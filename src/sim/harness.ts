@@ -8,7 +8,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 import { copyFileSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { generateKeyPair, type KeyPair } from "../protocol/crypto";
+import { exportPrivateJwk, generateKeyPair, signJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
+import type { Credential, CredentialStatusEntry, RotationAuthorization, RotationClaims, RotationReason } from "../protocol/types";
+import { buildAgentCard } from "../agentkit/runtime";
+import { rpcCall } from "../protocol/rpc";
 import type { AgentConfig } from "../agentkit/types";
 import type { Mandate, MandateLimits } from "../mandate/types";
 import { issueEnvelope, issueMandate } from "../mandate/sign";
@@ -63,6 +66,21 @@ export class AgentHandle {
   tender(load: LoadSpec, to: { agentId: string }) { return httpPost<{ taskId?: string; task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown }; localRefusal?: boolean }>(`${this.url}/control/tender`, { load, to }); }
   send(data: NegotiationPayload, taskId?: string, contextId?: string) { return httpPost<{ task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown } }>(`${this.url}/control/send`, { data, taskId, contextId }); }
   reconcile() { return httpPost<{ resolved: string[] }>(`${this.url}/control/reconcile`, {}); }
+  identity() { return httpGet<{ agentId: string; kid: string; credentialId?: string; supersedes?: string; expiresAt?: string }>(`${this.url}/control/identity`); }
+  rotatePrepare() { return httpPost<{ credentialId: string; newKid: string; newPublicKey: OkpJwk }>(`${this.url}/control/rotate/prepare`, {}); }
+  rotateSubmit(input: { authorization: RotationAuthorization | { kind: "CURRENT_KEY_ONLY" }; claims?: RotationClaims; reason: RotationReason; compromisedAt?: string }) {
+    return httpPost<{ ok: true; credential: Credential; superseded: CredentialStatusEntry } | { ok: false; reasonCode: string; evidence: unknown }>(`${this.url}/control/rotate/submit`, input);
+  }
+  /** The PRINCIPAL's authorization for a rotation: signed with the key the harness generated for the human, which the agent never held. */
+  authorizeRotation(claims: RotationClaims): RotationAuthorization {
+    return { kind: "PRINCIPAL", jws: signJws(claims, this.principal, { typ: "rotation+jws" }, true) };
+  }
+  /** Convenience: agent-cooperative rotation, authorized by the principal. */
+  async rotate(reason: RotationReason = "ROTATION") {
+    const prep = await this.rotatePrepare();
+    const claims: RotationClaims = { credentialId: prep.credentialId, newKid: prep.newKid, ts: new Date().toISOString(), reason };
+    return this.rotateSubmit({ authorization: this.authorizeRotation(claims), claims, reason });
+  }
   setRogue(rogue: AgentConfig["rogue"] | undefined) { return httpPost<{ ok: boolean }>(`${this.url}/control/rogue`, { rogue }); }
   sendRaw(message: Message) { return httpPost<{ task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown } }>(`${this.url}/control/send-raw`, { message }); }
   tasks() { return httpGet<LocalTask[]>(`${this.url}/control/tasks`); }
@@ -114,6 +132,7 @@ export class VenueHandle {
   agents() { return httpGet<{ agentId: string; credentialId: string; url: string }[]>(`${this.url}/admin/agents`); }
   guarantees() { return httpGet<{ guaranteeId: string; commitmentId?: string; status: string; coveredAmountUsd: number }[]>(`${this.url}/admin/guarantees`); }
   publicKey() { return httpGet<Record<string, unknown>>(`${this.url}/admin/public-key`); }
+  credentialStatus() { return httpGet<CredentialStatusEntry[]>(`${this.url}/admin/credential-status`); }
   registry() { return JSON.parse(readFileSync(join(this.dir, "registry.json"), "utf8")) as Record<string, unknown>[]; }
 
   async waitTerminal(taskId: string, timeoutMs = 20_000): Promise<NegotiationTask> {
@@ -175,6 +194,50 @@ export class Harness {
     await waitForHealth(`${url}/health`);
     this.venue = new VenueHandle(dir, url, proc);
     return this.venue;
+  }
+
+  /**
+   * Principal-driven rotation WITHOUT the agent's cooperation (the running agent may be compromised):
+   * the principal's key management generates the new key, gets the venue to rotate, then re-provisions
+   * the agent process with the new key + credential. The old process never sees the new key.
+   */
+  async principalRotate(handle: AgentHandle, reason: RotationReason, compromisedAt?: string): Promise<{ ok: true; credential: Credential; superseded: CredentialStatusEntry; voidedCommitments: string[]; newKp: KeyPair } | { ok: false; reasonCode: string; evidence: unknown }> {
+    const config = JSON.parse(readFileSync(join(handle.dir, "config.json"), "utf8")) as AgentConfig;
+    const id = await handle.identity();
+    const newKp = generateKeyPair();
+    const claims: RotationClaims = { credentialId: id.credentialId!, newKid: newKp.kid, ts: new Date().toISOString(), reason, compromisedAt };
+    const res = await rpcCall<{ credential: Credential; superseded: CredentialStatusEntry; voidedCommitments: string[] }>(`${this.venue.url}/a2a`, "venue/rotate", {
+      credentialId: id.credentialId,
+      newCard: buildAgentCard(config, newKp, handle.url),
+      authorization: handle.authorizeRotation(claims),
+      claims,
+    });
+    if (res.error) {
+      const d = (res.error.data ?? {}) as { reasonCode?: string; evidence?: unknown };
+      return { ok: false, reasonCode: d.reasonCode ?? String(res.error.code), evidence: d.evidence };
+    }
+    return { ok: true, ...res.result!, newKp };
+  }
+
+  /** Re-provision an agent: stop it, install the key + credential the principal obtained, start it on the same dir/port. */
+  async reprovisionAgent(handle: AgentHandle, newKp: KeyPair, credential: Credential): Promise<AgentHandle> {
+    if (handle.proc.exitCode === null) {
+      handle.proc.kill("SIGKILL");
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    writeFileSync(join(handle.dir, "agent-key.jwk.json"), JSON.stringify(exportPrivateJwk(newKp)));
+    writeFileSync(join(handle.dir, "credential.json"), JSON.stringify(credential, null, 2));
+    const next = join(handle.dir, "agent-key.next.jwk.json");
+    if (existsSync(next)) rmSync(next);
+    const entry = handle.spec.role === "broker" ? "src/agents/broker/index.ts" : "src/agents/carrier/index.ts";
+    const proc = spawnTs(entry, { AGENT_CONFIG: join(handle.dir, "config.json"), SIM_MODE: "1" }, handle.spec.agentId.padEnd(7).slice(0, 7), !!this.opts.quiet);
+    this.procs.push(proc);
+    await waitForHealth(`${handle.url}/health`, 15_000);
+    const start = Date.now();
+    while (Date.now() - start < 4000 && !existsSync(join(handle.dir, "venue-key.pinned.json"))) await new Promise((r) => setTimeout(r, 40));
+    const h2 = new AgentHandle(handle.spec, handle.dir, handle.url, proc, handle.principal, handle.mandate);
+    this.agents.set(handle.spec.agentId, h2);
+    return h2;
   }
 
   /** Restart the venue on the SAME data dir and port — what an operator (or supervisor) does after a crash. Recovery runs before it serves. */

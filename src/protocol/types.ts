@@ -31,6 +31,8 @@ export interface Credential {
   issuer: { venueId: string; kid: string };
   issuedAt: string;
   expiresAt: string;
+  /** Lineage: the credential this one replaced (key rotation / renewal). */
+  supersedes?: string;
   evidence: {
     registrySnapshotHash: string;
     registryCheckedAt: string;
@@ -43,11 +45,41 @@ export interface Credential {
   issuerSignature: string;
 }
 
-export interface RevocationEntry {
+/**
+ * A credential's non-ACTIVE status. REVOKED: the identity behind it is no
+ * longer in good standing (authority revoked, insurance cancelled). SUPERSEDED:
+ * the key was rotated — the entity is fine; the OLD key is not. A routine
+ * rotation leaves a grace window so in-flight messages signed with the old
+ * key are still accepted; a compromise records `compromisedAt`, after which
+ * anything the old key signed is suspect and nothing new is accepted.
+ */
+export interface CredentialStatusEntry {
   credentialId: string;
-  revokedAt: string;
+  status: "REVOKED" | "SUPERSEDED";
+  at: string;
   reason: string;
+  supersededBy?: string;
+  graceUntil?: string;
+  compromisedAt?: string;
   evidence?: Record<string, unknown>;
+}
+/** @deprecated name kept for readability at call sites that only deal with revocation. */
+export type RevocationEntry = CredentialStatusEntry;
+
+export type RotationReason = "ROTATION" | "RENEWAL" | "COMPROMISE";
+
+/** What a rotation request must prove. The agent's own current key is deliberately NOT an option. */
+export type RotationAuthorization =
+  | { kind: "PRINCIPAL"; jws: string }            // detached JWS by the principal key registered in the mandate envelope
+  | { kind: "PROOF_OF_CONTROL"; method: string; token: string } // registry-rooted, same gate as onboarding
+  | { kind: "CURRENT_KEY_ONLY"; jws: string };    // the agent signs with its own key — refused, by design
+
+export interface RotationClaims {
+  credentialId: string;   // the credential being rotated
+  newKid: string;         // thumbprint of the new key
+  ts: string;
+  reason: RotationReason;
+  compromisedAt?: string; // COMPROMISE only
 }
 
 /**

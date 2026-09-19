@@ -21,7 +21,7 @@ import { importPublicKey, signJws, verifyJws, type KeyPair, type OkpJwk } from "
 import { dataPart, type Message } from "../protocol/a2a";
 import { verifyMessageSignature } from "../protocol/envelope";
 import { termsHash, type AcceptPayload, type Terms } from "../protocol/freight";
-import type { Credential } from "../protocol/types";
+import type { Credential, CredentialStatusEntry } from "../protocol/types";
 import type { ReasonCode } from "../protocol/reasons";
 
 export interface GuaranteeSummary {
@@ -86,7 +86,7 @@ export interface ArtifactVerification {
  * Independent verification. Pass `pinnedVenueKey` to refuse the embedded key
  * (recommended). Every check is reported, not just the first failure.
  */
-export function verifyArtifact(a: CommitmentArtifact, opts: { pinnedVenueKey?: OkpJwk; now?: Date } = {}): ArtifactVerification {
+export function verifyArtifact(a: CommitmentArtifact, opts: { pinnedVenueKey?: OkpJwk; now?: Date; statusList?: CredentialStatusEntry[] } = {}): ArtifactVerification {
   const checks: ArtifactCheck[] = [];
   const push = (name: string, ok: boolean, detail?: string) => checks.push({ name, ok, detail });
   const venueKey = opts.pinnedVenueKey ?? a.venue.publicKey;
@@ -120,13 +120,21 @@ export function verifyArtifact(a: CommitmentArtifact, opts: { pinnedVenueKey?: O
     push(`${side}.credential.entity-matches-terms`, cred.subject.entity.usdot === termsEntity.usdot && (termsEntity.mc ?? cred.subject.entity.mc) === cred.subject.entity.mc);
     const termsAgent = side === "broker" ? a.terms.brokerAgentId : a.terms.carrierAgentId;
     push(`${side}.credential.agent-matches-terms`, cred.subject.agentId === termsAgent);
-    // Note: credential validity AT SIGNING TIME is what matters for a historical record.
+    // Note: credential validity AT SIGNING TIME is what matters for a historical record. Later expiry or
+    // a later routine key rotation does not invalidate an old signature; a compromise declared effective
+    // BEFORE the signature does — which needs the venue's published status list.
     const signedAt = new Date((msg.metadata as { ts?: string })?.ts ?? 0);
     push(`${side}.credential.valid-at-signing`, signedAt >= new Date(cred.issuedAt) && signedAt < new Date(cred.expiresAt), `signed ${signedAt.toISOString()}, valid ${cred.issuedAt}..${cred.expiresAt}`);
+    if (opts.statusList) {
+      const st = opts.statusList.find((x) => x.credentialId === cred.credentialId);
+      const compromisedBefore = !!st?.compromisedAt && signedAt >= new Date(st.compromisedAt);
+      const revokedBefore = st?.status === "REVOKED" && signedAt >= new Date(st.at);
+      push(`${side}.credential.trusted-at-signing`, !compromisedBefore && !revokedBefore, compromisedBefore ? `key declared compromised as of ${st!.compromisedAt}, signature at ${signedAt.toISOString()}` : revokedBefore ? `revoked ${st!.at}, signature at ${signedAt.toISOString()}` : st ? `status ${st.status} (${st.reason}) after signing — does not affect this signature` : "");
+    }
   }
 
   const failed = checks.filter((c) => !c.ok);
-  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : failed.some((c) => c.name.includes("signature") || c.name.includes("attestation") || c.name.includes("hash") || c.name.includes("match")) ? "RECORD_TAMPERED" : "CREDENTIAL_ISSUER_INVALID";
+  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : failed.some((c) => c.name.endsWith("trusted-at-signing")) && !failed.some((c) => c.name.includes("signature") || c.name.includes("attestation") || c.name.includes("hash")) ? "COMMITMENT_UNDER_COMPROMISED_KEY" : failed.some((c) => c.name.includes("signature") || c.name.includes("attestation") || c.name.includes("hash") || c.name.includes("match")) ? "RECORD_TAMPERED" : "CREDENTIAL_ISSUER_INVALID";
   return {
     ok: failed.length === 0,
     reasonCode,

@@ -37,6 +37,8 @@ const ok = (body: unknown) => ({ status: 200, body });
 const routes: Record<string, HttpRoute> = {
   "GET /health": async () => ok({ ok: true, venueId: config.venueId, kid: venue.kp.kid }),
   "GET /.well-known/agent-card.json": async () => ok(venue.agentCard()),
+  /** Published credential status list (revocations + supersessions): what an offline verifier needs to judge old signatures. */
+  "GET /.well-known/credential-status.json": async () => ok({ venueId: config.venueId, issuerKid: venue.kp.kid, asOf: new Date().toISOString(), entries: venue.issuer.statusList() }),
 };
 
 if (simMode) {
@@ -92,6 +94,7 @@ if (simMode) {
     "GET /admin/agents": async () => ok([...venue.state.agents.values()].map((a) => ({ agentId: a.agentId, credentialId: a.credentialId, url: a.url, envelope: a.envelope?.limits }))),
     "GET /admin/guarantees": async () => ok(venue.underwriting.allGuarantees()),
     "GET /admin/public-key": async () => ok(venue.kp.publicJwk),
+    "GET /admin/credential-status": async () => ok(venue.issuer.statusList()),
   };
   Object.assign(routes, admin);
 }

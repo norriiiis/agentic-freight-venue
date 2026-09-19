@@ -21,11 +21,15 @@ import type { CommitmentArtifact } from "../ledger/artifact";
 
 export interface RegisteredAgent {
   agentId: string;
+  /** The credential that currently represents this agent. */
   credentialId: string;
+  /** Superseded credentials in this agent's lineage (still accepted inside their grace window; needed to read old signatures). */
+  previousCredentialIds: string[];
   url: string;
   card: AgentCard;
   envelope?: MandateEnvelope;
   registeredAt: string;
+  rotatedAt?: string;
 }
 
 export interface Offer {
@@ -98,6 +102,8 @@ export interface VoidJournal {
   writtenAt: string;
   reasonCode: ReasonCode;
   evidence: Record<string, unknown>;
+  /** What triggered the void (audit event name). */
+  origin?: "pre-pickup-check" | "compromise-void";
 }
 export type Journal = CommitJournal | VoidJournal;
 
@@ -170,7 +176,8 @@ export class VenueState {
     if (!existsSync(this.file("messages.jsonl"))) return [];
     return readFileSync(this.file("messages.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
   }
+  /** Find the agent a credential belongs to — current or anywhere in its rotation lineage. */
   agentByCredential(credentialId: string): RegisteredAgent | undefined {
-    return [...this.agents.values()].find((a) => a.credentialId === credentialId);
+    return [...this.agents.values()].find((a) => a.credentialId === credentialId || (a.previousCredentialIds ?? []).includes(credentialId));
   }
 }

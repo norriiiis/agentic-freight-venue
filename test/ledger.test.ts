@@ -91,3 +91,21 @@ describe("commitment artifact verifies independently", () => {
     expect(verifyArtifact(artifact).ok).toBe(true);
   });
 });
+
+describe("artifact verification with a credential status list", () => {
+  it("a compromise declared before the signature fails trusted-at-signing; a later routine rotation does not", () => {
+    const { artifact } = makeArtifact();
+    const carrierCred = artifact.credentials.carrier;
+    const signedAt = (artifact.acceptances.carrier.metadata as { ts: string }).ts;
+    const before = new Date(new Date(signedAt).getTime() - 1000).toISOString();
+    const after = new Date(new Date(signedAt).getTime() + 1000).toISOString();
+    const compromised = verifyArtifact(artifact, { statusList: [{ credentialId: carrierCred.credentialId, status: "SUPERSEDED", at: after, reason: "COMPROMISE", compromisedAt: before }] });
+    expect(compromised).toMatchObject({ ok: false, reasonCode: "COMMITMENT_UNDER_COMPROMISED_KEY" });
+    expect(compromised.checks.find((c) => c.name === "carrier.credential.trusted-at-signing")?.ok).toBe(false);
+    const rotated = verifyArtifact(artifact, { statusList: [{ credentialId: carrierCred.credentialId, status: "SUPERSEDED", at: after, reason: "ROTATION", graceUntil: after }] });
+    expect(rotated.ok).toBe(true);
+    const revokedLater = verifyArtifact(artifact, { statusList: [{ credentialId: carrierCred.credentialId, status: "REVOKED", at: after, reason: "authority revoked" }] });
+    expect(revokedLater.ok).toBe(true);
+    expect(verifyArtifact(artifact).ok).toBe(true); // no status list: signatures still verify
+  });
+});

@@ -19,11 +19,11 @@ import { loadFingerprint, termsHash, textDigest, validateNegotiationPayload, typ
 import { REASONS, type ReasonCode } from "../protocol/reasons";
 import { AuditLog, type Component } from "../protocol/audit";
 import { rpcCall, RpcRefusal } from "../protocol/rpc";
-import type { Credential, MandateEnvelope } from "../protocol/types";
+import type { Credential, MandateEnvelope, RotationAuthorization, RotationClaims } from "../protocol/types";
 import { MockRegistry } from "../identity/registry";
 import { StubVettingProvider } from "../identity/vetting";
 import { CredentialIssuer } from "../identity/issuer";
-import { liveCheck, verifyCredential, verifyPresentation, type LiveCheckResult } from "../identity/verifier";
+import { liveCheck, signatureTrustedAt, verifyCredential, verifyPresentation, type LiveCheckResult } from "../identity/verifier";
 import { envelopeToLimits, evaluateMandate } from "../mandate/engine";
 import { verifyEnvelope } from "../mandate/sign";
 import { ExposureBook } from "../mandate/exposure";
@@ -138,11 +138,65 @@ export class VenueService {
       }
       envelope = params.envelope;
     }
-    const reg: RegisteredAgent = { agentId, credentialId: res.credential.credentialId, url: params.agentUrl, card: params.card, envelope, registeredAt: new Date().toISOString() };
+    const reg: RegisteredAgent = { agentId, credentialId: res.credential.credentialId, previousCredentialIds: [], url: params.agentUrl, card: params.card, envelope, registeredAt: new Date().toISOString() };
     this.state.agents.set(agentId, reg);
     this.state.persist();
     this.audit.write({ component: "venue.identity", event: "onboard", outcome: "ALLOWED", subject: agentId, evidence: { credentialId: res.credential.credentialId, entity: res.credential.subject.entity, envelopeRegistered: !!envelope, vettingFlags: res.credential.evidence.vettingFlags } });
     return { credential: res.credential, venueCard: this.agentCard(), issuerPublicKey: this.kp.publicJwk };
+  }
+
+  /**
+   * Key rotation. Authority: the principal key registered in the agent's
+   * mandate envelope, or proof of control — never the agent's own key. The
+   * agent id, entity, envelope, open negotiations and ACTIVE commitments all
+   * survive; only the key changes. A COMPROMISE rotation additionally voids
+   * every ACTIVE commitment whose acceptance the old key signed at or after
+   * the declared compromise time.
+   */
+  async rotate(params: { credentialId: string; newCard: AgentCard; authorization: RotationAuthorization; claims: RotationClaims }) {
+    const cardCheck = verifyAgentCard(params.newCard);
+    if (!cardCheck.ok || !cardCheck.jwk) throw new Refusal("IDENTITY_SIGNATURE_INVALID", "venue.identity", { error: cardCheck.error, stage: "new-agent-card" });
+    const reg = this.state.agentByCredential(params.credentialId);
+    if (!reg) throw new Refusal("CREDENTIAL_UNKNOWN", "venue.identity", { credentialId: params.credentialId });
+    if (String(params.newCard.metadata?.agentId ?? params.newCard.name) !== reg.agentId) throw new Refusal("ROTATION_UNAUTHORIZED", "venue.identity", { error: "new agent card is for a different agentId" });
+    const res = await this.issuer.rotate({ credentialId: params.credentialId, newPublicKey: cardCheck.jwk, authorization: params.authorization, claims: params.claims, principalPublicKey: reg.envelope?.principalPublicKey });
+    if (!res.ok) {
+      this.audit.write({ component: "venue.identity", event: "rotate", outcome: "REFUSED", reasonCode: res.reasonCode, subject: reg.agentId, evidence: { ...res.evidence, authorization: params.authorization.kind, reason: params.claims.reason } });
+      throw new Refusal(res.reasonCode, "venue.identity", { ...res.evidence, authorization: params.authorization.kind });
+    }
+    reg.previousCredentialIds = [...(reg.previousCredentialIds ?? []), reg.credentialId];
+    reg.credentialId = res.credential.credentialId;
+    reg.card = params.newCard;
+    reg.rotatedAt = new Date().toISOString();
+    this.state.persist();
+    this.audit.write({ component: "venue.identity", event: "rotate", outcome: "ALLOWED", subject: reg.agentId, evidence: { reason: params.claims.reason, authorizedBy: params.authorization.kind, oldCredentialId: res.superseded.credentialId, newCredentialId: res.credential.credentialId, oldKid: this.issuer.get(res.superseded.credentialId)?.subject.publicKey.kid, newKid: res.credential.subject.publicKey.kid, graceUntil: res.superseded.graceUntil, compromisedAt: res.superseded.compromisedAt } });
+    let voided: string[] = [];
+    if (res.superseded.compromisedAt) voided = (await this.voidUnderCompromisedKey(res.superseded.credentialId, new Date(res.superseded.compromisedAt))).map((c) => c.commitmentId);
+    return { credential: res.credential, superseded: res.superseded, voidedCommitments: voided };
+  }
+
+  /** Void every ACTIVE commitment whose acceptance this credential signed at or after `compromisedAt`. */
+  private async voidUnderCompromisedKey(credentialId: string, compromisedAt: Date): Promise<CommitmentRecord[]> {
+    const voided: CommitmentRecord[] = [];
+    for (const c of this.state.commitments.values()) {
+      if (c.status !== "ACTIVE") continue;
+      for (const side of ["broker", "carrier"] as const) {
+        const acc = c.artifact.acceptances[side];
+        const meta = acc.metadata as SignedMeta;
+        if (meta.credentialId !== credentialId) continue;
+        const signedAt = new Date(meta.ts);
+        if (signedAt < compromisedAt) continue;
+        const evidence = { commitmentId: c.commitmentId, party: side, agentId: side === "broker" ? c.brokerAgentId : c.carrierAgentId, credentialId, signedAt: meta.ts, compromisedAt: compromisedAt.toISOString(), note: "acceptance signed after the key's declared compromise time; the legitimate party may re-commit with its new key" };
+        const journal: VoidJournal = { kind: "VOID", commitmentId: c.commitmentId, writtenAt: new Date().toISOString(), reasonCode: "COMMITMENT_UNDER_COMPROMISED_KEY", evidence, origin: "compromise-void" };
+        this.state.writeJournal(journal);
+        const g = c.guaranteeId ? this.underwriting.guaranteeForCommitment(c.commitmentId) : undefined;
+        const entry = this.ledger.append("VOID", { commitmentId: c.commitmentId, reasonCode: "COMMITMENT_UNDER_COMPROMISED_KEY", evidence, guaranteeReleased: g ? { guaranteeId: g.guaranteeId, coveredAmountUsd: g.coveredAmountUsd } : null });
+        await this.applyVoid(journal, entry, "live");
+        voided.push(c);
+        break;
+      }
+    }
+    return voided;
   }
 
   // ------------------------------------------------------------- RPC surface
@@ -152,6 +206,8 @@ export class VenueService {
       switch (method) {
         case "venue/onboard":
           return await this.onboard(params as Parameters<VenueService["onboard"]>[0]);
+        case "venue/rotate":
+          return await this.rotate(params as Parameters<VenueService["rotate"]>[0]);
         case "message/send": {
           const m = (params as { message: Message }).message;
           return await this.ingest(m);
@@ -187,7 +243,7 @@ export class VenueService {
     }
     void h;
     const cred = this.issuer.get(claims.credentialId);
-    const cv = verifyCredential(cred, { issuerPublicKey: this.kp.publicJwk, revocation: this.issuer.revocation(claims.credentialId) });
+    const cv = verifyCredential(cred, { issuerPublicKey: this.kp.publicJwk, status: this.issuer.status(claims.credentialId) });
     if (!cv.ok || !cred) throw new Refusal(cv.reasonCode ?? "CREDENTIAL_UNKNOWN", "venue.identity", cv.evidence);
     const sig = verifyJws(token, importPublicKey(cred.subject.publicKey));
     if (!sig.ok || claims.method !== method || (taskId && claims.taskId !== taskId) || Math.abs(Date.now() - new Date(claims.ts).getTime()) > this.config.messageMaxAgeMs) {
@@ -221,11 +277,12 @@ export class VenueService {
     }
     // 2. credential (issuer sig, expiry, revocation)
     const cred = this.issuer.get(meta.credentialId);
-    const cv = verifyCredential(cred, { issuerPublicKey: this.kp.publicJwk, revocation: this.issuer.revocation(meta.credentialId) });
+    const cv = verifyCredential(cred, { issuerPublicKey: this.kp.publicJwk, status: this.issuer.status(meta.credentialId) });
     if (!cv.ok || !cred) {
       this.audit.write({ component: "venue.identity", event: "ingest", outcome: "REFUSED", reasonCode: cv.reasonCode, subject: meta.senderAgentId, taskId: m.taskId, evidence: cv.evidence });
       throw new Refusal(cv.reasonCode ?? "CREDENTIAL_UNKNOWN", "venue.identity", cv.evidence);
     }
+    if (cv.evidence.grace) this.audit.write({ component: "venue.identity", event: "ingest", outcome: "INFO", subject: meta.senderAgentId, taskId: m.taskId, evidence: { note: "message signed with a superseded key inside its rotation grace window", ...cv.evidence } });
     // 3. presentation (this message signed by the credential-bound key; identifiers match)
     const claimed = "from" in data ? { agentId: data.from.agentId, usdot: data.from.usdot, mc: data.from.mc } : { agentId: meta.senderAgentId, usdot: cred.subject.entity.usdot };
     const pv = verifyPresentation(m, cred, claimed);
@@ -297,7 +354,7 @@ export class VenueService {
     if (!cp) violations.push({ code: "COUNTERPARTY_UNVERIFIED", evidence: { requestedAgentId: data.to.agentId, registeredAgents: [...this.state.agents.keys()] } });
     else {
       cpCred = this.issuer.get(cp.credentialId);
-      const cv = verifyCredential(cpCred, { issuerPublicKey: this.kp.publicJwk, revocation: this.issuer.revocation(cp.credentialId), now });
+      const cv = verifyCredential(cpCred, { issuerPublicKey: this.kp.publicJwk, status: this.issuer.status(cp.credentialId), now });
       if (!cv.ok || !cpCred) violations.push({ code: cv.reasonCode!, evidence: { counterparty: cp.agentId, ...cv.evidence } });
       else {
         const requiredBipd = sender.envelope?.limits.requiredCounterpartyInsuranceUsd;
@@ -536,12 +593,14 @@ export class VenueService {
   private async commit(t: NegotiationTask, terms: Terms) {
     const brokerReg = this.state.agents.get(t.brokerAgentId)!;
     const carrierReg = this.state.agents.get(t.carrierAgentId)!;
-    const brokerCred = this.issuer.get(brokerReg.credentialId)!;
-    const carrierCred = this.issuer.get(carrierReg.credentialId)!;
+    // The artifact must embed the credential that SIGNED each acceptance (a party may have rotated its
+    // key between accepting and the commit); good standing is checked against the CURRENT credential.
+    const brokerCred = this.issuer.get((t.acceptances[t.brokerAgentId]!.metadata as SignedMeta).credentialId)!;
+    const carrierCred = this.issuer.get((t.acceptances[t.carrierAgentId]!.metadata as SignedMeta).credentialId)!;
 
     // 1. PREPARE — final identity re-verification of both parties at the moment of commitment.
-    for (const [reg, cred] of [[brokerReg, brokerCred], [carrierReg, carrierCred]] as const) {
-      const cv = verifyCredential(cred, { issuerPublicKey: this.kp.publicJwk, revocation: this.issuer.revocation(cred.credentialId) });
+    for (const [reg, cred] of [[brokerReg, this.issuer.get(brokerReg.credentialId)!], [carrierReg, this.issuer.get(carrierReg.credentialId)!]] as const) {
+      const cv = verifyCredential(cred, { issuerPublicKey: this.kp.publicJwk, status: this.issuer.status(cred.credentialId) });
       const lv = cv.ok ? liveCheck(this.registry, cred, { hazmat: t.load.hazmat, requiredBipdUsd: reg.agentId === t.carrierAgentId ? brokerReg.envelope?.limits.requiredCounterpartyInsuranceUsd : undefined }) : undefined;
       const bad = !cv.ok ? cv : lv && !lv.ok ? lv : undefined;
       if (bad) {
@@ -916,11 +975,17 @@ export class VenueService {
     for (const c of this.state.commitments.values()) {
       if (c.status !== "ACTIVE" || new Date(c.pickupWindowStart) < now) continue;
       for (const side of ["broker", "carrier"] as const) {
-        const cred = c.artifact.credentials[side];
-        const cv = verifyCredential(cred, { issuerPublicKey: this.kp.publicJwk, revocation: this.issuer.revocation(cred.credentialId), now });
-        const lv = cv.ok ? liveCheck(this.registry, cred, { now, hazmat: c.artifact.terms.load.hazmat }) : undefined;
-        const bad = !cv.ok ? cv : lv && !lv.ok ? lv : undefined;
+        const agentId = side === "broker" ? c.brokerAgentId : c.carrierAgentId;
+        const signing = c.artifact.credentials[side];
+        // A routine rotation must NOT void the deal: check the party's CURRENT credential for standing,
+        // and the SIGNING credential only for a compromise declared effective before the signature.
+        const current = this.issuer.currentInLineage(signing.credentialId) ?? signing;
+        const cv = verifyCredential(current, { issuerPublicKey: this.kp.publicJwk, status: this.issuer.status(current.credentialId), now });
+        const lv = cv.ok ? liveCheck(this.registry, current, { now, hazmat: c.artifact.terms.load.hazmat }) : undefined;
+        const st = signatureTrustedAt(signing, new Date((c.artifact.acceptances[side].metadata as SignedMeta).ts), this.issuer.status(signing.credentialId));
+        const bad = !cv.ok ? cv : lv && !lv.ok ? lv : !st.ok ? st : undefined;
         if (!bad) continue;
+        void agentId;
         const reasonCode: ReasonCode = bad.reasonCode === "CREDENTIAL_REVOKED" ? "CREDENTIAL_REVOKED_PRE_PICKUP" : bad.reasonCode!;
         const evidence = { commitmentId: c.commitmentId, party: side, agentId: side === "broker" ? c.brokerAgentId : c.carrierAgentId, pickupWindowStart: c.pickupWindowStart, checkedAt: now.toISOString(), underlying: bad.reasonCode, ...bad.evidence };
         // Same transaction shape as commit: journal → one ledger entry (carrying the guarantee release) → idempotent apply.
@@ -957,7 +1022,7 @@ export class VenueService {
     }
     this.state.persist();
     this.state.deleteJournal(j.commitmentId);
-    if (first) this.audit.write({ component: "venue.commitment", event: "pre-pickup-check", outcome: "VOIDED", reasonCode: j.reasonCode, taskId: c.taskId, evidence: { ...j.evidence, guaranteeReleased: !!c.guaranteeId, ledgerSeq: entry.seq, mode, guaranteeWouldHavePaid: guaranteeWouldHavePaid(j.reasonCode) } });
+    if (first) this.audit.write({ component: "venue.commitment", event: j.origin ?? "pre-pickup-check", outcome: "VOIDED", reasonCode: j.reasonCode, taskId: c.taskId, evidence: { ...j.evidence, guaranteeReleased: !!c.guaranteeId, ledgerSeq: entry.seq, mode, guaranteeWouldHavePaid: guaranteeWouldHavePaid(j.reasonCode) } });
     await this.flushOutbox();
   }
 }

@@ -13,7 +13,7 @@ import type { Message } from "../protocol/a2a";
 import { importPublicKey, verifyJws, type OkpJwk } from "../protocol/crypto";
 import { verifyMessageSignature } from "../protocol/envelope";
 import type { ReasonCode } from "../protocol/reasons";
-import type { Credential, RevocationEntry } from "../protocol/types";
+import type { Credential, CredentialStatusEntry } from "../protocol/types";
 import { authorityActive, hasBrokerAuthority, insuranceStatus, type InsuranceStatus, type MockRegistry } from "./registry";
 
 export interface Verdict {
@@ -22,9 +22,15 @@ export interface Verdict {
   evidence: Record<string, unknown>;
 }
 
+/**
+ * Is this credential acceptable for a NEW presentation right now?
+ * `status` is the venue's status entry for it (REVOKED / SUPERSEDED), if any.
+ * A superseded credential is still accepted inside its grace window — unless
+ * its key was declared compromised, in which case never.
+ */
 export function verifyCredential(
   cred: Credential | undefined,
-  opts: { issuerPublicKey: OkpJwk; revocation?: RevocationEntry; now?: Date },
+  opts: { issuerPublicKey: OkpJwk; revocation?: CredentialStatusEntry; status?: CredentialStatusEntry; now?: Date },
 ): Verdict {
   const now = opts.now ?? new Date();
   if (!cred) return { ok: false, reasonCode: "CREDENTIAL_UNKNOWN", evidence: {} };
@@ -34,10 +40,38 @@ export function verifyCredential(
   if (new Date(cred.expiresAt) <= now) {
     return { ok: false, reasonCode: "CREDENTIAL_EXPIRED", evidence: { credentialId: cred.credentialId, expiresAt: cred.expiresAt, now: now.toISOString() } };
   }
-  if (opts.revocation) {
-    return { ok: false, reasonCode: "CREDENTIAL_REVOKED", evidence: { credentialId: cred.credentialId, revocation: opts.revocation } };
+  const st = opts.status ?? opts.revocation;
+  if (st?.status === "REVOKED") {
+    return { ok: false, reasonCode: "CREDENTIAL_REVOKED", evidence: { credentialId: cred.credentialId, revocation: st } };
+  }
+  if (st?.status === "SUPERSEDED") {
+    if (st.compromisedAt) {
+      return { ok: false, reasonCode: "CREDENTIAL_SUPERSEDED", evidence: { credentialId: cred.credentialId, supersededBy: st.supersededBy, compromisedAt: st.compromisedAt, reason: st.reason } };
+    }
+    if (!st.graceUntil || new Date(st.graceUntil) <= now) {
+      return { ok: false, reasonCode: "CREDENTIAL_SUPERSEDED", evidence: { credentialId: cred.credentialId, supersededBy: st.supersededBy, graceUntil: st.graceUntil, reason: st.reason } };
+    }
+    return { ok: true, evidence: { credentialId: cred.credentialId, entity: cred.subject.entity, expiresAt: cred.expiresAt, grace: true, supersededBy: st.supersededBy, graceUntil: st.graceUntil } };
   }
   return { ok: true, evidence: { credentialId: cred.credentialId, entity: cred.subject.entity, expiresAt: cred.expiresAt } };
+}
+
+/**
+ * Was a signature made at `signedAt` under this credential trustworthy?
+ * Historical verification: expiry/supersession AFTER the signature do not
+ * matter; a compromise declared effective BEFORE the signature does.
+ */
+export function signatureTrustedAt(cred: Credential, signedAt: Date, status?: CredentialStatusEntry): Verdict {
+  if (signedAt < new Date(cred.issuedAt) || signedAt >= new Date(cred.expiresAt)) {
+    return { ok: false, reasonCode: "CREDENTIAL_EXPIRED", evidence: { credentialId: cred.credentialId, signedAt: signedAt.toISOString(), validity: [cred.issuedAt, cred.expiresAt] } };
+  }
+  if (status?.compromisedAt && signedAt >= new Date(status.compromisedAt)) {
+    return { ok: false, reasonCode: "COMMITMENT_UNDER_COMPROMISED_KEY", evidence: { credentialId: cred.credentialId, signedAt: signedAt.toISOString(), compromisedAt: status.compromisedAt } };
+  }
+  if (status?.status === "REVOKED" && signedAt >= new Date(status.at)) {
+    return { ok: false, reasonCode: "CREDENTIAL_REVOKED", evidence: { credentialId: cred.credentialId, signedAt: signedAt.toISOString(), revokedAt: status.at } };
+  }
+  return { ok: true, evidence: { credentialId: cred.credentialId, signedAt: signedAt.toISOString() } };
 }
 
 export function verifyPresentation(m: Message, cred: Credential, claimed?: { agentId: string; usdot: string; mc?: string }): Verdict {

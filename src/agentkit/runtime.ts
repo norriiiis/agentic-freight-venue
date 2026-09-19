@@ -9,17 +9,17 @@
  *
  * It never receives the counterparty's address, keys, or data directory.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync } from "node:fs";
 import { writeFileAtomic } from "../protocol/fsatomic";
 import { join } from "node:path";
 import { A2A_PROTOCOL_VERSION, FREIGHT_EXTENSION_URI, RPC_ERR, TERMINAL_STATES, dataPart, signAgentCard, verifyAgentCard, type AgentCard, type Message, type Task } from "../protocol/a2a";
 import { hashObject } from "../protocol/canonical";
-import { exportPrivateJwk, generateKeyPair, importKeyPair, signJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
+import { exportPrivateJwk, generateKeyPair, importKeyPair, jwkThumbprint as _jwkThumbprint, signJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import { buildMessage, signMessage, verifyMessageSignature, verifyVenueSignature, type SignedMeta, type VenueAttachment } from "../protocol/envelope";
 import { termsHash, textDigest, validateNegotiationPayload, type AcceptPayload, type CounterPayload, type LoadSpec, type NegotiationPayload, type RejectPayload, type TenderPayload, type Terms } from "../protocol/freight";
 import { AuditLog, type Component } from "../protocol/audit";
 import { httpGet, rpcCall, RpcRefusal, startServer, type HttpRoute } from "../protocol/rpc";
-import type { Credential, MandateEnvelope } from "../protocol/types";
+import type { Credential, CredentialStatusEntry, MandateEnvelope, RotationAuthorization, RotationClaims, RotationReason } from "../protocol/types";
 import { evaluateMandate } from "../mandate/engine";
 import { ExposureBook } from "../mandate/exposure";
 import { verifyMandate } from "../mandate/sign";
@@ -81,23 +81,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
   }
 
   agentCard(): AgentCard {
-    return signAgentCard(
-      {
-        protocolVersion: A2A_PROTOCOL_VERSION,
-        name: this.config.agentId,
-        description: `${this.config.role} agent for ${this.config.entity.legalName}`,
-        url: `${this.url}/a2a`,
-        preferredTransport: "JSONRPC",
-        version: "0.1.0",
-        provider: { organization: this.config.entity.legalName },
-        capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false, extensions: [{ uri: FREIGHT_EXTENSION_URI, required: true }] },
-        defaultInputModes: ["application/json"],
-        defaultOutputModes: ["application/json"],
-        skills: [{ id: "negotiate-freight", name: "Negotiate freight", description: `Negotiate loads as a ${this.config.role}`, tags: ["freight", this.config.role] }],
-        metadata: { agentId: this.config.agentId, registry: { usdot: this.config.entity.usdot, mc: this.config.entity.mc } },
-      },
-      this.kp,
-    );
+    return buildAgentCard(this.config, this.kp, this.url);
   }
 
   // ------------------------------------------------------------- onboarding
@@ -128,6 +112,53 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     writeFileAtomic(join(this.config.dataDir, "credential.json"), JSON.stringify(this.credential, null, 2));
     this.audit.write({ component: this.comp.runtime, event: "onboard", outcome: "ALLOWED", evidence: { credentialId: this.credential.credentialId, expiresAt: this.credential.expiresAt } });
     return { ok: true, credential: this.credential };
+  }
+
+  // ---------------------------------------------------------------- key rotation
+  //
+  // Two steps, because the authority to rotate is not this process's to give:
+  //   prepare  — generate the next key and hand its public half to the principal
+  //   submit   — send the principal's signed authorization (or proof of control)
+  //              with the new card; on success, swap keys atomically
+  // An agent that tries to authorize its own rotation (CURRENT_KEY_ONLY) is refused by the venue.
+
+  private nextKp?: KeyPair;
+  rotatePrepare(): { credentialId: string; newKid: string; newPublicKey: OkpJwk } {
+    if (!this.credential) throw new Error("not onboarded");
+    this.nextKp = generateKeyPair();
+    writeFileAtomic(join(this.config.dataDir, "agent-key.next.jwk.json"), JSON.stringify(exportPrivateJwk(this.nextKp)));
+    this.audit.write({ component: this.comp.runtime, event: "rotate-prepare", outcome: "INFO", evidence: { currentKid: this.kp.kid, newKid: this.nextKp.kid } });
+    return { credentialId: this.credential.credentialId, newKid: this.nextKp.kid, newPublicKey: this.nextKp.publicJwk };
+  }
+
+  async rotateSubmit(input: { authorization: RotationAuthorization | { kind: "CURRENT_KEY_ONLY" }; claims?: RotationClaims; reason: RotationReason; compromisedAt?: string }): Promise<{ ok: true; credential: Credential; superseded: CredentialStatusEntry } | { ok: false; reasonCode: string; evidence: unknown }> {
+    if (!this.credential || !this.nextKp) throw new Error("call rotatePrepare first");
+    // The claims are what the authorizer signed; this process forwards them verbatim. Only a
+    // CURRENT_KEY_ONLY attempt builds and signs its own — the thing the venue must refuse.
+    const claims: RotationClaims = input.claims ?? { credentialId: this.credential.credentialId, newKid: this.nextKp.kid, ts: new Date().toISOString(), reason: input.reason, compromisedAt: input.compromisedAt };
+    const authorization: RotationAuthorization = input.authorization.kind === "CURRENT_KEY_ONLY" ? { kind: "CURRENT_KEY_ONLY", jws: signJws(claims, this.kp, { typ: "rotation+jws" }, true) } : input.authorization;
+    const newCard = buildAgentCard(this.config, this.nextKp, this.url);
+    const res = await rpcCall<{ credential: Credential; superseded: CredentialStatusEntry }>(`${this.config.venueUrl}/a2a`, "venue/rotate", { credentialId: this.credential.credentialId, newCard, authorization, claims });
+    if (res.error) {
+      const d = (res.error.data ?? {}) as { reasonCode?: string; evidence?: unknown };
+      this.audit.write({ component: this.comp.runtime, event: "rotate", outcome: "REFUSED", evidence: { reasonCode: d.reasonCode, authorization: authorization.kind, reason: input.reason, currentKid: this.kp.kid, attemptedKid: this.nextKp.kid } });
+      return { ok: false, reasonCode: d.reasonCode ?? String(res.error.code), evidence: d.evidence };
+    }
+    const oldKid = this.kp.kid;
+    this.installKey(this.nextKp, res.result!.credential);
+    this.nextKp = undefined;
+    const nextPath = join(this.config.dataDir, "agent-key.next.jwk.json");
+    if (existsSync(nextPath)) unlinkSync(nextPath);
+    this.audit.write({ component: this.comp.runtime, event: "rotate", outcome: "ALLOWED", evidence: { reason: input.reason, authorization: authorization.kind, oldKid, newKid: this.kp.kid, oldCredentialId: res.result!.superseded.credentialId, newCredentialId: res.result!.credential.credentialId, graceUntil: res.result!.superseded.graceUntil } });
+    return { ok: true, credential: res.result!.credential, superseded: res.result!.superseded };
+  }
+
+  /** Make `kp` + `credential` this agent's identity: key file first (atomic), then the credential. The old private key is overwritten, not kept. */
+  private installKey(kp: KeyPair, credential: Credential) {
+    writeFileAtomic(join(this.config.dataDir, "agent-key.jwk.json"), JSON.stringify(exportPrivateJwk(kp)));
+    (this as { kp: KeyPair }).kp = kp;
+    this.credential = credential;
+    writeFileAtomic(join(this.config.dataDir, "credential.json"), JSON.stringify(credential, null, 2));
   }
 
   // ---------------------------------------------------------------- outbound
@@ -524,6 +555,9 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         },
         "POST /control/send-raw": async (_r: unknown, b: unknown) => ok(await this.sendRaw((b as { message: Message }).message)),
         "POST /control/reconcile": async () => ok({ resolved: await this.reconcile("control") }),
+        "POST /control/rotate/prepare": async () => ok(this.rotatePrepare()),
+        "POST /control/rotate/submit": async (_r: unknown, b: unknown) => ok(await this.rotateSubmit(b as Parameters<AgentRuntime<Ctx>["rotateSubmit"]>[0])),
+        "GET /control/identity": async () => ok({ agentId: this.config.agentId, kid: this.kp.kid, credentialId: this.credential?.credentialId, supersedes: this.credential?.supersedes, expiresAt: this.credential?.expiresAt }),
         /** Fault injection at runtime: models a compromised agent runtime. */
         "POST /control/rogue": async (_r: unknown, b: unknown) => {
           this.config.rogue = (b as { rogue?: AgentConfig["rogue"] }).rogue;
@@ -553,6 +587,27 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     setInterval(() => { if (this.credential) this.reconcile().catch(() => {}); }, this.config.reconcileMs ?? 15_000).unref();
     console.log(`[${this.config.agentId}] ${this.config.role} listening on ${this.url}${simMode ? " SIM_MODE" : ""}`);
   }
+}
+
+/** The agent's A2A card, signed by `kp`. Exported so a principal provisioning a NEW key for a compromised agent can produce the card the venue requires. */
+export function buildAgentCard(config: AgentConfig, kp: KeyPair, url: string): AgentCard {
+  return signAgentCard(
+    {
+      protocolVersion: A2A_PROTOCOL_VERSION,
+      name: config.agentId,
+      description: `${config.role} agent for ${config.entity.legalName}`,
+      url: `${url}/a2a`,
+      preferredTransport: "JSONRPC",
+      version: "0.1.0",
+      provider: { organization: config.entity.legalName },
+      capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false, extensions: [{ uri: FREIGHT_EXTENSION_URI, required: true }] },
+      defaultInputModes: ["application/json"],
+      defaultOutputModes: ["application/json"],
+      skills: [{ id: "negotiate-freight", name: "Negotiate freight", description: `Negotiate loads as a ${config.role}`, tags: ["freight", config.role] }],
+      metadata: { agentId: config.agentId, registry: { usdot: config.entity.usdot, mc: config.entity.mc } },
+    },
+    kp,
+  );
 }
 
 export function loadConfig(): AgentConfig {

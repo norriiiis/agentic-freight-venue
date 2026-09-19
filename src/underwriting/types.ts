@@ -78,6 +78,7 @@ export const GUARANTEE_EXCLUSIONS = [
   "OFF_VENUE_ARRANGEMENTS: anything agreed outside a venue-recorded commitment",
   "PRINCIPAL_OVERRODE_REFUSAL: the principal proceeded after a VOIDED or REFUSED notice",
   "CONTROLS_BYPASSED: the claimant disabled or bypassed mandate/identity checks",
+  "PRINCIPAL_KEY_COMPROMISE: loss from a stolen or leaked agent key held by the principal, before the principal declared the compromise",
 ];
 export const GUARANTEE_CONDITIONS = [
   "Venue controls functioned as designed at commitment time (audit trail intact)",

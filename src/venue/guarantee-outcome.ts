@@ -38,6 +38,11 @@ export function guaranteeWouldHavePaid(code: ReasonCode): string {
       return "N/A — no commitment formed; nothing to guarantee.";
     case "LOAD_ALREADY_COMMITTED":
       return "N/A for this negotiation — the load's guarantee rides on the commitment that won.";
+    case "COMMITMENT_UNDER_COMPROMISED_KEY":
+      return "Guarantee released with the void. A stolen or leaked agent key is the principal's custody failure (PRINCIPAL_KEY_COMPROMISE exclusion): losses before the principal declared the compromise are not covered. A venue-hosted key custody tier would change that.";
+    case "CREDENTIAL_SUPERSEDED":
+    case "ROTATION_UNAUTHORIZED":
+      return "N/A — refused before any transaction. A refused self-rotation is the control working: a stolen key cannot rebind itself.";
     case "CREDENTIAL_REVOKED_PRE_PICKUP":
     case "CREDENTIAL_REVOKED":
       return "Guarantee WAS attached and is now RELEASED with the commitment voided. If the broker ships anyway after the VOIDED notice, PRINCIPAL_OVERRODE_REFUSAL applies: excluded.";

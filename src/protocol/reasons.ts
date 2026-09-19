@@ -10,6 +10,8 @@ export const REASONS = {
   CREDENTIAL_UNKNOWN: "Credential id not issued by this venue",
   CREDENTIAL_EXPIRED: "Credential past its expiry",
   CREDENTIAL_REVOKED: "Credential has been revoked",
+  CREDENTIAL_SUPERSEDED: "Credential was replaced by key rotation and is outside its grace window (or its key was declared compromised)",
+  ROTATION_UNAUTHORIZED: "Key rotation must be authorized by the principal key registered in the mandate envelope, or by proof of control; the agent's own key is not sufficient",
   CREDENTIAL_ISSUER_INVALID: "Credential issuer signature does not verify",
   CREDENTIAL_ENTITY_MISMATCH: "Registry identifiers in the message do not match the credential's bound entity",
   AUTHORITY_NOT_ACTIVE: "Registry shows operating authority is not active",
@@ -56,6 +58,7 @@ export const REASONS = {
 
   // post-commitment
   CREDENTIAL_REVOKED_PRE_PICKUP: "Counterparty credential revoked after commitment, before pickup; commitment voided",
+  COMMITMENT_UNDER_COMPROMISED_KEY: "A party's acceptance was signed by a key later declared compromised as of a time before the signature; commitment voided",
 } as const;
 
 export type ReasonCode = keyof typeof REASONS;

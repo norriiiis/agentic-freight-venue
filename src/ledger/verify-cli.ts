@@ -1,6 +1,8 @@
 /**
  * Independent artifact verifier. Usage:
- *   npm run verify -- path/to/commitment.json [--venue-key path/to/venue-public.jwk.json] [--ledger path/to/ledger.jsonl]
+ *   npm run verify -- path/to/commitment.json [--venue-key venue-public.jwk.json] [--ledger ledger.jsonl] [--status-list credential-status.json]
+ * --status-list is the venue's published credential status list (revocations + rotations); with it the verifier
+ * can tell whether a signature was made under a key that had already been declared compromised.
  * Uses nothing from the venue process. Exit code 0 iff the artifact verifies.
  */
 import { readFileSync } from "node:fs";
@@ -19,7 +21,9 @@ const opt = (name: string) => {
 };
 const artifact = JSON.parse(readFileSync(file, "utf8")) as CommitmentArtifact;
 const pinned = opt("--venue-key") ? JSON.parse(readFileSync(opt("--venue-key")!, "utf8")) : undefined;
-const res = verifyArtifact(artifact, { pinnedVenueKey: pinned });
+const statusFile = opt("--status-list");
+const statusList = statusFile ? (JSON.parse(readFileSync(statusFile, "utf8")) as { entries?: unknown[] } | unknown[]) : undefined;
+const res = verifyArtifact(artifact, { pinnedVenueKey: pinned, statusList: statusList ? ((Array.isArray(statusList) ? statusList : statusList.entries) as never) : undefined });
 
 console.log(`Commitment ${artifact.commitmentId}`);
 console.log(`  load      ${res.summary.loadRef}`);
@@ -28,6 +32,7 @@ console.log(`  broker    ${res.summary.broker}`);
 console.log(`  carrier   ${res.summary.carrier}`);
 console.log(`  guarantee ${res.summary.guaranteed ? "attached" : "none"}`);
 console.log(`  venue key ${pinned ? "PINNED (supplied by you)" : "EMBEDDED (untrusted unless you pin it)"}`);
+console.log(`  status    ${statusList ? "credential status list supplied — compromise-before-signing is checked" : "no status list — a key compromise declared later cannot be detected offline"}`);
 console.log("");
 for (const c of res.checks) console.log(`  ${c.ok ? "PASS" : "FAIL"}  ${c.name}${!c.ok && c.detail ? `  — ${c.detail}` : ""}`);
 
