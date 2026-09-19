@@ -22,6 +22,7 @@ const config = {
   maxRounds: Number(process.env.VENUE_MAX_ROUNDS ?? 8),
   messageMaxAgeMs: Number(process.env.VENUE_MSG_MAX_AGE_MS ?? 5 * 60_000),
   replyTimeoutMs: Number(process.env.VENUE_REPLY_TIMEOUT_MS ?? 120_000),
+  outboxMaxAttempts: Number(process.env.VENUE_OUTBOX_MAX_ATTEMPTS ?? 40),
   underwriting: process.env.VENUE_UW_PARAMS ? JSON.parse(process.env.VENUE_UW_PARAMS) : undefined,
 };
 const venue = new VenueService(config);
@@ -68,11 +69,13 @@ if (simMode) {
     },
     /** Crash the venue process at a named point inside the next commit (after-journal | after-ledger-append | after-apply). */
     "POST /admin/fault": async (_r, b) => {
-      const { crashAt } = b as { crashAt?: string };
-      venue.simFault = crashAt ? { crashAt } : undefined;
-      venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null } });
-      return ok({ ok: true, crashAt: crashAt ?? null });
+      const { crashAt, holdOutbox } = b as { crashAt?: string; holdOutbox?: boolean };
+      venue.simFault = crashAt || holdOutbox ? { crashAt: crashAt || undefined, holdOutbox: !!holdOutbox } : undefined;
+      venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null, holdOutbox: !!holdOutbox } });
+      return ok({ ok: true, fault: venue.simFault ?? null });
     },
+    "POST /admin/flush-outbox": async () => { await venue.flushOutbox(); return ok({ pending: venue.state.outbox.length, deadLetter: venue.state.deadLetter.length }); },
+    "GET /admin/dead-letter": async () => ok(venue.state.deadLetter.map((n) => ({ id: n.id, toAgentId: n.toAgentId, attempts: n.attempts, note: n.note }))),
     "GET /admin/journal": async () => ok(venue.state.readJournals()),
     "GET /admin/outbox": async () => ok(venue.state.outbox.map((n) => ({ id: n.id, toAgentId: n.toAgentId, attempts: n.attempts, note: n.note }))),
     "GET /admin/exposure": async (req) => {

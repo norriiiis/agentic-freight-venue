@@ -107,6 +107,9 @@ interface Snapshot {
   commitments: Record<string, CommitmentRecord>;
   nonces: Record<string, { messageId: string; ts: string; senderAgentId: string }>;
   outbox: PendingNotice[];
+  deadLetter: PendingNotice[];
+  /** Last moment this venue was known to be alive; recovery measures downtime from it. */
+  lastAliveAt?: string;
 }
 
 export class VenueState {
@@ -115,6 +118,8 @@ export class VenueState {
   commitments = new Map<string, CommitmentRecord>();
   nonces = new Map<string, { messageId: string; ts: string; senderAgentId: string }>();
   outbox: PendingNotice[] = [];
+  deadLetter: PendingNotice[] = [];
+  lastAliveAt?: string;
   private readonly dir: string;
   private readonly journalDir: string;
 
@@ -136,10 +141,13 @@ export class VenueState {
     this.commitments = new Map(Object.entries(s.commitments));
     this.nonces = new Map(Object.entries(s.nonces));
     this.outbox = s.outbox ?? [];
+    this.deadLetter = s.deadLetter ?? [];
+    this.lastAliveAt = s.lastAliveAt;
   }
-  /** One atomic write. Either the whole new state is on disk or none of it. */
+  /** One atomic write. Either the whole new state is on disk or none of it. Doubles as a heartbeat. */
   persist() {
-    const s: Snapshot = { agents: Object.fromEntries(this.agents), tasks: Object.fromEntries(this.tasks), commitments: Object.fromEntries(this.commitments), nonces: Object.fromEntries(this.nonces), outbox: this.outbox };
+    this.lastAliveAt = new Date().toISOString();
+    const s: Snapshot = { agents: Object.fromEntries(this.agents), tasks: Object.fromEntries(this.tasks), commitments: Object.fromEntries(this.commitments), nonces: Object.fromEntries(this.nonces), outbox: this.outbox, deadLetter: this.deadLetter, lastAliveAt: this.lastAliveAt };
     writeFileAtomic(this.file("snapshot.json"), JSON.stringify(s));
   }
 

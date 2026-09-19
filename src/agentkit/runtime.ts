@@ -12,7 +12,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { writeFileAtomic } from "../protocol/fsatomic";
 import { join } from "node:path";
-import { A2A_PROTOCOL_VERSION, FREIGHT_EXTENSION_URI, RPC_ERR, dataPart, signAgentCard, verifyAgentCard, type AgentCard, type Message, type Task } from "../protocol/a2a";
+import { A2A_PROTOCOL_VERSION, FREIGHT_EXTENSION_URI, RPC_ERR, TERMINAL_STATES, dataPart, signAgentCard, verifyAgentCard, type AgentCard, type Message, type Task } from "../protocol/a2a";
 import { hashObject } from "../protocol/canonical";
 import { exportPrivateJwk, generateKeyPair, importKeyPair, signJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import { buildMessage, signMessage, verifyMessageSignature, verifyVenueSignature, type SignedMeta, type VenueAttachment } from "../protocol/envelope";
@@ -144,11 +144,64 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     };
   }
 
-  /** Sign and send a negotiation payload to the venue. */
+  /**
+   * Sign and send a negotiation payload to the venue. Three ways this agent
+   * can learn the outcome, tried in order, all idempotent:
+   *   1. SYNC ACK  — the Task the venue returns; if it is already terminal
+   *                  (the venue committed while answering), its status message
+   *                  is processed right here.
+   *   2. PULL      — if a retry was answered NONCE_REUSED, the venue processed
+   *                  the original before the connection died; tasks/get tells
+   *                  us what it did.
+   *   3. PUSH      — the venue's outbox delivers the notice to /a2a; deduped.
+   */
   async send(data: NegotiationPayload, taskId?: string, contextId?: string): Promise<{ task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown } }> {
     const id = this.identity();
     const m = signMessage(buildMessage({ role: "user", data: data as unknown as Record<string, unknown>, taskId, contextId, senderAgentId: id.agentId, credentialId: id.credentialId }), this.kp);
-    return this.sendRaw(m);
+    const r = await this.sendRaw(m);
+    if (r.duplicate && taskId) await this.pullTask(taskId, "pull-after-retry");
+    else if (r.task && taskId) await this.ingestTask(r.task, "sync-ack");
+    return r;
+  }
+
+  /** Fetch a task from the venue and, if it is terminal, process its status message as if it had been pushed. */
+  async pullTask(taskId: string, source: "pull-after-retry" | "reconcile" | "control"): Promise<boolean> {
+    let task: Task | undefined;
+    try {
+      task = await this.getTask(taskId);
+    } catch (e) {
+      this.audit.write({ component: this.comp.runtime, event: "pull-failed", outcome: "INFO", taskId, evidence: { source, error: String(e).slice(0, 120) } });
+      return false;
+    }
+    if (!task) return false;
+    return this.ingestTask(task, source);
+  }
+
+  /** A terminal Task carries the venue-signed COMMITTED/REFUSED/VOIDED notice in status.message. Process it exactly once. */
+  private async ingestTask(task: Task, source: string): Promise<boolean> {
+    if (!TERMINAL_STATES.includes(task.status.state) || !task.status.message) return false;
+    const m = task.status.message;
+    if (!this.venueKey) return false;
+    const vs = verifyVenueSignature(m, this.venueKey);
+    if (!vs.ok) {
+      this.audit.write({ component: this.comp.runtime, event: "task-notice", outcome: "REFUSED", reasonCode: "ENVELOPE_NOT_FROM_VENUE", taskId: task.id, evidence: { source, error: vs.error } });
+      return false;
+    }
+    if (this.seenInbound.includes(m.messageId)) return false;
+    this.markSeen(m.messageId);
+    this.audit.write({ component: this.comp.runtime, event: "task-notice", outcome: "INFO", taskId: task.id, evidence: { source, state: task.status.state, messageId: m.messageId } });
+    await this.process(m);
+    return true;
+  }
+
+  /** Pull every task this agent still considers OPEN. Runs on a timer; the sim can trigger it. */
+  async reconcile(source: "reconcile" | "control" = "reconcile"): Promise<string[]> {
+    const done: string[] = [];
+    for (const lt of this.tasks.values()) {
+      if (lt.status !== "OPEN") continue;
+      if (await this.pullTask(lt.taskId, source)) done.push(lt.taskId);
+    }
+    return done;
   }
 
   /**
@@ -470,6 +523,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
           return ok(await this.send(data, taskId, contextId));
         },
         "POST /control/send-raw": async (_r: unknown, b: unknown) => ok(await this.sendRaw((b as { message: Message }).message)),
+        "POST /control/reconcile": async () => ok({ resolved: await this.reconcile("control") }),
         /** Fault injection at runtime: models a compromised agent runtime. */
         "POST /control/rogue": async (_r: unknown, b: unknown) => {
           this.config.rogue = (b as { rogue?: AgentConfig["rogue"] }).rogue;
@@ -496,6 +550,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
       } satisfies Record<string, HttpRoute>);
     }
     await startServer(this.config.port, { rpcPath: "/a2a", rpc: (m, p) => this.handleRpc(m, p), routes });
+    setInterval(() => { if (this.credential) this.reconcile().catch(() => {}); }, this.config.reconcileMs ?? 15_000).unref();
     console.log(`[${this.config.agentId}] ${this.config.role} listening on ${this.url}${simMode ? " SIM_MODE" : ""}`);
   }
 }

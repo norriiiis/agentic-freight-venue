@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Scenario, Finding } from "../scenario";
-import { LOAD } from "../fixtures";
+import { LOAD, blueMesaCarrierSpec } from "../fixtures";
 import { standardSetup } from "./common";
 import { pickAudit } from "../scenario";
 import { verifyChain, type LedgerEntry } from "../../ledger/chain";
@@ -59,7 +59,7 @@ export const venueCrashRecovery: Scenario = {
     let n = 0;
     for (const ph of phases) {
       n += 1;
-      await h.venue.fault(ph.crashAt);
+      await h.venue.fault({ crashAt: ph.crashAt });
       const load = { ...LOAD, loadRef: ph.loadRef, commodity: ph.commodity, weightLbs: LOAD.weightLbs + n * 700 };
       const r = await broker.tender(load, { agentId: carrier.spec.agentId });
       taskA ??= r.taskId;
@@ -85,6 +85,25 @@ export const venueCrashRecovery: Scenario = {
       const ok = await invariants(h, broker, carrier, n, ph.label);
       findings.push({ label: ph.label, reasonCode: "COMMITTED", by: "venue.commitment", detail: `recovery ${recovery ? `applied=${(recovery.evidence!.applied as string[]).length} aborted=${(recovery.evidence!.aborted as string[]).length} retried=${(recovery.evidence!.retriedTasks as string[]).length} redelivered=${recovery.evidence!.redelivered}` : "n/a"}; ${ok.length} invariants hold` });
     }
+    // Phase D — a multi-tender sibling is open when the venue dies after the ledger append.
+    // The loser must be canceled by recovery with the RIGHT reason, not left to time out.
+    const carrier2 = await h.startAgent(blueMesaCarrierSpec({ thinkMs: 900 }));
+    await h.venue.fault({ crashAt: "after-ledger-append" });
+    const loadD = { ...LOAD, loadRef: "L-2026-262-0422", commodity: "Household goods, palletized", weightLbs: LOAD.weightLbs + 4 * 700 };
+    const [d1, d2] = await Promise.all([broker.tender(loadD, { agentId: carrier.spec.agentId }), broker.tender(loadD, { agentId: carrier2.spec.agentId })]);
+    await h.venue.waitExit();
+    const tasksAtCrash = JSON.parse(readFileSync(join(h.venue.dir, "state", "snapshot.json"), "utf8")).tasks as Record<string, { task: { status: { state: string } } }>;
+    say(`D: multi-tender; venue died after the ledger append while ${carrier2.spec.agentId}'s negotiation was ${tasksAtCrash[d2.taskId!]?.task.status.state}; 1 journal file on disk — restarting`);
+    await h.restartVenue();
+    const [tD1, tD2] = await Promise.all([h.venue.waitTerminal(d1.taskId!, 15_000), h.venue.waitTerminal(d2.taskId!, 15_000)]);
+    await Promise.all([broker.waitStatus(d1.taskId!, ["COMMITTED"]), carrier.waitStatus(d1.taskId!, ["COMMITTED"]), carrier2.waitStatus(d2.taskId!, ["CANCELED", "REFUSED", "COMMITTED"])]);
+    const recD = (await h.venue.audit()).filter((e) => e.event === "recovery").at(-1);
+    const loserView = (await carrier2.tasks()).find((x) => x.taskId === d2.taskId);
+    say(`   recovery: ${JSON.stringify(recD?.evidence ?? {})}; winner ${tD1.status} ${tD1.commitmentId}; sibling → ${tD2.task.status.state} (${tD2.outcome?.reasonCode}); ${carrier2.spec.agentId} told: ${loserView?.status} ${loserView?.outcome?.reasonCode}`);
+    if (tD1.status !== "COMMITTED" || tD2.outcome?.reasonCode !== "LOAD_ALREADY_COMMITTED" || loserView?.outcome?.reasonCode !== "LOAD_ALREADY_COMMITTED") throw new Error("phase D: sibling was not canceled with LOAD_ALREADY_COMMITTED across the crash");
+    const okD = await invariants(h, broker, carrier, 4, "D");
+    findings.push({ label: "D: multi-tender sibling open at the crash", reasonCode: "LOAD_ALREADY_COMMITTED", by: "venue.commitment", detail: `sibling cancellation is inside the commit transaction (same snapshot as the winner); recovery also reconciles siblings of every ACTIVE commitment; ${okD.length} invariants hold` });
+
     const audit = await h.venue.audit();
     return {
       outcome: "COMMITTED",
@@ -92,7 +111,7 @@ export const venueCrashRecovery: Scenario = {
       commitmentId: (await h.venue.commitments())[0]?.commitmentId,
       findings: [
         ...findings,
-        { label: "how", detail: "journal (atomic) → one durable ledger append = commit point → idempotent apply keyed by commitmentId → one atomic snapshot → journal delete → outbox flush; recovery reconciles journal vs ledger before serving" },
+        { label: "how", detail: "journal (atomic) → one durable ledger append = commit point → idempotent apply keyed by commitmentId (guarantee, exposure, commitment record, task, notices, sibling cancellations, audit) → one atomic snapshot → journal delete → outbox flush; recovery reconciles journal vs ledger before serving" },
         { label: "agent side", detail: "a retry of the in-flight ACCEPT is answered NONCE_REUSED (the nonce is inside the signature) and treated as delivered; inbound notices are deduped by messageId" },
       ],
       auditRefs: pickAudit(audit, "venue", (e) => e.event === "recovery" || e.event === "crash"),

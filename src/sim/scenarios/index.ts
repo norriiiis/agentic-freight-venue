@@ -12,6 +12,7 @@ import { multiTender } from "./multi-tender";
 import { negotiationTimeout } from "./negotiation-timeout";
 import { promptInjection } from "./prompt-injection";
 import { venueCrashRecovery } from "./venue-crash-recovery";
+import { venueCrashNotification } from "./venue-crash-notification";
 
-export const SCENARIOS: Scenario[] = [happyPath, insuranceLapsed, spoofedCarrier, doubleBrokering, brokerOverCeiling, exposureMidNegotiation, nonConvergence, revokedPrePickup, replayAndTamper, multiTender, negotiationTimeout, promptInjection, venueCrashRecovery];
+export const SCENARIOS: Scenario[] = [happyPath, insuranceLapsed, spoofedCarrier, doubleBrokering, brokerOverCeiling, exposureMidNegotiation, nonConvergence, revokedPrePickup, replayAndTamper, multiTender, negotiationTimeout, promptInjection, venueCrashRecovery, venueCrashNotification];
 export const ADVERSARIAL = SCENARIOS.filter((s) => s.id !== "happy-path");

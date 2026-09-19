@@ -20,6 +20,8 @@ export interface AgentConfig {
   proofOfControl: { method: string; token: string };
   /** Simulated deliberation time per decision (ms). Makes transcripts readable and lets the sim inject events mid-negotiation. */
   thinkMs?: number;
+  /** How often to pull tasks/get for negotiations still OPEN locally (push is at-least-once; pull bounds the gap). Default 15s. */
+  reconcileMs?: number;
   /** Pinned principal key: the mandate on disk must be signed by this key or the agent refuses to run. */
   principal: { name: string; publicKey: OkpJwk };
   /**

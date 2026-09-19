@@ -44,6 +44,8 @@ export interface VenueConfig {
   messageMaxAgeMs: number;
   /** How long the venue waits for the awaited party's reply before canceling the negotiation. */
   replyTimeoutMs: number;
+  /** Deliveries abandoned to the dead-letter queue after this many attempts (agents can still pull via tasks/get). */
+  outboxMaxAttempts: number;
   underwriting?: Partial<UnderwritingParams>;
 }
 
@@ -643,18 +645,19 @@ export class VenueService {
       // Notices are enqueued in the same snapshot as the state change: either both persist or neither.
       for (const id of [brokerAgentId, carrierAgentId]) this.enqueue(id, notice, `COMMITTED ${j.commitmentId}`);
     }
+    // Multi-tender losers are canceled INSIDE the transaction: their state change and their
+    // notices ride in the same snapshot as the winner's commitment.
+    const rec = this.state.commitments.get(j.commitmentId)!;
+    const canceled = t ? this.cancelSiblings(t, rec) : 0;
+    // Audit entries are keyed by commitment id so re-application after a crash never duplicates them,
+    // and they are written BEFORE the journal is deleted so a crash cannot lose them.
+    if (j.guarantee) this.audit.writeOnce(`guarantee-attached:${j.commitmentId}`, { component: "underwriting", event: "guarantee-attached", outcome: "ALLOWED", taskId: j.taskId, evidence: { guaranteeId, coveredAmountUsd: j.guarantee.coveredAmountUsd, premiumUsd: j.guarantee.premiumUsd, probabilityOfLoss: j.guarantee.probabilityOfLoss, factors: j.guarantee.factors } });
+    else if (j.declined) this.audit.writeOnce(`guarantee-declined:${j.commitmentId}`, { component: "underwriting", event: "guarantee-declined", outcome: "INFO", reasonCode: j.declined.reasonCode, taskId: j.taskId, evidence: { ...j.declined.evidence, proceededUnguaranteed: true } });
+    this.audit.writeOnce(`commit:${j.commitmentId}`, { component: "venue.commitment", event: "commit", outcome: "ALLOWED", taskId: j.taskId, contextId: t?.task.contextId, evidence: { commitmentId: j.commitmentId, termsHash: artifact.termsHash, rateUsd: terms.rateUsd, guaranteed: !!guaranteeId, ledgerSeq: entry.seq, mode, siblingsCanceled: canceled } });
     this.state.persist();
     this.crashIf("after-apply");
     this.state.deleteJournal(j.commitmentId);
-
-    if (!alreadyRecorded) {
-      if (j.guarantee) this.audit.write({ component: "underwriting", event: "guarantee-attached", outcome: "ALLOWED", taskId: j.taskId, evidence: { guaranteeId, coveredAmountUsd: j.guarantee.coveredAmountUsd, premiumUsd: j.guarantee.premiumUsd, probabilityOfLoss: j.guarantee.probabilityOfLoss, factors: j.guarantee.factors } });
-      else if (j.declined) this.audit.write({ component: "underwriting", event: "guarantee-declined", outcome: "INFO", reasonCode: j.declined.reasonCode, taskId: j.taskId, evidence: { ...j.declined.evidence, proceededUnguaranteed: true } });
-      this.audit.write({ component: "venue.commitment", event: "commit", outcome: "ALLOWED", taskId: j.taskId, contextId: t?.task.contextId, evidence: { commitmentId: j.commitmentId, termsHash: artifact.termsHash, rateUsd: terms.rateUsd, guaranteed: !!guaranteeId, ledgerSeq: entry.seq, mode } });
-    }
     await this.flushOutbox();
-    const rec = this.state.commitments.get(j.commitmentId)!;
-    if (t) await this.cancelSiblings(t, rec);
   }
 
   // ---------------------------------------------------------------- recovery
@@ -663,7 +666,10 @@ export class VenueService {
    * Run once at startup, before serving. Reconciles the journal against the
    * ledger, finishes in-flight commits, and re-delivers owed notices.
    */
-  async recover(): Promise<{ applied: string[]; aborted: string[]; retried: string[]; redelivered: number }> {
+  async recover(): Promise<{ applied: string[]; aborted: string[]; retried: string[]; redelivered: number; siblingsCanceled: number; downtimeMs: number; shifted: number }> {
+    // Read the heartbeat before anything below persists (and refreshes it).
+    const lastAliveAt = this.state.lastAliveAt;
+    const deliveredBefore = this.delivered;
     const applied: string[] = [];
     const aborted: string[] = [];
     const retried: string[] = [];
@@ -692,17 +698,36 @@ export class VenueService {
       retried.push(t.task.id);
       await this.commit(t, accept.terms);
     }
-    const before = this.state.outbox.length;
-    await this.flushOutbox();
-    const redelivered = before - this.state.outbox.length;
-    if (applied.length || aborted.length || retried.length || redelivered) {
-      this.audit.write({ component: "venue.commitment", event: "recovery", outcome: "INFO", evidence: { applied, aborted, retriedTasks: retried, redelivered, outboxPending: this.state.outbox.length } });
+    // Multi-tender losers of any ACTIVE commitment that are somehow still open (a crash between the
+    // snapshot and the journal delete cannot cause this any more, but recovery must not depend on that).
+    let siblingsCanceled = 0;
+    for (const c of this.state.commitments.values()) {
+      if (c.status !== "ACTIVE") continue;
+      siblingsCanceled += this.cancelSiblings({ task: { id: c.taskId }, brokerAgentId: c.brokerAgentId }, c);
     }
-    return { applied, aborted, retried, redelivered };
+    // The venue's downtime must not count against the party it was waiting on: shift every open
+    // task's reply clock forward by the time this venue was dead.
+    const now = Date.now();
+    const downtimeMs = lastAliveAt ? Math.max(0, now - new Date(lastAliveAt).getTime()) : 0;
+    let shifted = 0;
+    if (downtimeMs > 0) {
+      for (const t of this.state.tasks.values()) {
+        if (TERMINAL_STATES.includes(t.task.status.state)) continue;
+        t.awaitingSince = new Date(new Date(t.awaitingSince).getTime() + downtimeMs).toISOString();
+        shifted += 1;
+      }
+    }
+    this.state.persist();
+    await this.flushOutbox();
+    const redelivered = this.delivered - deliveredBefore;
+    if (applied.length || aborted.length || retried.length || redelivered || siblingsCanceled || shifted) {
+      this.audit.write({ component: "venue.commitment", event: "recovery", outcome: "INFO", evidence: { applied, aborted, retriedTasks: retried, redelivered, siblingsCanceled, downtimeMs, replyClocksShifted: shifted, outboxPending: this.state.outbox.length, deadLetter: this.state.deadLetter.length } });
+    }
+    return { applied, aborted, retried, redelivered, siblingsCanceled, downtimeMs, shifted };
   }
 
   /** SIM-ONLY fault injection: die at a named point inside a commit. Never present in a deployed venue. */
-  simFault?: { crashAt: string };
+  simFault?: { crashAt?: string; holdOutbox?: boolean };
   private crashIf(point: string) {
     if (process.env.SIM_MODE === "1" && this.simFault?.crashAt === point) {
       this.audit.write({ component: "sim", event: "crash", outcome: "INFO", evidence: { crashAt: point } });
@@ -718,14 +743,22 @@ export class VenueService {
     return undefined;
   }
 
-  /** Multi-tender: once one carrier's commitment is recorded, every other open negotiation for the same load is canceled. */
-  private async cancelSiblings(winner: NegotiationTask, rec: CommitmentRecord) {
+  /**
+   * Multi-tender: once one carrier's commitment is recorded, every other open
+   * negotiation for the same load is canceled. Mutates state and enqueues
+   * notices only — the caller persists. Idempotent (terminal tasks are skipped),
+   * so recovery can call it for every ACTIVE commitment.
+   */
+  private cancelSiblings(winner: NegotiationTask | { task: { id: string }; brokerAgentId: string }, rec: CommitmentRecord): number {
+    let n = 0;
     for (const s of this.state.tasks.values()) {
       if (s.task.id === winner.task.id || s.brokerAgentId !== winner.brokerAgentId) continue;
       if (TERMINAL_STATES.includes(s.task.status.state)) continue;
       if (s.loadRef !== rec.loadRef && loadFingerprint(s.load) !== rec.loadFingerprint) continue;
-      await this.fail(s, "LOAD_ALREADY_COMMITTED", "venue.commitment", { agentId: s.brokerAgentId, winningCommitmentId: rec.commitmentId, canceledTaskId: s.task.id, canceledCounterparty: s.carrierAgentId, round: s.round, stateAtCancel: s.status }, undefined, undefined, s.brokerAgentId, "CANCELED");
+      this.terminate(s, "LOAD_ALREADY_COMMITTED", "venue.commitment", { agentId: s.brokerAgentId, winningCommitmentId: rec.commitmentId, canceledTaskId: s.task.id, canceledCounterparty: s.carrierAgentId, round: s.round, stateAtCancel: s.status }, s.brokerAgentId, "CANCELED");
+      n += 1;
     }
+    return n;
   }
 
   /**
@@ -752,17 +785,27 @@ export class VenueService {
    * counterparty through a refusal (see DECISIONS.md Q2).
    */
   private async fail(t: NegotiationTask, reasonCode: ReasonCode, refusedBy: Component, evidence: Record<string, unknown>, _triggering?: Message, _other?: RegisteredAgent, subject?: string, disposition: "FAILED" | "CANCELED" = reasonCode === "NEGOTIATION_WALKAWAY" ? "CANCELED" : "FAILED") {
+    this.terminate(t, reasonCode, refusedBy, evidence, subject, disposition);
+    this.state.persist();
+    await this.flushOutbox();
+  }
+
+  /**
+   * Terminate a negotiation: mutate the task, write the (idempotent) audit
+   * entry, enqueue notices. Does NOT persist or flush — the caller decides
+   * what else rides in the same snapshot. The party the refusal is ABOUT
+   * (`subject`) gets the full evidence; the other party gets a redacted
+   * notice (see DECISIONS.md Q2).
+   */
+  private terminate(t: NegotiationTask, reasonCode: ReasonCode, refusedBy: Component, evidence: Record<string, unknown>, subject?: string, disposition: "FAILED" | "CANCELED" = "FAILED") {
     t.status = reasonCode === "NEGOTIATION_WALKAWAY" ? "REJECTED" : disposition === "CANCELED" ? "CANCELED" : "FAILED";
     t.outcome = { reasonCode, refusedBy, evidence, guaranteeWouldHavePaid: guaranteeWouldHavePaid(reasonCode) };
     const subjectId = subject ?? (typeof evidence.agentId === "string" ? evidence.agentId : typeof evidence.acceptedBy === "string" ? evidence.acceptedBy : typeof evidence.by === "string" ? evidence.by : undefined);
     const full = this.venueMessage({ type: "REFUSED", loadRef: t.loadRef, reasonCode, refusedBy, evidence, disposition }, t.task.id, t.task.contextId);
     const redacted = this.venueMessage({ type: "REFUSED", loadRef: t.loadRef, reasonCode, refusedBy, evidence: redactForCounterparty(evidence, subjectId), disposition }, t.task.id, t.task.contextId);
     t.task.status = { state: disposition === "CANCELED" ? "canceled" : "failed", timestamp: new Date().toISOString(), message: full };
-    this.state.persist();
-    this.audit.write({ component: refusedBy, event: "negotiation-terminated", outcome: "REFUSED", reasonCode, taskId: t.task.id, contextId: t.task.contextId, subject: subjectId, evidence });
+    this.audit.writeOnce(`terminated:${t.task.id}`, { component: refusedBy, event: "negotiation-terminated", outcome: "REFUSED", reasonCode, taskId: t.task.id, contextId: t.task.contextId, subject: subjectId, evidence });
     for (const id of [t.brokerAgentId, t.carrierAgentId]) if (this.state.agents.has(id)) this.enqueue(id, !subjectId || id === subjectId ? full : redacted, `REFUSED ${reasonCode}`);
-    this.state.persist();
-    await this.flushOutbox();
   }
 
   // ------------------------------------------------------- outbound to agents
@@ -807,6 +850,8 @@ export class VenueService {
   }
 
   private flushing = false;
+  /** Successful deliveries since process start (recovery reports how many notices it owed). */
+  private delivered = 0;
   async flushOutbox(): Promise<void> {
     if (this.flushing) return;
     this.flushing = true;
@@ -815,25 +860,39 @@ export class VenueService {
       const blocked = new Set<string>(); // per-recipient ordering: a failed delivery blocks only that agent's later notices
       for (const n of [...this.state.outbox]) {
         if (blocked.has(n.toAgentId) || new Date(n.nextAttemptAt).getTime() > now) continue;
+        // SIM fault: the venue cannot push its own notices (COMMITTED/REFUSED/VOIDED); forwards still flow.
+        if (this.simFault?.holdOutbox && (n.message.metadata as { senderAgentId?: string } | undefined)?.senderAgentId === "venue") {
+          blocked.add(n.toAgentId);
+          continue;
+        }
         const to = this.state.agents.get(n.toAgentId);
         if (!to) {
           this.state.outbox = this.state.outbox.filter((x) => x.id !== n.id);
           continue;
         }
-        this.state.logMessage("OUT", n.message, `to ${to.agentId}`);
         let ok = false;
         try {
           const res = await rpcCall(`${to.url}/a2a`, "message/send", { message: n.message });
           ok = !res.error;
           if (res.error) this.audit.write({ component: "venue.routing", event: "deliver", outcome: "INFO", subject: to.agentId, taskId: n.message.taskId, evidence: { error: res.error, attempt: n.attempts + 1 } });
         } catch (e) {
-          this.audit.write({ component: "venue.routing", event: "deliver", outcome: "INFO", subject: to.agentId, taskId: n.message.taskId, evidence: { error: String(e), attempt: n.attempts + 1 } });
+          this.audit.write({ component: "venue.routing", event: "deliver", outcome: "INFO", subject: to.agentId, taskId: n.message.taskId, evidence: { error: String(e).slice(0, 120), attempt: n.attempts + 1 } });
         }
-        if (ok) this.state.outbox = this.state.outbox.filter((x) => x.id !== n.id);
-        else {
+        if (ok) {
+          this.delivered += 1;
+          // Logged only once actually delivered, so the wire log never shows a delivery that did not happen.
+          this.state.logMessage("OUT", n.message, `to ${to.agentId}`);
+          this.state.outbox = this.state.outbox.filter((x) => x.id !== n.id);
+        } else {
           n.attempts += 1;
           n.nextAttemptAt = new Date(Date.now() + Math.min(30_000, 250 * 2 ** n.attempts)).toISOString();
           blocked.add(n.toAgentId);
+          if (n.attempts >= this.config.outboxMaxAttempts) {
+            // Give up pushing; the agent can still pull the task via tasks/get.
+            this.state.outbox = this.state.outbox.filter((x) => x.id !== n.id);
+            this.state.deadLetter.push(n);
+            this.audit.write({ component: "venue.routing", event: "deliver-abandoned", outcome: "INFO", subject: to.agentId, taskId: n.message.taskId, evidence: { attempts: n.attempts, note: n.note, recoverable: "agent may pull via tasks/get" } });
+          }
         }
         this.state.persist();
       }

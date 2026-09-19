@@ -62,6 +62,7 @@ export class AgentHandle {
   onboard() { return httpPost<{ ok: boolean; reasonCode?: string; evidence?: unknown; credential?: { credentialId: string } }>(`${this.url}/control/onboard`, {}); }
   tender(load: LoadSpec, to: { agentId: string }) { return httpPost<{ taskId?: string; task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown }; localRefusal?: boolean }>(`${this.url}/control/tender`, { load, to }); }
   send(data: NegotiationPayload, taskId?: string, contextId?: string) { return httpPost<{ task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown } }>(`${this.url}/control/send`, { data, taskId, contextId }); }
+  reconcile() { return httpPost<{ resolved: string[] }>(`${this.url}/control/reconcile`, {}); }
   setRogue(rogue: AgentConfig["rogue"] | undefined) { return httpPost<{ ok: boolean }>(`${this.url}/control/rogue`, { rogue }); }
   sendRaw(message: Message) { return httpPost<{ task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown } }>(`${this.url}/control/send-raw`, { message }); }
   tasks() { return httpGet<LocalTask[]>(`${this.url}/control/tasks`); }
@@ -84,7 +85,9 @@ export class AgentHandle {
 export class VenueHandle {
   constructor(readonly dir: string, readonly url: string, public proc: ChildProcess) {}
   /** Arm a crash at a named point inside the next commit (SIM-ONLY). */
-  fault(crashAt: string | null) { return httpPost<{ ok: boolean }>(`${this.url}/admin/fault`, { crashAt }); }
+  fault(f: { crashAt?: string; holdOutbox?: boolean } | null) { return httpPost<{ ok: boolean }>(`${this.url}/admin/fault`, f ?? {}); }
+  flushOutbox() { return httpPost<{ pending: number; deadLetter: number }>(`${this.url}/admin/flush-outbox`, {}); }
+  deadLetter() { return httpGet<{ toAgentId: string; attempts: number; note?: string }[]>(`${this.url}/admin/dead-letter`); }
   journal() { return httpGet<unknown[]>(`${this.url}/admin/journal`); }
   outbox() { return httpGet<{ toAgentId: string; attempts: number; note?: string }[]>(`${this.url}/admin/outbox`); }
   exposure(counterparty: string, beneficiary: string) { return httpGet<{ counterpartyOutstandingUsd: number; pairOutstandingUsd: number; portfolioOutstandingUsd: number }>(`${this.url}/admin/exposure?counterparty=${counterparty}&beneficiary=${beneficiary}`); }
@@ -136,7 +139,7 @@ export class VenueHandle {
 export interface HarnessOptions {
   workspace: string;
   quiet?: boolean;
-  venue?: { maxRounds?: number; replyTimeoutMs?: number; sweepMs?: number; underwriting?: Record<string, unknown> };
+  venue?: { maxRounds?: number; replyTimeoutMs?: number; sweepMs?: number; outboxMaxAttempts?: number; underwriting?: Record<string, unknown> };
 }
 
 export class Harness {
@@ -162,6 +165,7 @@ export class Harness {
       VENUE_MAX_ROUNDS: String(this.opts.venue?.maxRounds ?? 8),
       VENUE_REPLY_TIMEOUT_MS: String(this.opts.venue?.replyTimeoutMs ?? 120_000),
       VENUE_SWEEP_MS: String(this.opts.venue?.sweepMs ?? 5_000),
+      VENUE_OUTBOX_MAX_ATTEMPTS: String(this.opts.venue?.outboxMaxAttempts ?? 40),
       VENUE_UW_PARAMS: this.opts.venue?.underwriting ? JSON.stringify(this.opts.venue.underwriting) : "",
       SIM_MODE: "1",
     };
