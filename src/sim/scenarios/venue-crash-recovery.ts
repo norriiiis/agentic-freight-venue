@@ -12,9 +12,9 @@ const RATE = 2215;
 
 /** Every invariant a crash could break. Throws on the first violation. */
 async function invariants(h: Harness, broker: AgentHandle, carrier: AgentHandle, expectCommits: number, label: string) {
-  const venueKey = JSON.parse(readFileSync(join(h.venue.dir, "venue-public.jwk.json"), "utf8")) as OkpJwk;
+  const venueKey = JSON.parse(readFileSync(join(h.venue.dir, "venue-root-public.jwk.json"), "utf8")) as OkpJwk;
   const ledger = readFileSync(join(h.venue.dir, "ledger.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as LedgerEntry);
-  const chain = verifyChain(ledger, venueKey);
+  const chain = verifyChain(ledger, { rootPublicKey: venueKey });
   const commits = ledger.filter((e) => e.type === "COMMITMENT");
   const commitments = await h.venue.commitments();
   const guarantees = (await h.venue.guarantees()).filter((g) => g.status === "ATTACHED" && !g.guaranteeId.startsWith("gtee_seed"));

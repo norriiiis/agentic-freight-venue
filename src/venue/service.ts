@@ -9,11 +9,13 @@
  * (costs, margins, strategy). See DECISIONS.md Q5.
  */
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { A2A_PROTOCOL_VERSION, FREIGHT_EXTENSION_URI, RPC_ERR, TERMINAL_STATES, dataPart, signAgentCard, verifyAgentCard, type AgentCard, type Message, type Task } from "../protocol/a2a";
 import { canonicalize, hashObject } from "../protocol/canonical";
-import { exportPrivateJwk, generateKeyPair, importKeyPair, importPublicKey, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
+import { importPublicKey, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
+import { VenueKeyRing } from "./keyring";
+import { verifyCert, verifyRevocation, type VenueKeyCert, type VenueKeyRevocation } from "../protocol/venue-keys";
 import { buildMessage, venueSignMessage, type SignedMeta, type VenueAttachment } from "../protocol/envelope";
 import { loadFingerprint, termsHash, textDigest, validateNegotiationPayload, type AcceptPayload, type CounterPayload, type NegotiationPayload, type RejectPayload, type TenderPayload, type Terms } from "../protocol/freight";
 import { REASONS, type ReasonCode } from "../protocol/reasons";
@@ -28,10 +30,10 @@ import { envelopeToLimits, evaluateMandate } from "../mandate/engine";
 import { verifyEnvelope } from "../mandate/sign";
 import { ExposureBook } from "../mandate/exposure";
 import { Ledger, type LedgerEntry } from "../ledger/chain";
-import { artifactHash, buildArtifact, type CommitmentArtifact } from "../ledger/artifact";
+import { artifactHash, buildArtifact, reattestArtifact, type CommitmentArtifact } from "../ledger/artifact";
 import { UnderwritingEngine } from "../underwriting/engine";
 import { DEFAULT_PARAMS, type RiskInputs, type UnderwritingParams } from "../underwriting/types";
-import { VenueState, type CommitJournal, type CommitmentRecord, type NegotiationTask, type Offer, type RegisteredAgent, type VoidJournal } from "./state";
+import { VenueState, type CommitJournal, type CommitmentRecord, type KeyRotationJournal, type NegotiationTask, type Offer, type RegisteredAgent, type VoidJournal } from "./state";
 import { GUARANTEE_SCOPE } from "../underwriting/types";
 import { guaranteeWouldHavePaid } from "./guarantee-outcome";
 
@@ -56,7 +58,8 @@ export class Refusal extends Error {
 }
 
 export class VenueService {
-  readonly kp: KeyPair;
+  /** Venue key ring: root public key, ACTIVE operational key, certificates, revocations. Never cache `kp` across a rotation. */
+  readonly keys: VenueKeyRing;
   readonly registry: MockRegistry;
   readonly issuer: CredentialIssuer;
   readonly ledger: Ledger;
@@ -68,20 +71,23 @@ export class VenueService {
 
   constructor(readonly config: VenueConfig) {
     mkdirSync(config.dataDir, { recursive: true });
-    const keyPath = join(config.dataDir, "venue-key.jwk.json");
-    if (existsSync(keyPath)) this.kp = importKeyPair(JSON.parse(readFileSync(keyPath, "utf8")));
-    else {
-      this.kp = generateKeyPair();
-      writeFileSync(keyPath, JSON.stringify(exportPrivateJwk(this.kp)));
-    }
-    writeFileSync(join(config.dataDir, "venue-public.jwk.json"), JSON.stringify(this.kp.publicJwk, null, 2));
+    this.keys = new VenueKeyRing(config.dataDir, config.venueId);
     this.url = `http://127.0.0.1:${config.port}`;
     this.registry = new MockRegistry(config.registryPath);
-    this.issuer = new CredentialIssuer(config.venueId, this.kp, this.registry, new StubVettingProvider(this.registry), config.dataDir);
-    this.ledger = new Ledger(join(config.dataDir, "ledger.jsonl"), this.kp);
+    this.issuer = new CredentialIssuer(config.venueId, () => this.keys.signer(), this.registry, new StubVettingProvider(this.registry), config.dataDir);
+    this.ledger = new Ledger(join(config.dataDir, "ledger.jsonl"), () => this.keys.signer(), this.keys.currentCert());
     this.underwriting = new UnderwritingEngine(config.dataDir, { ...DEFAULT_PARAMS, ...config.underwriting });
     this.audit = new AuditLog(join(config.dataDir, "audit.jsonl"));
     this.state = new VenueState(config.dataDir);
+  }
+
+  /** The current operational signing key. Read it fresh every time; it changes on rotation. */
+  get kp(): KeyPair {
+    return this.keys.signer();
+  }
+  /** Resolver for verifying anything signed by ANY certified venue key (current or retired), with compromise awareness. */
+  private venueKeys() {
+    return this.keys.resolver();
   }
 
   // ---------------------------------------------------------------- identity
@@ -105,7 +111,7 @@ export class VenueService {
           { id: "onboard", name: "Onboard agent", description: "Bind an agent key to a registry entity and issue a credential", tags: ["identity"] },
           { id: "negotiate", name: "Route negotiation", description: "Route tender/counter/accept between credentialed agents", tags: ["negotiation"] },
         ],
-        metadata: { venueId: this.config.venueId, issuerKid: this.kp.kid },
+        metadata: { venueId: this.config.venueId, issuerKid: this.kp.kid, venueKeys: { rootPublicKey: this.keys.rootPublicKey, cert: this.keys.currentCert() } },
       },
       this.kp,
     );
@@ -142,7 +148,7 @@ export class VenueService {
     this.state.agents.set(agentId, reg);
     this.state.persist();
     this.audit.write({ component: "venue.identity", event: "onboard", outcome: "ALLOWED", subject: agentId, evidence: { credentialId: res.credential.credentialId, entity: res.credential.subject.entity, envelopeRegistered: !!envelope, vettingFlags: res.credential.evidence.vettingFlags } });
-    return { credential: res.credential, venueCard: this.agentCard(), issuerPublicKey: this.kp.publicJwk };
+    return { credential: res.credential, venueCard: this.agentCard(), issuerPublicKey: this.kp.publicJwk, venueKeys: this.keys.history() };
   }
 
   /**
@@ -199,6 +205,101 @@ export class VenueService {
     return voided;
   }
 
+  /** Certificates for the given venue kids (deduplicated). */
+  private certsFor(kids: string[]): VenueKeyCert[] {
+    const out: VenueKeyCert[] = [];
+    for (const k of new Set(kids)) {
+      const c = this.keys.certFor(k);
+      if (c) out.push(c);
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------ venue key rotation
+  //
+  // Two steps, like an agent's: the venue process generates the next key but
+  // cannot certify it; the OPERATOR's root does. Commit is a transaction:
+  //   journal → KEY_ROTATION ledger entry signed by the SUCCESSOR (its
+  //   authority is the root-signed cert it carries) → install → persist →
+  //   (compromise: re-issue credentials, re-attest commitments, reseal the
+  //   ledger) → notices. Recovery finishes a rotation whose entry is on the
+  //   ledger and discards one whose entry is not.
+
+  keyRotationPrepare(params: { authorization: string }) {
+    const claims = this.rootAuthorized(params.authorization, "key-rotation/prepare");
+    const p = this.keys.prepare();
+    this.audit.write({ component: "venue.identity", event: "venue-key-prepare", outcome: "INFO", evidence: { pendingKid: p.kid, seq: p.seq, ts: claims.ts } });
+    return p;
+  }
+
+  async keyRotationCommit(params: { cert: VenueKeyCert; revocation?: VenueKeyRevocation }) {
+    if (!verifyCert(params.cert, this.keys.rootPublicKey)) throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: "certificate not signed by the venue root", certKid: params.cert.kid, rootKid: this.keys.rootPublicKey.kid });
+    if (params.revocation && !verifyRevocation(params.revocation, this.keys.rootPublicKey)) throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: "revocation not signed by the venue root" });
+    if (params.revocation && params.revocation.kid !== this.kp.kid) throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: "revocation does not name the active key", active: this.kp.kid, named: params.revocation.kid });
+    const pending = this.keys.pendingSigner();
+    if (!pending || pending.kid !== params.cert.kid) throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: "certificate does not name the pending key", pendingKid: pending?.kid, certKid: params.cert.kid });
+    const previousKid = this.kp.kid;
+    const journal: KeyRotationJournal = { kind: "KEY_ROTATION", commitmentId: `keyrot_${params.cert.kid.slice(0, 16)}`, writtenAt: new Date().toISOString(), previousKid, cert: params.cert, revocation: params.revocation };
+    this.state.writeJournal(journal);
+    // The entry is the successor's first signature; its authority is the root-signed certificate in its payload.
+    const entry = this.ledger.append("KEY_ROTATION", { previousKid, cert: params.cert, revocation: params.revocation ?? null, reason: params.cert.reason }, pending);
+    this.crashIf("after-key-rotation-append");
+    return this.applyKeyRotation(journal, entry, "live");
+  }
+
+  private async applyKeyRotation(j: KeyRotationJournal, entry: LedgerEntry, mode: "live" | "recovery") {
+    this.keys.install(j.cert, j.revocation); // idempotent by kid
+    this.state.persist();
+    const compromisedAt = j.revocation?.compromisedAt ? new Date(j.revocation.compromisedAt) : undefined;
+    let reissued: string[] = [];
+    let reattested: string[] = [];
+    let resealed: { fromSeq: number; toSeq: number } | undefined;
+    if (compromisedAt) {
+      // 1. Credentials issued under the compromised key after the compromise: re-sign under the new key, push to agents.
+      const creds = this.issuer.reissueUnder(j.previousKid, compromisedAt);
+      reissued = creds.map((c) => c.credentialId);
+      for (const c of creds) {
+        const reg = this.state.agentByCredential(c.credentialId);
+        if (reg) this.enqueue(reg.agentId, this.venueMessage({ type: "CREDENTIAL_REISSUED", credential: c as unknown as Record<string, unknown>, reason: `venue key ${j.previousKid.slice(0, 12)}… compromised as of ${j.revocation!.compromisedAt}` }, "n/a", "n/a"), `CREDENTIAL_REISSUED ${c.credentialId}`);
+      }
+      // 2. Commitments attested under the compromised key after the compromise: re-attest (additive) and record it.
+      for (const c of this.state.commitments.values()) {
+        const suspect = c.artifact.venueAttestations.some((a) => a.kid === j.previousKid && new Date(a.at) >= compromisedAt);
+        const alreadyReattested = c.artifact.venueAttestations.some((a) => a.kid === this.kp.kid);
+        if (!suspect || alreadyReattested) continue;
+        const fresh = { broker: this.issuer.get(c.artifact.credentials.broker.credentialId) ?? c.artifact.credentials.broker, carrier: this.issuer.get(c.artifact.credentials.carrier.credentialId) ?? c.artifact.credentials.carrier };
+        c.artifact = reattestArtifact(c.artifact, this.kp, { credentials: fresh, addCerts: this.certsFor([this.kp.kid, fresh.broker.issuer.kid, fresh.carrier.issuer.kid]) });
+        this.ledger.append("REATTESTATION", { commitmentId: c.commitmentId, previousKid: j.previousKid, kid: this.kp.kid, artifactHash: artifactHash(c.artifact) });
+        reattested.push(c.commitmentId);
+        const t = this.state.tasks.get(c.taskId);
+        if (t) t.task.artifacts = [{ artifactId: c.commitmentId, name: "commitment", description: "Signed commitment artifact (re-attested)", parts: [{ kind: "data", data: c.artifact as unknown as Record<string, unknown> }] }];
+        for (const id of [c.brokerAgentId, c.carrierAgentId]) this.enqueue(id, this.venueMessage({ type: "COMMITMENT_REATTESTED", loadRef: c.loadRef, commitmentId: c.commitmentId, artifact: c.artifact as unknown as Record<string, unknown>, reason: `venue key ${j.previousKid.slice(0, 12)}… compromised as of ${j.revocation!.compromisedAt}` }, c.taskId, `ctx_${c.loadRef}`), `COMMITMENT_REATTESTED ${c.commitmentId}`);
+      }
+      // 3. Ledger entries the compromised key signed after the compromise: the new key affirms them as this venue's own.
+      const suspectSeqs = this.ledger.all().filter((e) => e.type !== "KEY_ROTATION" && new Date(e.ts) >= compromisedAt && e.seq < entry.seq).map((e) => e.seq);
+      if (suspectSeqs.length) {
+        resealed = { fromSeq: Math.min(...suspectSeqs), toSeq: Math.max(...suspectSeqs) };
+        this.ledger.append("RESEAL", { ...resealed, previousKid: j.previousKid, reason: "entries signed by a key later declared compromised; affirmed from the venue's own records" });
+      }
+      this.state.persist();
+    }
+    this.state.deleteJournal(j.commitmentId);
+    this.audit.writeOnce(`venue-key-rotation:${j.cert.kid}`, { component: "venue.identity", event: "venue-key-rotation", outcome: "ALLOWED", evidence: { reason: j.cert.reason, previousKid: j.previousKid, newKid: j.cert.kid, seq: j.cert.seq, ledgerSeq: entry.seq, compromisedAt: j.revocation?.compromisedAt, credentialsReissued: reissued, commitmentsReattested: reattested, resealed, mode } });
+    await this.flushOutbox();
+    return { previousKid: j.previousKid, kid: j.cert.kid, seq: j.cert.seq, credentialsReissued: reissued, commitmentsReattested: reattested, resealed };
+  }
+
+  /** Verify a root-signed operator request `{ action, ts }`. */
+  private rootAuthorized(jws: string, action: string): { action: string; ts: string } {
+    const res = verifyJws(jws, importPublicKey(this.keys.rootPublicKey));
+    const claims = res.payload as { action?: string; ts?: string } | undefined;
+    if (!res.ok || claims?.action !== action || !claims.ts || Math.abs(Date.now() - new Date(claims.ts).getTime()) > 5 * 60_000) {
+      this.audit.write({ component: "venue.identity", event: action, outcome: "REFUSED", reasonCode: "VENUE_KEY_ROTATION_UNAUTHORIZED", evidence: { error: res.error ?? "claims mismatch", action } });
+      throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: res.error ?? "operator request not signed by the venue root or stale", action });
+    }
+    return { action: claims.action, ts: claims.ts };
+  }
+
   // ------------------------------------------------------------- RPC surface
 
   async handleRpc(method: string, params: unknown, headers: Record<string, string | string[] | undefined>): Promise<unknown> {
@@ -208,6 +309,10 @@ export class VenueService {
           return await this.onboard(params as Parameters<VenueService["onboard"]>[0]);
         case "venue/rotate":
           return await this.rotate(params as Parameters<VenueService["rotate"]>[0]);
+        case "venue/key-rotation/prepare":
+          return this.keyRotationPrepare(params as { authorization: string });
+        case "venue/key-rotation/commit":
+          return await this.keyRotationCommit(params as { cert: VenueKeyCert; revocation?: VenueKeyRevocation });
         case "message/send": {
           const m = (params as { message: Message }).message;
           return await this.ingest(m);
@@ -243,7 +348,7 @@ export class VenueService {
     }
     void h;
     const cred = this.issuer.get(claims.credentialId);
-    const cv = verifyCredential(cred, { issuerPublicKey: this.kp.publicJwk, status: this.issuer.status(claims.credentialId) });
+    const cv = verifyCredential(cred, { issuerKeys: this.venueKeys(), status: this.issuer.status(claims.credentialId) });
     if (!cv.ok || !cred) throw new Refusal(cv.reasonCode ?? "CREDENTIAL_UNKNOWN", "venue.identity", cv.evidence);
     const sig = verifyJws(token, importPublicKey(cred.subject.publicKey));
     if (!sig.ok || claims.method !== method || (taskId && claims.taskId !== taskId) || Math.abs(Date.now() - new Date(claims.ts).getTime()) > this.config.messageMaxAgeMs) {
@@ -277,7 +382,7 @@ export class VenueService {
     }
     // 2. credential (issuer sig, expiry, revocation)
     const cred = this.issuer.get(meta.credentialId);
-    const cv = verifyCredential(cred, { issuerPublicKey: this.kp.publicJwk, status: this.issuer.status(meta.credentialId) });
+    const cv = verifyCredential(cred, { issuerKeys: this.venueKeys(), status: this.issuer.status(meta.credentialId) });
     if (!cv.ok || !cred) {
       this.audit.write({ component: "venue.identity", event: "ingest", outcome: "REFUSED", reasonCode: cv.reasonCode, subject: meta.senderAgentId, taskId: m.taskId, evidence: cv.evidence });
       throw new Refusal(cv.reasonCode ?? "CREDENTIAL_UNKNOWN", "venue.identity", cv.evidence);
@@ -354,7 +459,7 @@ export class VenueService {
     if (!cp) violations.push({ code: "COUNTERPARTY_UNVERIFIED", evidence: { requestedAgentId: data.to.agentId, registeredAgents: [...this.state.agents.keys()] } });
     else {
       cpCred = this.issuer.get(cp.credentialId);
-      const cv = verifyCredential(cpCred, { issuerPublicKey: this.kp.publicJwk, status: this.issuer.status(cp.credentialId), now });
+      const cv = verifyCredential(cpCred, { issuerKeys: this.venueKeys(), status: this.issuer.status(cp.credentialId), now });
       if (!cv.ok || !cpCred) violations.push({ code: cv.reasonCode!, evidence: { counterparty: cp.agentId, ...cv.evidence } });
       else {
         const requiredBipd = sender.envelope?.limits.requiredCounterpartyInsuranceUsd;
@@ -600,7 +705,7 @@ export class VenueService {
 
     // 1. PREPARE — final identity re-verification of both parties at the moment of commitment.
     for (const [reg, cred] of [[brokerReg, this.issuer.get(brokerReg.credentialId)!], [carrierReg, this.issuer.get(carrierReg.credentialId)!]] as const) {
-      const cv = verifyCredential(cred, { issuerPublicKey: this.kp.publicJwk, status: this.issuer.status(cred.credentialId) });
+      const cv = verifyCredential(cred, { issuerKeys: this.venueKeys(), status: this.issuer.status(cred.credentialId) });
       const lv = cv.ok ? liveCheck(this.registry, cred, { hazmat: t.load.hazmat, requiredBipdUsd: reg.agentId === t.carrierAgentId ? brokerReg.envelope?.limits.requiredCounterpartyInsuranceUsd : undefined }) : undefined;
       const bad = !cv.ok ? cv : lv && !lv.ok ? lv : undefined;
       if (bad) {
@@ -618,7 +723,7 @@ export class VenueService {
     const head = this.ledger.head;
     const artifact = buildArtifact(
       {
-        venue: { venueId: this.config.venueId, publicKey: this.kp.publicJwk },
+        venue: { venueId: this.config.venueId, rootPublicKey: this.keys.rootPublicKey, certs: this.certsFor([this.kp.kid, brokerCred.issuer.kid, carrierCred.issuer.kid]) },
         terms,
         termsHash: termsHash(terms),
         acceptances: { broker: t.acceptances[t.brokerAgentId]!, carrier: t.acceptances[t.carrierAgentId]! },
@@ -733,6 +838,17 @@ export class VenueService {
     const aborted: string[] = [];
     const retried: string[] = [];
     for (const j of this.state.readJournals()) {
+      if (j.kind === "KEY_ROTATION") {
+        const onLedger = this.ledger.find((e) => e.type === "KEY_ROTATION" && (e.payload as { cert?: VenueKeyCert }).cert?.kid === j.cert.kid);
+        if (onLedger) {
+          await this.applyKeyRotation(j, onLedger, "recovery");
+          applied.push(j.commitmentId);
+        } else {
+          this.state.deleteJournal(j.commitmentId);
+          aborted.push(j.commitmentId);
+        }
+        continue;
+      }
       const wantType = j.kind === "COMMIT" ? "COMMITMENT" : "VOID";
       const onLedger = this.ledger.find((e) => e.type === wantType && (e.payload as { commitmentId?: string }).commitmentId === j.commitmentId);
       if (onLedger) {
@@ -980,7 +1096,7 @@ export class VenueService {
         // A routine rotation must NOT void the deal: check the party's CURRENT credential for standing,
         // and the SIGNING credential only for a compromise declared effective before the signature.
         const current = this.issuer.currentInLineage(signing.credentialId) ?? signing;
-        const cv = verifyCredential(current, { issuerPublicKey: this.kp.publicJwk, status: this.issuer.status(current.credentialId), now });
+        const cv = verifyCredential(current, { issuerKeys: this.venueKeys(), status: this.issuer.status(current.credentialId), now });
         const lv = cv.ok ? liveCheck(this.registry, current, { now, hazmat: c.artifact.terms.load.hazmat }) : undefined;
         const st = signatureTrustedAt(signing, new Date((c.artifact.acceptances[side].metadata as SignedMeta).ts), this.issuer.status(signing.credentialId));
         const bad = !cv.ok ? cv : lv && !lv.ok ? lv : !st.ok ? st : undefined;

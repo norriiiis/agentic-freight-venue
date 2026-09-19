@@ -14,6 +14,7 @@ import { importPublicKey, verifyJws, type OkpJwk } from "../protocol/crypto";
 import { verifyMessageSignature } from "../protocol/envelope";
 import type { ReasonCode } from "../protocol/reasons";
 import type { Credential, CredentialStatusEntry } from "../protocol/types";
+import type { VenueKeyResolver } from "../protocol/venue-keys";
 import { authorityActive, hasBrokerAuthority, insuranceStatus, type InsuranceStatus, type MockRegistry } from "./registry";
 
 export interface Verdict {
@@ -30,13 +31,18 @@ export interface Verdict {
  */
 export function verifyCredential(
   cred: Credential | undefined,
-  opts: { issuerPublicKey: OkpJwk; revocation?: CredentialStatusEntry; status?: CredentialStatusEntry; now?: Date },
+  opts: { issuerPublicKey?: OkpJwk; issuerKeys?: VenueKeyResolver; revocation?: CredentialStatusEntry; status?: CredentialStatusEntry; now?: Date },
 ): Verdict {
   const now = opts.now ?? new Date();
   if (!cred) return { ok: false, reasonCode: "CREDENTIAL_UNKNOWN", evidence: {} };
   const { issuerSignature, ...unsigned } = cred;
-  const sig = verifyJws(issuerSignature, importPublicKey(opts.issuerPublicKey), unsigned);
+  // The issuing venue key is named in the credential; with a resolver (root + certs) it may be any certified key.
+  const issuerKey = opts.issuerKeys ? opts.issuerKeys.key(cred.issuer.kid) : opts.issuerPublicKey;
+  if (!issuerKey) return { ok: false, reasonCode: "CREDENTIAL_ISSUER_INVALID", evidence: { credentialId: cred.credentialId, error: `issuer key ${cred.issuer.kid.slice(0, 12)}… is not certified by the venue root` } };
+  const sig = verifyJws(issuerSignature, importPublicKey(issuerKey), unsigned);
   if (!sig.ok) return { ok: false, reasonCode: "CREDENTIAL_ISSUER_INVALID", evidence: { credentialId: cred.credentialId, error: sig.error } };
+  const issuedWhy = opts.issuerKeys?.untrustedAt(cred.issuer.kid, new Date(cred.signedAt ?? cred.issuedAt));
+  if (issuedWhy) return { ok: false, reasonCode: "CREDENTIAL_ISSUER_INVALID", evidence: { credentialId: cred.credentialId, issuerKid: cred.issuer.kid, error: issuedWhy, note: "issued under a venue key later declared compromised as of a time before issuance; awaiting re-issuance" } };
   if (new Date(cred.expiresAt) <= now) {
     return { ok: false, reasonCode: "CREDENTIAL_EXPIRED", evidence: { credentialId: cred.credentialId, expiresAt: cred.expiresAt, now: now.toISOString() } };
   }

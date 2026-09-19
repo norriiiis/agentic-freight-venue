@@ -20,6 +20,7 @@ import { termsHash, textDigest, validateNegotiationPayload, type AcceptPayload, 
 import { AuditLog, type Component } from "../protocol/audit";
 import { httpGet, rpcCall, RpcRefusal, startServer, type HttpRoute } from "../protocol/rpc";
 import type { Credential, CredentialStatusEntry, MandateEnvelope, RotationAuthorization, RotationClaims, RotationReason } from "../protocol/types";
+import { makeResolver, type VenueKeyCert, type VenueKeyHistory, type VenueKeyResolver } from "../protocol/venue-keys";
 import { evaluateMandate } from "../mandate/engine";
 import { ExposureBook } from "../mandate/exposure";
 import { verifyMandate } from "../mandate/sign";
@@ -34,7 +35,13 @@ export class AgentRuntime<Ctx extends { canary: string }> {
   readonly exposure: ExposureBook;
   readonly envelope?: MandateEnvelope;
   credential?: Credential;
-  venueKey?: OkpJwk;
+  /** Pinned venue ROOT key (trust-on-first-use, persisted). Operational keys are learned from root-signed certificates. */
+  venueRoot?: OkpJwk;
+  private venueKeys?: VenueKeyResolver;
+  /** @deprecated single-key view kept for readers; verification goes through venueKeys. */
+  get venueKey(): OkpJwk | undefined {
+    return this.venueRoot;
+  }
   private tasks = new Map<string, LocalTask>();
   private readonly comp: { mandate: Component; strategy: Component; runtime: Component };
   readonly url: string;
@@ -90,8 +97,57 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     const card = await httpGet<AgentCard>(`${this.config.venueUrl}/.well-known/agent-card.json`);
     const v = verifyAgentCard(card);
     if (!v.ok || !v.jwk) throw new Error(`venue agent card does not verify: ${v.error}`);
-    this.venueKey = v.jwk;
-    writeFileSync(join(this.config.dataDir, "venue-key.pinned.json"), JSON.stringify(v.jwk));
+    const vk = card.metadata?.venueKeys as { rootPublicKey?: OkpJwk; cert?: VenueKeyCert } | undefined;
+    if (!vk?.rootPublicKey || !vk.cert) throw new Error("venue agent card carries no key hierarchy");
+    const pinnedPath = join(this.config.dataDir, "venue-root.pinned.json");
+    // Trust on first use for the ROOT; afterwards the pinned root must match.
+    if (existsSync(pinnedPath)) {
+      const pinned = JSON.parse(readFileSync(pinnedPath, "utf8")) as OkpJwk;
+      if (pinned.x !== vk.rootPublicKey.x) throw new Error("venue root key changed; refusing to re-pin without an operator decision");
+      this.venueRoot = pinned;
+    } else {
+      this.venueRoot = vk.rootPublicKey;
+      writeFileAtomic(pinnedPath, JSON.stringify(vk.rootPublicKey));
+    }
+    this.venueKeys = makeResolver(this.venueRoot);
+    if (!this.venueKeys.add(vk.cert)) throw new Error("venue operational key certificate is not signed by the pinned root");
+    if (vk.cert.kid !== v.jwk.kid && vk.cert.publicKey.x !== v.jwk.x) throw new Error("venue agent card is not signed by its certified operational key");
+    await this.refreshVenueKeys();
+  }
+
+  /** Fetch the venue's published key history; accept only certificates/revocations signed by the pinned root. */
+  async refreshVenueKeys(): Promise<{ kids: string[] }> {
+    if (!this.venueKeys) throw new Error("venue not pinned");
+    const h = await httpGet<VenueKeyHistory>(`${this.config.venueUrl}/.well-known/venue-keys.json`);
+    let added = 0;
+    for (const c of h.certs) if (this.venueKeys.add(c)) added += 1;
+    for (const r of h.revocations) this.venueKeys.revoke(r);
+    writeFileAtomic(join(this.config.dataDir, "venue-keys.cache.json"), JSON.stringify({ certs: h.certs, revocations: h.revocations }));
+    if (added) this.audit.write({ component: this.comp.runtime, event: "venue-keys-refreshed", outcome: "INFO", evidence: { kids: this.venueKeys.kids().map((k) => k.slice(0, 12)) } });
+    return { kids: this.venueKeys.kids() };
+  }
+
+  /** Resolve a venue signing key by kid; on an unfamiliar kid, refresh once from the venue (root-verified) before giving up. */
+  private async resolveVenueKey(kid: string): Promise<OkpJwk | undefined> {
+    if (!this.venueKeys) return undefined;
+    const k = this.venueKeys.key(kid);
+    if (k) return k;
+    try {
+      await this.refreshVenueKeys();
+    } catch (e) {
+      this.audit.write({ component: this.comp.runtime, event: "venue-keys-refresh-failed", outcome: "INFO", evidence: { error: String(e).slice(0, 120) } });
+    }
+    return this.venueKeys.key(kid);
+  }
+
+  private venueSignatureOk(m: Message): { ok: boolean; error?: string; kid?: string } {
+    if (!this.venueKeys) return { ok: false, error: "venue not pinned" };
+    const res = verifyVenueSignature(m, (kid) => this.venueKeys!.key(kid));
+    if (res.ok && res.kid) {
+      const why = this.venueKeys.untrustedAt(res.kid, new Date());
+      if (why) return { ok: false, error: why, kid: res.kid };
+    }
+    return res;
   }
 
   async onboard(): Promise<{ ok: true; credential: Credential } | { ok: false; reasonCode: string; evidence: unknown }> {
@@ -212,8 +268,12 @@ export class AgentRuntime<Ctx extends { canary: string }> {
   private async ingestTask(task: Task, source: string): Promise<boolean> {
     if (!TERMINAL_STATES.includes(task.status.state) || !task.status.message) return false;
     const m = task.status.message;
-    if (!this.venueKey) return false;
-    const vs = verifyVenueSignature(m, this.venueKey);
+    if (!this.venueKeys) return false;
+    let vs = this.venueSignatureOk(m);
+    if (!vs.ok && vs.kid && !this.venueKeys.key(vs.kid)) {
+      await this.resolveVenueKey(vs.kid);
+      vs = this.venueSignatureOk(m);
+    }
     if (!vs.ok) {
       this.audit.write({ component: this.comp.runtime, event: "task-notice", outcome: "REFUSED", reasonCode: "ENVELOPE_NOT_FROM_VENUE", taskId: task.id, evidence: { source, error: vs.error } });
       return false;
@@ -331,8 +391,13 @@ export class AgentRuntime<Ctx extends { canary: string }> {
   async handleRpc(method: string, params: unknown): Promise<unknown> {
     if (method !== "message/send") throw new RpcRefusal(RPC_ERR.METHOD_NOT_FOUND, "method not found");
     const m = (params as { message: Message }).message;
-    if (!this.venueKey) throw new RpcRefusal(RPC_ERR.VENUE_REFUSED, "venue not pinned");
-    const vs = verifyVenueSignature(m, this.venueKey);
+    if (!this.venueKeys) throw new RpcRefusal(RPC_ERR.VENUE_REFUSED, "venue not pinned");
+    let vs = this.venueSignatureOk(m);
+    if (!vs.ok && vs.kid && !this.venueKeys.key(vs.kid)) {
+      // A kid this process has never seen: the venue may have rotated. Learn it from the root-signed history, then re-check.
+      await this.resolveVenueKey(vs.kid);
+      vs = this.venueSignatureOk(m);
+    }
     if (!vs.ok) {
       this.audit.write({ component: this.comp.runtime, event: "inbound", outcome: "REFUSED", reasonCode: "ENVELOPE_NOT_FROM_VENUE", taskId: m.taskId, evidence: { error: vs.error, senderAgentId: (m.metadata as SignedMeta)?.senderAgentId } });
       throw new RpcRefusal(RPC_ERR.VENUE_REFUSED, "ENVELOPE_NOT_FROM_VENUE", { reasonCode: "ENVELOPE_NOT_FROM_VENUE" });
@@ -434,6 +499,23 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         lt.status = data.disposition === "CANCELED" ? "CANCELED" : "REFUSED";
         lt.outcome = { reasonCode: data.reasonCode, refusedBy: data.refusedBy, evidence: data.evidence };
         this.audit.write({ component: this.comp.runtime, event: data.disposition === "CANCELED" ? "canceled-by-venue" : "refused-by-venue", outcome: "INFO", taskId, evidence: { reasonCode: data.reasonCode, refusedBy: data.refusedBy } });
+        break;
+      }
+      case "CREDENTIAL_REISSUED": {
+        const c = data.credential as unknown as Credential;
+        if (this.credential && c.credentialId === this.credential.credentialId && c.subject.publicKey.x === this.kp.publicJwk.x) {
+          this.credential = c;
+          writeFileAtomic(join(this.config.dataDir, "credential.json"), JSON.stringify(c, null, 2));
+          this.audit.write({ component: this.comp.runtime, event: "credential-reissued", outcome: "INFO", evidence: { credentialId: c.credentialId, issuerKid: c.issuer.kid, reason: data.reason } });
+        }
+        break;
+      }
+      case "COMMITMENT_REATTESTED": {
+        const p = join(this.config.dataDir, "commitments", `${data.commitmentId}.json`);
+        if (existsSync(p)) {
+          writeFileAtomic(p, JSON.stringify(data.artifact, null, 2));
+          this.audit.write({ component: this.comp.runtime, event: "commitment-reattested", outcome: "INFO", taskId, evidence: { commitmentId: data.commitmentId, attestations: (data.artifact as { venueAttestations?: unknown[] }).venueAttestations?.length, reason: data.reason } });
+        }
         break;
       }
       case "VOIDED": {
@@ -557,7 +639,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         "POST /control/reconcile": async () => ok({ resolved: await this.reconcile("control") }),
         "POST /control/rotate/prepare": async () => ok(this.rotatePrepare()),
         "POST /control/rotate/submit": async (_r: unknown, b: unknown) => ok(await this.rotateSubmit(b as Parameters<AgentRuntime<Ctx>["rotateSubmit"]>[0])),
-        "GET /control/identity": async () => ok({ agentId: this.config.agentId, kid: this.kp.kid, credentialId: this.credential?.credentialId, supersedes: this.credential?.supersedes, expiresAt: this.credential?.expiresAt }),
+        "GET /control/identity": async () => ok({ agentId: this.config.agentId, kid: this.kp.kid, credentialId: this.credential?.credentialId, supersedes: this.credential?.supersedes, expiresAt: this.credential?.expiresAt, issuerKid: this.credential?.issuer.kid, venueRootKid: this.venueRoot?.kid, venueKidsKnown: this.venueKeys?.kids() ?? [] }),
         /** Fault injection at runtime: models a compromised agent runtime. */
         "POST /control/rogue": async (_r: unknown, b: unknown) => {
           this.config.rogue = (b as { rogue?: AgentConfig["rogue"] }).rogue;
@@ -578,7 +660,8 @@ export class AgentRuntime<Ctx extends { canary: string }> {
             files: readdirSync(this.config.dataDir),
             privateContextHash: hashObject(this.ctx),
             knownAgentUrls: [this.config.venueUrl],
-            venueKeyPinned: !!this.venueKey,
+            venueKeyPinned: !!this.venueRoot,
+            venueKidsKnown: this.venueKeys?.kids().length ?? 0,
           }),
         "GET /control/private-canary": async () => ok({ canary: this.ctx.canary }),
       } satisfies Record<string, HttpRoute>);

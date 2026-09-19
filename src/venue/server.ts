@@ -35,10 +35,12 @@ setInterval(() => {
 
 const ok = (body: unknown) => ({ status: 200, body });
 const routes: Record<string, HttpRoute> = {
-  "GET /health": async () => ok({ ok: true, venueId: config.venueId, kid: venue.kp.kid }),
+  "GET /health": async () => ok({ ok: true, venueId: config.venueId, kid: venue.kp.kid, rootKid: venue.keys.rootPublicKey.kid }),
+  /** Published venue key history: root + every root-signed certificate and revocation. Pin the root; verify the rest. */
+  "GET /.well-known/venue-keys.json": async () => ok(venue.keys.history()),
   "GET /.well-known/agent-card.json": async () => ok(venue.agentCard()),
   /** Published credential status list (revocations + supersessions): what an offline verifier needs to judge old signatures. */
-  "GET /.well-known/credential-status.json": async () => ok({ venueId: config.venueId, issuerKid: venue.kp.kid, asOf: new Date().toISOString(), entries: venue.issuer.statusList() }),
+  "GET /.well-known/credential-status.json": async () => ok(venue.issuer.signedStatusList()),
 };
 
 if (simMode) {
@@ -94,6 +96,7 @@ if (simMode) {
     "GET /admin/agents": async () => ok([...venue.state.agents.values()].map((a) => ({ agentId: a.agentId, credentialId: a.credentialId, url: a.url, envelope: a.envelope?.limits }))),
     "GET /admin/guarantees": async () => ok(venue.underwriting.allGuarantees()),
     "GET /admin/public-key": async () => ok(venue.kp.publicJwk),
+    "GET /admin/venue-keys": async () => ok(venue.keys.history()),
     "GET /admin/credential-status": async () => ok(venue.issuer.statusList()),
   };
   Object.assign(routes, admin);
@@ -108,5 +111,5 @@ venue.recover().then((r) => {
     routes,
   });
 }).then(() => {
-  console.log(`[venue] ${config.venueId} listening on ${venue.url} (kid ${venue.kp.kid.slice(0, 12)}…) replyTimeout ${config.replyTimeoutMs}ms sweep ${sweepMs}ms${simMode ? " SIM_MODE" : ""}`);
+  console.log(`[venue] ${config.venueId} listening on ${venue.url} (signing kid ${venue.kp.kid.slice(0, 12)}…, root ${venue.keys.rootPublicKey.kid?.slice(0, 12)}…) replyTimeout ${config.replyTimeoutMs}ms sweep ${sweepMs}ms${simMode ? " SIM_MODE" : ""}`);
 });

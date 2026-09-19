@@ -16,7 +16,7 @@ export const keyRotation: Scenario = {
   async run({ h, say }) {
     const { broker, carrier } = await standardSetup(h, { broker: { thinkMs: 500 }, carrier: { thinkMs: 60 } });
     const findings: Finding[] = [];
-    const venueKey = JSON.parse(readFileSync(join(h.venue.dir, "venue-public.jwk.json"), "utf8")) as OkpJwk;
+    const venueKey = JSON.parse(readFileSync(join(h.venue.dir, "venue-root-public.jwk.json"), "utf8")) as OkpJwk;
     const id0 = await carrier.identity();
 
     // ---- Part 1: routine rotation in the window between the carrier's ACCEPT and the broker's countersign.
@@ -37,7 +37,7 @@ export const keyRotation: Scenario = {
     const artA = JSON.parse(readFileSync(join(broker.dir, "commitments", `${tA.commitmentId}.json`), "utf8")) as CommitmentArtifact;
     const signingCredA = artA.credentials.carrier.credentialId;
     const statusList = await h.venue.credentialStatus();
-    const vA = verifyArtifact(artA, { pinnedVenueKey: venueKey, statusList });
+    const vA = verifyArtifact(artA, { pinnedRootKey: venueKey, statusList });
     const pre = await h.venue.prePickupChecks();
     const stillActive = (await h.venue.commitments()).find((c) => c.commitmentId === tA.commitmentId)?.status;
     say(`   committed ${tA.commitmentId}: artifact embeds the SIGNING credential for the carrier (${signingCredA.slice(0, 18)}… = old ${signingCredA === rot.superseded.credentialId}); verifies with status list: ${vA.ok} (${vA.checks.find((c) => c.name === "carrier.credential.trusted-at-signing")?.detail}); pre-pickup check voided ${pre.voided.length} → still ${stillActive}`);
@@ -79,9 +79,9 @@ export const keyRotation: Scenario = {
     const d = await negotiate(h, broker, carrier2, { ...LOAD, loadRef: "L-2026-262-0442", commodity: "Sporting goods, palletized", weightLbs: 36_400 });
     say(`   principal re-provisions the agent with the new key (${id3.kid.slice(0, 10)}…, credential ${id3.credentialId?.slice(0, 18)}…) → next load ${d.task!.status}`);
     const statusList2 = await h.venue.credentialStatus();
-    const vC = verifyArtifact(artC, { pinnedVenueKey: venueKey, statusList: statusList2 });
-    const vA2 = verifyArtifact(artA, { pinnedVenueKey: venueKey, statusList: statusList2 });
-    const vCoffline = verifyArtifact(artC, { pinnedVenueKey: venueKey });
+    const vC = verifyArtifact(artC, { pinnedRootKey: venueKey, statusList: statusList2 });
+    const vA2 = verifyArtifact(artA, { pinnedRootKey: venueKey, statusList: statusList2 });
+    const vCoffline = verifyArtifact(artC, { pinnedRootKey: venueKey });
     say(`   offline verifier with the published status list: post-T artifact → ${vC.ok ? "VERIFIED (!)" : vC.reasonCode}; pre-T artifact → ${vA2.ok ? "VERIFIED" : vA2.reasonCode}; post-T artifact WITHOUT the status list → ${vCoffline.ok ? "VERIFIED (signatures are genuine; compromise is invisible offline)" : vCoffline.reasonCode}`);
     if (cNow.status !== "VOIDED" || aNow.status !== "ACTIVE" || lockedOut.refusal?.reasonCode !== "CREDENTIAL_SUPERSEDED" || d.task!.status !== "COMMITTED" || vC.ok || !vA2.ok) throw new Error("part 3: compromise handling failed");
     findings.push(

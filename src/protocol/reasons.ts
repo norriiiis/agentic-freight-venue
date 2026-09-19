@@ -51,6 +51,10 @@ export const REASONS = {
   RECORD_TAMPERED: "Record content does not match its signatures or hash",
   CHAIN_BROKEN: "Ledger hash chain is inconsistent",
 
+  // venue key hierarchy
+  VENUE_KEY_UNTRUSTED: "A venue signature is by a key that is not certified by the venue root, or was declared compromised at that time and not re-signed",
+  VENUE_KEY_ROTATION_UNAUTHORIZED: "Venue key rotation must carry a certificate (and, for compromise, a revocation) signed by the venue root; the venue process cannot certify its own successor",
+
   // underwriting
   UNDERWRITING_DECLINED_RISK: "Counterparty risk score exceeds the guarantee threshold",
   VENUE_EXPOSURE_LIMIT_EXCEEDED: "Venue's aggregate guaranteed exposure to this counterparty would exceed its limit",

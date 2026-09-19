@@ -93,10 +93,14 @@ export function venueSignMessage(m: Message, venueKp: KeyPair, attachment?: Venu
   return { ...withAttachment, metadata: { ...meta, venueSig } };
 }
 
-export function verifyVenueSignature(m: Message, venuePublicKey: OkpJwk): { ok: boolean; error?: string } {
+/** `venueKey` is a single key, or a resolver from the JWS header kid (so a rotated venue key verifies). */
+export function verifyVenueSignature(m: Message, venueKey: OkpJwk | ((kid: string) => OkpJwk | undefined)): { ok: boolean; error?: string; kid?: string } {
   const meta = (m.metadata ?? {}) as SignedMeta;
   if (!meta.venueSig) return { ok: false, error: "missing metadata.venueSig" };
+  const kid = jwsHeader(meta.venueSig)?.kid;
+  const key = typeof venueKey === "function" ? (kid ? venueKey(kid) : undefined) : venueKey;
+  if (!key) return { ok: false, error: `unknown venue key ${kid?.slice(0, 12)}…`, kid };
   const surface = { messageDigest: sha256Hex(venueSigningSurface(m)) };
-  const res = verifyJws(meta.venueSig, importPublicKey(venuePublicKey), surface);
-  return { ok: res.ok, error: res.error };
+  const res = verifyJws(meta.venueSig, importPublicKey(key), surface);
+  return { ok: res.ok, error: res.error, kid };
 }

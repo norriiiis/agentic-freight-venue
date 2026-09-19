@@ -11,6 +11,8 @@ import { join, resolve } from "node:path";
 import { exportPrivateJwk, generateKeyPair, signJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import type { Credential, CredentialStatusEntry, RotationAuthorization, RotationClaims, RotationReason } from "../protocol/types";
 import { buildAgentCard } from "../agentkit/runtime";
+import { importKeyPair as importKp } from "../protocol/crypto";
+import { signCert, signRevocation, type VenueKeyCert, type VenueKeyHistory, type VenueKeyRevocation } from "../protocol/venue-keys";
 import { rpcCall } from "../protocol/rpc";
 import type { AgentConfig } from "../agentkit/types";
 import type { Mandate, MandateLimits } from "../mandate/types";
@@ -66,7 +68,7 @@ export class AgentHandle {
   tender(load: LoadSpec, to: { agentId: string }) { return httpPost<{ taskId?: string; task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown }; localRefusal?: boolean }>(`${this.url}/control/tender`, { load, to }); }
   send(data: NegotiationPayload, taskId?: string, contextId?: string) { return httpPost<{ task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown } }>(`${this.url}/control/send`, { data, taskId, contextId }); }
   reconcile() { return httpPost<{ resolved: string[] }>(`${this.url}/control/reconcile`, {}); }
-  identity() { return httpGet<{ agentId: string; kid: string; credentialId?: string; supersedes?: string; expiresAt?: string }>(`${this.url}/control/identity`); }
+  identity() { return httpGet<{ agentId: string; kid: string; credentialId?: string; supersedes?: string; expiresAt?: string; issuerKid?: string; venueRootKid?: string; venueKidsKnown: string[] }>(`${this.url}/control/identity`); }
   rotatePrepare() { return httpPost<{ credentialId: string; newKid: string; newPublicKey: OkpJwk }>(`${this.url}/control/rotate/prepare`, {}); }
   rotateSubmit(input: { authorization: RotationAuthorization | { kind: "CURRENT_KEY_ONLY" }; claims?: RotationClaims; reason: RotationReason; compromisedAt?: string }) {
     return httpPost<{ ok: true; credential: Credential; superseded: CredentialStatusEntry } | { ok: false; reasonCode: string; evidence: unknown }>(`${this.url}/control/rotate/submit`, input);
@@ -133,6 +135,29 @@ export class VenueHandle {
   guarantees() { return httpGet<{ guaranteeId: string; commitmentId?: string; status: string; coveredAmountUsd: number }[]>(`${this.url}/admin/guarantees`); }
   publicKey() { return httpGet<Record<string, unknown>>(`${this.url}/admin/public-key`); }
   credentialStatus() { return httpGet<CredentialStatusEntry[]>(`${this.url}/admin/credential-status`); }
+  venueKeys() { return httpGet<VenueKeyHistory>(`${this.url}/.well-known/venue-keys.json`); }
+  /** The OPERATOR's root key. The venue process wrote it once and never reads it back; the harness is the operator's HSM. */
+  operatorRoot(): KeyPair { return importKp(JSON.parse(readFileSync(join(this.dir, "venue-root.jwk.json"), "utf8"))); }
+  /** Operator-driven venue key rotation: prepare (root-signed request) → certify the pending key with the root → commit. */
+  async rotateVenueKey(reason: "ROTATION" | "COMPROMISE", compromisedAt?: string) {
+    const root = this.operatorRoot();
+    const authorization = signJws({ action: "key-rotation/prepare", ts: new Date().toISOString() }, root, { typ: "operator-request+jws" });
+    const prep = await rpcCall<{ kid: string; publicKey: OkpJwk; seq: number }>(`${this.url}/a2a`, "venue/key-rotation/prepare", { authorization });
+    if (prep.error) throw new Error(`prepare refused: ${JSON.stringify(prep.error.data)}`);
+    const cert = signCert(root, prep.result!.publicKey, prep.result!.seq, reason);
+    const activeKid = (await httpGet<{ kid: string }>(`${this.url}/health`)).kid;
+    const revocation = reason === "COMPROMISE" ? signRevocation(root, activeKid, "COMPROMISE", compromisedAt) : undefined;
+    return rpcCall<{ previousKid: string; kid: string; seq: number; credentialsReissued: string[]; commitmentsReattested: string[]; resealed?: { fromSeq: number; toSeq: number } }>(`${this.url}/a2a`, "venue/key-rotation/commit", { cert, revocation });
+  }
+  /** A commit whose certificate was NOT signed by the root (an impostor operator, or the venue process trying to certify itself). */
+  async rotateVenueKeyUnauthorized() {
+    const root = this.operatorRoot();
+    const authorization = signJws({ action: "key-rotation/prepare", ts: new Date().toISOString() }, root, { typ: "operator-request+jws" });
+    const prep = await rpcCall<{ kid: string; publicKey: OkpJwk; seq: number }>(`${this.url}/a2a`, "venue/key-rotation/prepare", { authorization });
+    const impostor = generateKeyPair();
+    const cert: VenueKeyCert = signCert(impostor, prep.result!.publicKey, prep.result!.seq, "ROTATION");
+    return rpcCall(`${this.url}/a2a`, "venue/key-rotation/commit", { cert });
+  }
   registry() { return JSON.parse(readFileSync(join(this.dir, "registry.json"), "utf8")) as Record<string, unknown>[]; }
 
   async waitTerminal(taskId: string, timeoutMs = 20_000): Promise<NegotiationTask> {
@@ -234,7 +259,7 @@ export class Harness {
     this.procs.push(proc);
     await waitForHealth(`${handle.url}/health`, 15_000);
     const start = Date.now();
-    while (Date.now() - start < 4000 && !existsSync(join(handle.dir, "venue-key.pinned.json"))) await new Promise((r) => setTimeout(r, 40));
+    while (Date.now() - start < 4000 && !existsSync(join(handle.dir, "venue-root.pinned.json"))) await new Promise((r) => setTimeout(r, 40));
     const h2 = new AgentHandle(handle.spec, handle.dir, handle.url, proc, handle.principal, handle.mandate);
     this.agents.set(handle.spec.agentId, h2);
     return h2;
@@ -295,7 +320,7 @@ export class Harness {
       }
     } else {
       const start = Date.now();
-      while (Date.now() - start < 4000 && !existsSync(join(dir, "venue-key.pinned.json"))) await new Promise((r) => setTimeout(r, 40));
+      while (Date.now() - start < 4000 && !existsSync(join(dir, "venue-root.pinned.json"))) await new Promise((r) => setTimeout(r, 40));
     }
     const h = new AgentHandle(spec, dir, url, proc, principal, mandate);
     this.agents.set(spec.agentId, h);

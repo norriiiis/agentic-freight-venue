@@ -42,9 +42,10 @@ export class CredentialIssuer {
   private statuses = new Map<string, CredentialStatusEntry>();
   private readonly dir: string;
 
+  private readonly signer: () => KeyPair;
   constructor(
     private readonly venueId: string,
-    private readonly kp: KeyPair,
+    signer: KeyPair | (() => KeyPair),
     private readonly registry: MockRegistry,
     private readonly vetting: VettingProvider,
     dataDir: string,
@@ -52,13 +53,18 @@ export class CredentialIssuer {
     /** How long a routinely-rotated credential is still accepted for in-flight messages. */
     private readonly rotationGraceMs = 10 * 60_000,
   ) {
+    this.signer = typeof signer === "function" ? signer : () => signer;
     this.dir = join(dataDir, "identity");
     mkdirSync(this.dir, { recursive: true });
     this.load();
   }
 
+  /** The CURRENT issuing key. Older credentials name their own issuer kid; verify them with a resolver, not this. */
   get issuerPublicKey(): OkpJwk {
-    return this.kp.publicJwk;
+    return this.signer().publicJwk;
+  }
+  private get kp(): KeyPair {
+    return this.signer();
   }
 
   private load() {
@@ -127,6 +133,7 @@ export class CredentialIssuer {
       },
       issuer: { venueId: this.venueId, kid: this.kp.kid },
       issuedAt: now.toISOString(),
+      signedAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + this.validityDays * 86_400_000).toISOString(),
       supersedes,
       evidence: { registrySnapshotHash: this.registry.snapshotHash(rec.usdot), registryCheckedAt: now.toISOString(), ...ev },
@@ -220,6 +227,32 @@ export class CredentialIssuer {
   /** The published status list: what an offline verifier needs to judge old signatures. */
   statusList(): CredentialStatusEntry[] {
     return [...this.statuses.values()];
+  }
+  /** Status list signed by the current venue key (kid in the JWS header), so a copy can be trusted offline. */
+  signedStatusList(): { venueId: string; kid: string; asOf: string; entries: CredentialStatusEntry[]; signature: string } {
+    const body = { venueId: this.venueId, kid: this.kp.kid, asOf: new Date().toISOString(), entries: this.statusList() };
+    return { ...body, signature: signJws(body, this.kp, { typ: "credential-status+jws" }, true) };
+  }
+
+  /**
+   * After a venue-key compromise: every credential this venue issued under the
+   * compromised key at or after `compromisedAt` is re-signed under the current
+   * key. Same id, same subject, same evidence — only the issuer signature
+   * changes. The venue's own records, not the signature, say which credentials
+   * are genuine; re-signing lets OFFLINE verifiers trust them again.
+   */
+  reissueUnder(compromisedKid: string, compromisedAt: Date, now = new Date()): Credential[] {
+    const out: Credential[] = [];
+    for (const c of this.issued.values()) {
+      if (c.issuer.kid !== compromisedKid || new Date(c.issuedAt) < compromisedAt) continue;
+      const { issuerSignature: _old, ...unsigned } = c;
+      const reissued: Omit<Credential, "issuerSignature"> = { ...unsigned, issuer: { venueId: this.venueId, kid: this.kp.kid }, signedAt: now.toISOString(), evidence: { ...c.evidence, reissued: { fromKid: compromisedKid, at: now.toISOString(), reason: "venue key compromise" } } as Credential["evidence"] };
+      const next: Credential = { ...reissued, issuerSignature: signJws(reissued, this.kp, { typ: "agent-credential+jws" }, true) };
+      this.issued.set(next.credentialId, next);
+      out.push(next);
+    }
+    if (out.length) this.persist();
+    return out;
   }
   /** Walk the lineage forward to the credential that currently represents this agent. */
   currentInLineage(credentialId: string): Credential | undefined {

@@ -18,6 +18,7 @@ import type { LoadSpec, Terms } from "../protocol/freight";
 import type { MandateEnvelope } from "../protocol/types";
 import type { ReasonCode } from "../protocol/reasons";
 import type { CommitmentArtifact } from "../ledger/artifact";
+import type { VenueKeyCert, VenueKeyRevocation } from "../protocol/venue-keys";
 
 export interface RegisteredAgent {
   agentId: string;
@@ -105,7 +106,16 @@ export interface VoidJournal {
   /** What triggered the void (audit event name). */
   origin?: "pre-pickup-check" | "compromise-void";
 }
-export type Journal = CommitJournal | VoidJournal;
+export interface KeyRotationJournal {
+  kind: "KEY_ROTATION";
+  /** journal file name; not a commitment */
+  commitmentId: string;
+  writtenAt: string;
+  previousKid: string;
+  cert: VenueKeyCert;
+  revocation?: VenueKeyRevocation;
+}
+export type Journal = CommitJournal | VoidJournal | KeyRotationJournal;
 
 interface Snapshot {
   agents: Record<string, RegisteredAgent>;

@@ -35,7 +35,7 @@ async function runScenario(sc: Scenario, index: number): Promise<{ res: Scenario
   console.log(`  ${sc.summary}\n`);
   try {
     const res = await sc.run({ h, say: (l) => { notes.push(l); console.log(`  ▸ ${l}`); } });
-    const wire = renderWire(await h.venue.messages(), ROLES, ["happy-path", "non-convergence", "exposure-mid-negotiation", "insurance-lapsed", "negotiation-timeout", "key-rotation"].includes(sc.id) ? res.taskId : undefined);
+    const wire = renderWire(await h.venue.messages(), ROLES, ["happy-path", "non-convergence", "exposure-mid-negotiation", "insurance-lapsed", "negotiation-timeout", "key-rotation", "venue-key-rotation"].includes(sc.id) ? res.taskId : undefined);
     if (wire.length) {
       console.log("\n  wire (venue log):");
       for (const l of wire) console.log(l);
@@ -55,12 +55,12 @@ async function demoExtras(workspace: string) {
   const { readdirSync } = await import("node:fs");
   const file = readdirSync(join(brokerDir, "commitments"))[0]!;
   const artifact = JSON.parse(readFileSync(join(brokerDir, "commitments", file), "utf8")) as CommitmentArtifact;
-  const venueKey = JSON.parse(readFileSync(join(workspace, "venue", "venue-public.jwk.json"), "utf8")) as OkpJwk;
+  const venueRoot = JSON.parse(readFileSync(join(workspace, "venue", "venue-root-public.jwk.json"), "utf8")) as OkpJwk;
   console.log(`\n${"─".repeat(100)}\n  Independent verification of the broker's copy of the artifact (no venue process involved)\n${"─".repeat(100)}`);
-  const v = verifyArtifact(artifact, { pinnedVenueKey: venueKey });
+  const v = verifyArtifact(artifact, { pinnedRootKey: venueRoot });
   for (const c of v.checks) console.log(`  ${c.ok ? "PASS" : "FAIL"}  ${c.name}`);
   console.log(`  → ${v.ok ? "VERIFIED: both parties signed these exact terms." : `NOT VERIFIED: ${v.reasonCode}`}`);
-  console.log(`  re-run yourself:  npm run verify -- ${join(brokerDir, "commitments", file).replace(ROOT + "/", "")} --venue-key ${join(workspace, "venue", "venue-public.jwk.json").replace(ROOT + "/", "")} --ledger ${join(workspace, "venue", "ledger.jsonl").replace(ROOT + "/", "")}`);
+  console.log(`  re-run yourself:  npm run verify -- ${join(brokerDir, "commitments", file).replace(ROOT + "/", "")} --venue-root ${join(workspace, "venue", "venue-root-public.jwk.json").replace(ROOT + "/", "")} --ledger ${join(workspace, "venue", "ledger.jsonl").replace(ROOT + "/", "")}`);
 
   console.log(`\n${"─".repeat(100)}\n  Underwriting\n${"─".repeat(100)}`);
   const u = artifact.underwriting;

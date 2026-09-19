@@ -29,7 +29,10 @@ export interface Credential {
     publicKey: OkpJwk; // the agent's Ed25519 key
   };
   issuer: { venueId: string; kid: string };
+  /** When the entity was verified and the credential first issued. Unchanged by re-issuance. */
   issuedAt: string;
+  /** When the current issuer signature was made (differs from issuedAt only after a re-issuance under a new venue key). */
+  signedAt?: string;
   expiresAt: string;
   /** Lineage: the credential this one replaced (key rotation / renewal). */
   supersedes?: string;

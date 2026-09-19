@@ -33,20 +33,20 @@ export const replayAndTamper: Scenario = {
     // (3) Tamper with the broker's own copy of the artifact.
     const artPath = join(broker.dir, "commitments", `${first.task!.commitmentId}.json`);
     const artifact = JSON.parse(readFileSync(artPath, "utf8")) as CommitmentArtifact;
-    const venueKey = (await h.venue.publicKey()) as unknown as OkpJwk;
-    const genuine = verifyArtifact(artifact, { pinnedVenueKey: venueKey });
+    const venueKey = JSON.parse(readFileSync(join(h.venue.dir, "venue-root-public.jwk.json"), "utf8")) as OkpJwk;
+    const genuine = verifyArtifact(artifact, { pinnedRootKey: venueKey });
     const tampered: CommitmentArtifact = structuredClone(artifact);
     tampered.terms.rateUsd = artifact.terms.rateUsd + 900;
-    const tv = verifyArtifact(tampered, { pinnedVenueKey: venueKey });
+    const tv = verifyArtifact(tampered, { pinnedRootKey: venueKey });
     say(`artifact genuine → ${genuine.ok ? "VERIFIED" : "FAIL"}; rate +$900 → ${tv.ok ? "VERIFIED (!)" : `${tv.reasonCode} (${tv.checks.filter((c) => !c.ok).length} checks fail)`}`);
 
     // (4) Tamper with the ledger file.
     const ledgerPath = join(h.venue.dir, "ledger.jsonl");
     const entries = readFileSync(ledgerPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as LedgerEntry);
-    const chainOk = verifyChain(entries, venueKey);
+    const chainOk = verifyChain(entries, { rootPublicKey: venueKey });
     const edited = structuredClone(entries);
     (edited[1]!.payload as { rateUsd: number }).rateUsd = 999;
-    const chainBad = verifyChain(edited, venueKey);
+    const chainBad = verifyChain(edited, { rootPublicKey: venueKey });
     writeFileSync(join(h.opts.workspace, "tampered-artifact.json"), JSON.stringify(tampered, null, 2));
     say(`ledger chain intact → ${chainOk.ok}; after editing seq 1 → ${chainBad.ok ? "ok (!)" : `broken at seq ${chainBad.firstBadSeq}: ${chainBad.error}`}`);
 

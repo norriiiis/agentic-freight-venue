@@ -145,7 +145,24 @@ export interface VoidedPayload {
   evidence: Record<string, unknown>;
 }
 
+/** Venue -> agent, after a venue-key compromise: your credential was re-signed under the new venue key. */
+export interface CredentialReissuedPayload {
+  type: "CREDENTIAL_REISSUED";
+  credential: Record<string, unknown>;
+  reason: string;
+}
+/** Venue -> agent, after a venue-key compromise: this commitment's artifact carries a new attestation. */
+export interface CommitmentReattestedPayload {
+  type: "COMMITMENT_REATTESTED";
+  loadRef: string;
+  commitmentId: string;
+  artifact: Record<string, unknown>;
+  reason: string;
+}
+
 export type NegotiationPayload =
+  | CredentialReissuedPayload
+  | CommitmentReattestedPayload
   | TenderPayload
   | CounterPayload
   | AcceptPayload
@@ -186,6 +203,8 @@ const KEYS: Record<string, string[]> = {
   COMMITTED: ["type", "loadRef", "commitmentId", "termsHash", "guarantee", "artifact"],
   REFUSED: ["type", "loadRef", "reasonCode", "refusedBy", "evidence", "disposition"],
   VOIDED: ["type", "loadRef", "commitmentId", "reasonCode", "evidence"],
+  CREDENTIAL_REISSUED: ["type", "credential", "reason"],
+  COMMITMENT_REATTESTED: ["type", "loadRef", "commitmentId", "artifact", "reason"],
 };
 const FORMATS: Record<string, { re: RegExp; max: number }> = {
   loadRef: { re: /^[A-Za-z0-9._\-/]+$/, max: 64 },
