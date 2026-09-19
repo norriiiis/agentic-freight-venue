@@ -82,7 +82,21 @@ export class AgentHandle {
 }
 
 export class VenueHandle {
-  constructor(readonly dir: string, readonly url: string, readonly proc: ChildProcess) {}
+  constructor(readonly dir: string, readonly url: string, public proc: ChildProcess) {}
+  /** Arm a crash at a named point inside the next commit (SIM-ONLY). */
+  fault(crashAt: string | null) { return httpPost<{ ok: boolean }>(`${this.url}/admin/fault`, { crashAt }); }
+  journal() { return httpGet<unknown[]>(`${this.url}/admin/journal`); }
+  outbox() { return httpGet<{ toAgentId: string; attempts: number; note?: string }[]>(`${this.url}/admin/outbox`); }
+  exposure(counterparty: string, beneficiary: string) { return httpGet<{ counterpartyOutstandingUsd: number; pairOutstandingUsd: number; portfolioOutstandingUsd: number }>(`${this.url}/admin/exposure?counterparty=${counterparty}&beneficiary=${beneficiary}`); }
+  /** Wait for the venue process to exit (e.g. after an armed crash). */
+  async waitExit(timeoutMs = 10_000): Promise<number | null> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (this.proc.exitCode !== null) return this.proc.exitCode;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error("venue did not exit");
+  }
   registryUpdate(usdot: string, patch: Record<string, unknown>) { return httpPost(`${this.url}/admin/registry/update`, { usdot, patch }); }
   revoke(agentId: string, reason: string, evidence?: Record<string, unknown>) { return httpPost<{ revocation: unknown }>(`${this.url}/admin/credential/revoke`, { agentId, reason, evidence }); }
   seedExposure(counterpartyUsdot: string, beneficiaryUsdot: string, amountUsd: number, day: string, note: string) { return httpPost<{ exposure: unknown }>(`${this.url}/admin/underwriting/seed-exposure`, { counterpartyUsdot, beneficiaryUsdot, amountUsd, day, note }); }
@@ -95,6 +109,7 @@ export class VenueHandle {
   commitments() { return httpGet<CommitmentRecord[]>(`${this.url}/admin/commitments`); }
   messages() { return httpGet<{ ts: string; direction: "IN" | "OUT"; note?: string; message: Message }[]>(`${this.url}/admin/messages`); }
   agents() { return httpGet<{ agentId: string; credentialId: string; url: string }[]>(`${this.url}/admin/agents`); }
+  guarantees() { return httpGet<{ guaranteeId: string; commitmentId?: string; status: string; coveredAmountUsd: number }[]>(`${this.url}/admin/guarantees`); }
   publicKey() { return httpGet<Record<string, unknown>>(`${this.url}/admin/public-key`); }
   registry() { return JSON.parse(readFileSync(join(this.dir, "registry.json"), "utf8")) as Record<string, unknown>[]; }
 
@@ -126,6 +141,7 @@ export interface HarnessOptions {
 
 export class Harness {
   private procs: ChildProcess[] = [];
+  private venueEnv?: Record<string, string>;
   venue!: VenueHandle;
   readonly agents = new Map<string, AgentHandle>();
   constructor(readonly opts: HarnessOptions) {
@@ -138,7 +154,7 @@ export class Harness {
     mkdirSync(dir, { recursive: true });
     copyFileSync(REGISTRY_FIXTURE, join(dir, "registry.json"));
     const port = await freePort();
-    const proc = spawnTs("src/venue/server.ts", {
+    this.venueEnv = {
       VENUE_DATA_DIR: dir,
       VENUE_REGISTRY_PATH: join(dir, "registry.json"),
       VENUE_PORT: String(port),
@@ -148,11 +164,25 @@ export class Harness {
       VENUE_SWEEP_MS: String(this.opts.venue?.sweepMs ?? 5_000),
       VENUE_UW_PARAMS: this.opts.venue?.underwriting ? JSON.stringify(this.opts.venue.underwriting) : "",
       SIM_MODE: "1",
-    }, "venue  ", !!this.opts.quiet);
+    };
+    const proc = spawnTs("src/venue/server.ts", this.venueEnv, "venue  ", !!this.opts.quiet);
     this.procs.push(proc);
     const url = `http://127.0.0.1:${port}`;
     await waitForHealth(`${url}/health`);
     this.venue = new VenueHandle(dir, url, proc);
+    return this.venue;
+  }
+
+  /** Restart the venue on the SAME data dir and port — what an operator (or supervisor) does after a crash. Recovery runs before it serves. */
+  async restartVenue(): Promise<VenueHandle> {
+    if (this.venue.proc.exitCode === null) {
+      this.venue.proc.kill("SIGKILL");
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const proc = spawnTs("src/venue/server.ts", this.venueEnv!, "venue  ", !!this.opts.quiet);
+    this.procs.push(proc);
+    this.venue.proc = proc;
+    await waitForHealth(`${this.venue.url}/health`, 15_000);
     return this.venue;
   }
 

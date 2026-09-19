@@ -1,9 +1,18 @@
 /**
- * Venue persistence: registered agents, negotiation tasks, commitments, seen
- * nonces, and the raw message log. JSON files in the venue's own data dir.
+ * Venue persistence.
+ *
+ *   state/snapshot.json   agents, tasks, commitments, nonces, outbox — ONE file,
+ *                         written atomically (temp + fsync + rename), so every
+ *                         persisted view of the venue is internally consistent.
+ *   state/journal/<id>    write-ahead intent for a commit or void in progress;
+ *                         written before the ledger append, deleted after all
+ *                         side effects are applied and persisted. Recovery on
+ *                         startup replays or discards these.
+ *   state/messages.jsonl  raw wire log (forensics only; append-only).
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { appendDurable, writeFileAtomic } from "../protocol/fsatomic";
 import type { AgentCard, Message, Task } from "../protocol/a2a";
 import type { LoadSpec, Terms } from "../protocol/freight";
 import type { MandateEnvelope } from "../protocol/types";
@@ -61,36 +70,93 @@ export interface CommitmentRecord {
   voided?: { at: string; reasonCode: ReasonCode; evidence: Record<string, unknown> };
 }
 
+/** A notice the venue owes an agent. Persisted until delivered (at-least-once); agents dedupe by messageId. */
+export interface PendingNotice {
+  id: string;
+  toAgentId: string;
+  message: Message;
+  enqueuedAt: string;
+  attempts: number;
+  nextAttemptAt: string;
+  note?: string;
+}
+
+/** Write-ahead intent for a commit: everything needed to (re)apply its side effects. */
+export interface CommitJournal {
+  kind: "COMMIT";
+  commitmentId: string;
+  taskId: string;
+  writtenAt: string;
+  artifact: CommitmentArtifact;
+  guarantee?: { guaranteeId: string; counterpartyUsdot: string; beneficiaryUsdot: string; coveredAmountUsd: number; premiumUsd: number; day: string; probabilityOfLoss: number; factors: unknown };
+  declined?: { reasonCode: ReasonCode; evidence: Record<string, unknown> };
+  ledger: { seq: number; prevHash: string };
+}
+export interface VoidJournal {
+  kind: "VOID";
+  commitmentId: string;
+  writtenAt: string;
+  reasonCode: ReasonCode;
+  evidence: Record<string, unknown>;
+}
+export type Journal = CommitJournal | VoidJournal;
+
+interface Snapshot {
+  agents: Record<string, RegisteredAgent>;
+  tasks: Record<string, NegotiationTask>;
+  commitments: Record<string, CommitmentRecord>;
+  nonces: Record<string, { messageId: string; ts: string; senderAgentId: string }>;
+  outbox: PendingNotice[];
+}
+
 export class VenueState {
   agents = new Map<string, RegisteredAgent>();
   tasks = new Map<string, NegotiationTask>();
   commitments = new Map<string, CommitmentRecord>();
   nonces = new Map<string, { messageId: string; ts: string; senderAgentId: string }>();
+  outbox: PendingNotice[] = [];
   private readonly dir: string;
+  private readonly journalDir: string;
 
   constructor(dataDir: string) {
     this.dir = join(dataDir, "state");
-    mkdirSync(this.dir, { recursive: true });
+    this.journalDir = join(this.dir, "journal");
+    mkdirSync(this.journalDir, { recursive: true });
     this.load();
   }
   private file(name: string) {
     return join(this.dir, name);
   }
   private load() {
-    const rd = <T>(name: string, fallback: T): T => (existsSync(this.file(name)) ? JSON.parse(readFileSync(this.file(name), "utf8")) : fallback);
-    this.agents = new Map(Object.entries(rd<Record<string, RegisteredAgent>>("agents.json", {})));
-    this.tasks = new Map(Object.entries(rd<Record<string, NegotiationTask>>("tasks.json", {})));
-    this.commitments = new Map(Object.entries(rd<Record<string, CommitmentRecord>>("commitments.json", {})));
-    this.nonces = new Map(Object.entries(rd<Record<string, { messageId: string; ts: string; senderAgentId: string }>>("nonces.json", {})));
+    const p = this.file("snapshot.json");
+    if (!existsSync(p)) return;
+    const s = JSON.parse(readFileSync(p, "utf8")) as Snapshot;
+    this.agents = new Map(Object.entries(s.agents));
+    this.tasks = new Map(Object.entries(s.tasks));
+    this.commitments = new Map(Object.entries(s.commitments));
+    this.nonces = new Map(Object.entries(s.nonces));
+    this.outbox = s.outbox ?? [];
   }
+  /** One atomic write. Either the whole new state is on disk or none of it. */
   persist() {
-    writeFileSync(this.file("agents.json"), JSON.stringify(Object.fromEntries(this.agents), null, 2));
-    writeFileSync(this.file("tasks.json"), JSON.stringify(Object.fromEntries(this.tasks), null, 2));
-    writeFileSync(this.file("commitments.json"), JSON.stringify(Object.fromEntries(this.commitments), null, 2));
-    writeFileSync(this.file("nonces.json"), JSON.stringify(Object.fromEntries(this.nonces), null, 2));
+    const s: Snapshot = { agents: Object.fromEntries(this.agents), tasks: Object.fromEntries(this.tasks), commitments: Object.fromEntries(this.commitments), nonces: Object.fromEntries(this.nonces), outbox: this.outbox };
+    writeFileAtomic(this.file("snapshot.json"), JSON.stringify(s));
   }
+
+  // ---- write-ahead journal ----
+  writeJournal(j: Journal) {
+    writeFileAtomic(join(this.journalDir, `${j.commitmentId}.json`), JSON.stringify(j));
+  }
+  readJournals(): Journal[] {
+    return readdirSync(this.journalDir).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(readFileSync(join(this.journalDir, f), "utf8")) as Journal);
+  }
+  deleteJournal(commitmentId: string) {
+    const p = join(this.journalDir, `${commitmentId}.json`);
+    if (existsSync(p)) unlinkSync(p);
+  }
+
   logMessage(direction: "IN" | "OUT", m: Message, note?: string) {
-    appendFileSync(this.file("messages.jsonl"), JSON.stringify({ ts: new Date().toISOString(), direction, note, message: m }) + "\n");
+    appendDurable(this.file("messages.jsonl"), JSON.stringify({ ts: new Date().toISOString(), direction, note, message: m }) + "\n");
   }
   messageLog(): { ts: string; direction: "IN" | "OUT"; note?: string; message: Message }[] {
     if (!existsSync(this.file("messages.jsonl"))) return [];

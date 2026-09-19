@@ -6,12 +6,18 @@
  * Storage is a JSONL file — sufficient for a prototype, and the first thing
  * to replace at scale (see README).
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { appendDurable } from "../protocol/fsatomic";
 import { canonicalize, sha256Hex } from "../protocol/canonical";
 import { importPublicKey, signJws, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 
-export type LedgerEntryType = "COMMITMENT" | "VOID" | "GUARANTEE_ATTACHED" | "GUARANTEE_RELEASED" | "GENESIS";
+/**
+ * COMMITMENT and VOID each carry their guarantee effect (attach / release) in
+ * the same entry: one append is the whole commit point, so there is no
+ * window in which the ledger says "committed" but not whether it is guaranteed.
+ */
+export type LedgerEntryType = "COMMITMENT" | "VOID" | "GENESIS";
 
 export interface LedgerEntry {
   seq: number;
@@ -47,8 +53,9 @@ export class Ledger {
     const hash = entryHash(partial);
     const venueSig = signJws({ hash }, this.kp, { typ: "ledger-entry+jws" }, true);
     const entry: LedgerEntry = { ...partial, hash, venueSig };
+    // Durable before visible: the line is fsynced before the in-memory chain advances.
+    appendDurable(this.path, JSON.stringify(entry) + "\n");
     this.entries.push(entry);
-    appendFileSync(this.path, JSON.stringify(entry) + "\n");
     return entry;
   }
   all(): LedgerEntry[] {

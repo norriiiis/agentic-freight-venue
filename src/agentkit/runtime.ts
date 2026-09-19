@@ -10,6 +10,7 @@
  * It never receives the counterparty's address, keys, or data directory.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { writeFileAtomic } from "../protocol/fsatomic";
 import { join } from "node:path";
 import { A2A_PROTOCOL_VERSION, FREIGHT_EXTENSION_URI, RPC_ERR, dataPart, signAgentCard, verifyAgentCard, type AgentCard, type Message, type Task } from "../protocol/a2a";
 import { hashObject } from "../protocol/canonical";
@@ -60,13 +61,23 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     if (existsSync(credPath)) this.credential = JSON.parse(readFileSync(credPath, "utf8"));
     const tasksPath = join(config.dataDir, "tasks.json");
     if (existsSync(tasksPath)) this.tasks = new Map(Object.entries(JSON.parse(readFileSync(tasksPath, "utf8"))));
+    const seenPath = join(config.dataDir, "inbox-seen.json");
+    if (existsSync(seenPath)) this.seenInbound = JSON.parse(readFileSync(seenPath, "utf8"));
     this.url = `http://127.0.0.1:${config.port}`;
     const r = config.role;
     this.comp = { mandate: `agent.${r}.mandate`, strategy: `agent.${r}.strategy`, runtime: `agent.${r}.runtime` };
   }
 
   private persistTasks() {
-    writeFileSync(join(this.config.dataDir, "tasks.json"), JSON.stringify(Object.fromEntries(this.tasks), null, 2));
+    writeFileAtomic(join(this.config.dataDir, "tasks.json"), JSON.stringify(Object.fromEntries(this.tasks), null, 2));
+  }
+
+  /** Inbound messageIds already processed. The venue's outbox is at-least-once; this makes it effectively once. */
+  private seenInbound: string[] = [];
+  private markSeen(messageId: string) {
+    this.seenInbound.push(messageId);
+    if (this.seenInbound.length > 1000) this.seenInbound = this.seenInbound.slice(-1000);
+    writeFileAtomic(join(this.config.dataDir, "inbox-seen.json"), JSON.stringify(this.seenInbound));
   }
 
   agentCard(): AgentCard {
@@ -114,7 +125,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
       return { ok: false, reasonCode: d?.reasonCode ?? "UNKNOWN", evidence: d?.evidence };
     }
     this.credential = res.result!.credential;
-    writeFileSync(join(this.config.dataDir, "credential.json"), JSON.stringify(this.credential, null, 2));
+    writeFileAtomic(join(this.config.dataDir, "credential.json"), JSON.stringify(this.credential, null, 2));
     this.audit.write({ component: this.comp.runtime, event: "onboard", outcome: "ALLOWED", evidence: { credentialId: this.credential.credentialId, expiresAt: this.credential.expiresAt } });
     return { ok: true, credential: this.credential };
   }
@@ -140,9 +151,31 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     return this.sendRaw(m);
   }
 
-  /** Send an already-signed message verbatim (used by the replay scenario). */
-  async sendRaw(m: Message): Promise<{ task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown } }> {
-    const res = await rpcCall<Task>(`${this.config.venueUrl}/a2a`, "message/send", { message: m });
+  /**
+   * Send an already-signed message verbatim. Retries on transport failure
+   * (venue unreachable / connection dropped). Because the nonce is inside the
+   * signed surface, a retry is exactly idempotent: if the venue had already
+   * processed the message before the connection died, it answers NONCE_REUSED,
+   * which a retry treats as "delivered".
+   */
+  async sendRaw(m: Message): Promise<{ task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown; guaranteeWouldHavePaid?: string }; duplicate?: boolean }> {
+    let res: Awaited<ReturnType<typeof rpcCall<Task>>> | undefined;
+    let attempt = 0;
+    for (;;) {
+      try {
+        res = await rpcCall<Task>(`${this.config.venueUrl}/a2a`, "message/send", { message: m });
+        break;
+      } catch (e) {
+        attempt += 1;
+        this.audit.write({ component: this.comp.runtime, event: "send-transport-failure", outcome: "INFO", taskId: m.taskId, evidence: { attempt, error: String(e).slice(0, 120) } });
+        if (attempt >= 6) return { refusal: { reasonCode: "TRANSPORT_FAILURE", refusedBy: "network", evidence: String(e) } };
+        await new Promise((r) => setTimeout(r, 200 * 2 ** (attempt - 1)));
+      }
+    }
+    if (res.error && attempt > 0 && (res.error.data as { reasonCode?: string } | undefined)?.reasonCode === "NONCE_REUSED") {
+      this.audit.write({ component: this.comp.runtime, event: "send-retry-acknowledged", outcome: "INFO", taskId: m.taskId, evidence: { note: "venue had already processed this message before the connection dropped", attempts: attempt + 1 } });
+      return { duplicate: true };
+    }
     if (res.error) {
       const d = (res.error.data ?? {}) as { reasonCode?: string; refusedBy?: string; evidence?: unknown; guaranteeWouldHavePaid?: string };
       const refusal = { reasonCode: d.reasonCode ?? String(res.error.code), refusedBy: d.refusedBy ?? "venue", evidence: d.evidence ?? res.error.message, guaranteeWouldHavePaid: d.guaranteeWouldHavePaid };
@@ -240,6 +273,11 @@ export class AgentRuntime<Ctx extends { canary: string }> {
       }
     }
     const ack: Task = { kind: "task", id: m.taskId ?? "n/a", contextId: m.contextId ?? "n/a", status: { state: "working", timestamp: new Date().toISOString() } };
+    if (this.seenInbound.includes(m.messageId)) {
+      this.audit.write({ component: this.comp.runtime, event: "inbound-duplicate", outcome: "INFO", taskId: m.taskId, evidence: { messageId: m.messageId, note: "already processed; acknowledged without re-processing" } });
+      return ack;
+    }
+    this.markSeen(m.messageId);
     setImmediate(() => this.process(m).catch((e) => this.audit.write({ component: this.comp.runtime, event: "process", outcome: "INFO", taskId: m.taskId, evidence: { error: String(e) } })));
     return ack;
   }
@@ -293,13 +331,17 @@ export class AgentRuntime<Ctx extends { canary: string }> {
       }
       case "COMMITTED": {
         if (!lt) return;
+        if (lt.status === "COMMITTED" && lt.commitmentId === data.commitmentId) {
+          this.audit.write({ component: this.comp.runtime, event: "committed-duplicate", outcome: "INFO", taskId, evidence: { commitmentId: data.commitmentId } });
+          break;
+        }
         lt.status = "COMMITTED";
         lt.commitmentId = data.commitmentId;
         const art = data.artifact as { terms: Terms };
         mkdirSync(join(this.config.dataDir, "commitments"), { recursive: true });
-        writeFileSync(join(this.config.dataDir, "commitments", `${data.commitmentId}.json`), JSON.stringify(data.artifact, null, 2));
+        writeFileAtomic(join(this.config.dataDir, "commitments", `${data.commitmentId}.json`), JSON.stringify(data.artifact, null, 2));
         const cpUsdot = this.config.role === "broker" ? art.terms.carrierEntity.usdot : art.terms.brokerEntity.usdot;
-        this.exposure.add(cpUsdot, art.terms.rateUsd, art.terms.pickup.windowStart.slice(0, 10));
+        this.exposure.add(cpUsdot, art.terms.rateUsd, art.terms.pickup.windowStart.slice(0, 10), data.commitmentId);
         this.audit.write({ component: this.comp.runtime, event: "committed", outcome: "ALLOWED", taskId, evidence: { commitmentId: data.commitmentId, rateUsd: art.terms.rateUsd, guarantee: data.guarantee ? { guaranteeId: data.guarantee.guaranteeId, premiumUsd: data.guarantee.premiumUsd } : null, artifactSavedTo: `commitments/${data.commitmentId}.json` } });
         break;
       }
@@ -318,7 +360,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         if (existsSync(p)) {
           const art = JSON.parse(readFileSync(p, "utf8")) as { terms: Terms };
           const cpUsdot = this.config.role === "broker" ? art.terms.carrierEntity.usdot : art.terms.brokerEntity.usdot;
-          this.exposure.release(cpUsdot, art.terms.rateUsd, art.terms.pickup.windowStart.slice(0, 10));
+          this.exposure.release(cpUsdot, art.terms.rateUsd, art.terms.pickup.windowStart.slice(0, 10), data.commitmentId);
         }
         this.audit.write({ component: this.comp.runtime, event: "voided-by-venue", outcome: "INFO", taskId, evidence: { commitmentId: data.commitmentId, reasonCode: data.reasonCode } });
         break;

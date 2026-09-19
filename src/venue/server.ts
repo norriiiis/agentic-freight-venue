@@ -27,7 +27,10 @@ const config = {
 const venue = new VenueService(config);
 const simMode = process.env.SIM_MODE === "1";
 const sweepMs = Number(process.env.VENUE_SWEEP_MS ?? 5_000);
-setInterval(() => { venue.expireStaleTasks().catch((e) => console.error("[venue] sweeper", e)); }, sweepMs).unref();
+setInterval(() => {
+  venue.expireStaleTasks().catch((e) => console.error("[venue] sweeper", e));
+  venue.flushOutbox().catch((e) => console.error("[venue] outbox", e));
+}, sweepMs).unref();
 
 const ok = (body: unknown) => ({ status: 200, body });
 const routes: Record<string, HttpRoute> = {
@@ -63,6 +66,19 @@ if (simMode) {
       venue.underwriting.seedHistory(usdot, history);
       return ok({ ok: true });
     },
+    /** Crash the venue process at a named point inside the next commit (after-journal | after-ledger-append | after-apply). */
+    "POST /admin/fault": async (_r, b) => {
+      const { crashAt } = b as { crashAt?: string };
+      venue.simFault = crashAt ? { crashAt } : undefined;
+      venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null } });
+      return ok({ ok: true, crashAt: crashAt ?? null });
+    },
+    "GET /admin/journal": async () => ok(venue.state.readJournals()),
+    "GET /admin/outbox": async () => ok(venue.state.outbox.map((n) => ({ id: n.id, toAgentId: n.toAgentId, attempts: n.attempts, note: n.note }))),
+    "GET /admin/exposure": async (req) => {
+      const u = new URL(req.url ?? "/", "http://localhost");
+      return ok(venue.underwriting.exposure(u.searchParams.get("counterparty") ?? "", u.searchParams.get("beneficiary") ?? ""));
+    },
     "POST /admin/expire-stale-tasks": async () => ok({ expired: (await venue.expireStaleTasks()).map((t) => ({ taskId: t.task.id, outcome: t.outcome })) }),
     "POST /admin/pre-pickup-checks": async () => ok({ voided: (await venue.prePickupChecks()).map((c) => ({ commitmentId: c.commitmentId, voided: c.voided })) }),
     "GET /admin/audit": async () => ok(venue.audit.readAll()),
@@ -77,10 +93,14 @@ if (simMode) {
   Object.assign(routes, admin);
 }
 
-startServer(config.port, {
-  rpcPath: "/a2a",
-  rpc: (method, params, req) => venue.handleRpc(method, params, req.headers as Record<string, string | string[] | undefined>),
-  routes,
+// Recover BEFORE serving: reconcile journal vs ledger, finish in-flight commits, re-deliver owed notices.
+venue.recover().then((r) => {
+  if (r.applied.length || r.aborted.length || r.retried.length || r.redelivered) console.log(`[venue] recovery: applied=${r.applied.length} aborted=${r.aborted.length} retried=${r.retried.length} redelivered=${r.redelivered}`);
+  return startServer(config.port, {
+    rpcPath: "/a2a",
+    rpc: (method, params, req) => venue.handleRpc(method, params, req.headers as Record<string, string | string[] | undefined>),
+    routes,
+  });
 }).then(() => {
   console.log(`[venue] ${config.venueId} listening on ${venue.url} (kid ${venue.kp.kid.slice(0, 12)}…) replyTimeout ${config.replyTimeoutMs}ms sweep ${sweepMs}ms${simMode ? " SIM_MODE" : ""}`);
 });

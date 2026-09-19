@@ -27,11 +27,12 @@ import { liveCheck, verifyCredential, verifyPresentation, type LiveCheckResult }
 import { envelopeToLimits, evaluateMandate } from "../mandate/engine";
 import { verifyEnvelope } from "../mandate/sign";
 import { ExposureBook } from "../mandate/exposure";
-import { Ledger } from "../ledger/chain";
+import { Ledger, type LedgerEntry } from "../ledger/chain";
 import { artifactHash, buildArtifact, type CommitmentArtifact } from "../ledger/artifact";
 import { UnderwritingEngine } from "../underwriting/engine";
 import { DEFAULT_PARAMS, type RiskInputs, type UnderwritingParams } from "../underwriting/types";
-import { VenueState, type CommitmentRecord, type NegotiationTask, type Offer, type RegisteredAgent } from "./state";
+import { VenueState, type CommitJournal, type CommitmentRecord, type NegotiationTask, type Offer, type RegisteredAgent, type VoidJournal } from "./state";
+import { GUARANTEE_SCOPE } from "../underwriting/types";
 import { guaranteeWouldHavePaid } from "./guarantee-outcome";
 
 export interface VenueConfig {
@@ -243,6 +244,7 @@ export class VenueService {
       throw new Refusal(code, "venue.protocol", ev);
     }
     this.state.nonces.set(meta.nonce, { messageId: m.messageId, ts: meta.ts, senderAgentId: sender.agentId });
+    this.state.persist();
     this.state.logMessage("IN", m, data.type);
     this.audit.write({ component: "venue.identity", event: "ingest", outcome: "ALLOWED", subject: sender.agentId, taskId: m.taskId, evidence: { payloadType: data.type, credentialId: cred.credentialId, kid: pv.evidence.kid } });
 
@@ -431,6 +433,9 @@ export class VenueService {
     }
     this.audit.write({ component: "venue.mandate", event: "envelope-check", outcome: "ALLOWED", subject: sender.agentId, taskId: t.task.id, evidence: { checked: verdict.checked, rateUsd: data.terms.rateUsd, guaranteeAvailable } });
     t.acceptances[sender.agentId] = m;
+    // Persist the acceptance (and this message's nonce) before attempting the commit: a crash inside
+    // commit() then leaves a task recovery can finish, and the sender's retry is answered NONCE_REUSED.
+    this.state.persist();
 
     if (!t.acceptances[otherId]) {
       t.status = "COUNTERSIGN";
@@ -506,13 +511,33 @@ export class VenueService {
     return this.underwriting.quote(this.riskInputs(t, terms), brokerUsdot, terms.pickup.windowStart.slice(0, 10));
   }
 
+  // ------------------------------------------------------------ commit
+  //
+  // A commit is a transaction over several files. The protocol is:
+  //
+  //   1. PREPARE  — pure: re-verify identities, quote underwriting, build the
+  //                 artifact. Nothing is written.
+  //   2. JOURNAL  — write the intent atomically (journal/<commitmentId>.json).
+  //   3. COMMIT POINT — one durable ledger append. The COMMITMENT entry carries
+  //                 the guarantee, so "committed" and "guaranteed" cannot diverge.
+  //   4. APPLY    — side effects, each idempotent by commitmentId: guarantee
+  //                 record, exposure books, commitment record, task state, and
+  //                 the COMMITTED notices into the outbox. Then one atomic
+  //                 snapshot write.
+  //   5. CLEANUP  — delete the journal; flush the outbox (at-least-once).
+  //
+  // A crash before 3 leaves nothing but a journal, which recovery discards
+  // (and, because both acceptances are already in the snapshot, retries the
+  // commit). A crash after 3 leaves a ledger entry and a journal; recovery
+  // re-runs 4–5, and every step tolerates having already happened.
+
   private async commit(t: NegotiationTask, terms: Terms) {
     const brokerReg = this.state.agents.get(t.brokerAgentId)!;
     const carrierReg = this.state.agents.get(t.carrierAgentId)!;
     const brokerCred = this.issuer.get(brokerReg.credentialId)!;
     const carrierCred = this.issuer.get(carrierReg.credentialId)!;
 
-    // Final identity re-verification of both parties at the moment of commitment.
+    // 1. PREPARE — final identity re-verification of both parties at the moment of commitment.
     for (const [reg, cred] of [[brokerReg, brokerCred], [carrierReg, carrierCred]] as const) {
       const cv = verifyCredential(cred, { issuerPublicKey: this.kp.publicJwk, revocation: this.issuer.revocation(cred.credentialId) });
       const lv = cv.ok ? liveCheck(this.registry, cred, { hazmat: t.load.hazmat, requiredBipdUsd: reg.agentId === t.carrierAgentId ? brokerReg.envelope?.limits.requiredCounterpartyInsuranceUsd : undefined }) : undefined;
@@ -522,17 +547,15 @@ export class VenueService {
         return;
       }
     }
-
     const quote = this.quoteFor(t, terms);
     const requireGuarantee = !!brokerReg.envelope?.limits.requireGuarantee || !!carrierReg.envelope?.limits.requireGuarantee;
     if (quote.decision === "DECLINED" && requireGuarantee) {
       await this.fail(t, quote.reasonCode, "underwriting", { ...quote.evidence, mandateRequiresGuarantee: true, assessment: quote.assessment, exposure: quote.exposureAfter }, undefined, undefined);
       return;
     }
-
     const commitmentId = `cmt_${randomUUID()}`;
     const head = this.ledger.head;
-    const artifact: CommitmentArtifact = buildArtifact(
+    const artifact = buildArtifact(
       {
         venue: { venueId: this.config.venueId, publicKey: this.kp.publicJwk },
         terms,
@@ -545,34 +568,146 @@ export class VenueService {
       this.kp,
       commitmentId,
     );
-    const entry = this.ledger.append("COMMITMENT", { commitmentId, termsHash: artifact.termsHash, artifactHash: artifactHash(artifact), loadRef: terms.loadRef, brokerUsdot: terms.brokerEntity.usdot, carrierUsdot: terms.carrierEntity.usdot, rateUsd: terms.rateUsd, guaranteed: quote.decision === "GUARANTEED" });
-    artifact.ledgerEntryHash = entry.hash;
+    const day = terms.pickup.windowStart.slice(0, 10);
+    const journal: CommitJournal = {
+      kind: "COMMIT",
+      commitmentId,
+      taskId: t.task.id,
+      writtenAt: new Date().toISOString(),
+      artifact,
+      guarantee: quote.decision === "GUARANTEED" ? { guaranteeId: quote.guarantee.guaranteeId, counterpartyUsdot: terms.carrierEntity.usdot, beneficiaryUsdot: terms.brokerEntity.usdot, coveredAmountUsd: quote.guarantee.coveredAmountUsd, premiumUsd: quote.guarantee.premiumUsd, day, probabilityOfLoss: quote.assessment.probabilityOfLoss, factors: quote.assessment.factors } : undefined,
+      declined: quote.decision === "DECLINED" ? { reasonCode: quote.reasonCode, evidence: quote.evidence } : undefined,
+      ledger: { seq: head.seq + 1, prevHash: head.hash },
+    };
+
+    // 2. JOURNAL
+    this.state.writeJournal(journal);
+    this.crashIf("after-journal");
+
+    // 3. COMMIT POINT
+    const entry = this.ledger.append("COMMITMENT", this.ledgerPayloadFor(journal));
+    this.crashIf("after-ledger-append");
+
+    // 4–5. APPLY + CLEANUP
+    await this.applyCommit(journal, entry, "live");
+  }
+
+  private ledgerPayloadFor(j: CommitJournal): Record<string, unknown> {
+    const terms = j.artifact.terms;
+    return {
+      commitmentId: j.commitmentId,
+      taskId: j.taskId,
+      termsHash: j.artifact.termsHash,
+      artifactHash: artifactHash(j.artifact),
+      loadRef: terms.loadRef,
+      brokerUsdot: terms.brokerEntity.usdot,
+      carrierUsdot: terms.carrierEntity.usdot,
+      rateUsd: terms.rateUsd,
+      guarantee: j.guarantee ? { guaranteeId: j.guarantee.guaranteeId, coveredAmountUsd: j.guarantee.coveredAmountUsd, premiumUsd: j.guarantee.premiumUsd, counterpartyUsdot: j.guarantee.counterpartyUsdot, beneficiaryUsdot: j.guarantee.beneficiaryUsdot } : null,
+    };
+  }
+
+  /**
+   * Apply a committed journal's side effects. Every step is idempotent by
+   * commitmentId, so this is safe to run any number of times — which is
+   * exactly what recovery does.
+   */
+  private async applyCommit(j: CommitJournal, entry: LedgerEntry, mode: "live" | "recovery") {
+    const t = this.state.tasks.get(j.taskId);
+    const terms = j.artifact.terms;
+    const day = terms.pickup.windowStart.slice(0, 10);
+    const artifact: CommitmentArtifact = { ...j.artifact, ledgerEntryHash: entry.hash };
 
     let guaranteeId: string | undefined;
-    if (quote.decision === "GUARANTEED") {
-      const g = this.underwriting.attach(quote.guarantee.guaranteeId, commitmentId);
+    if (j.guarantee) {
+      const g = this.underwriting.attach(j.guarantee, j.commitmentId); // no-op if already attached
       guaranteeId = g.guaranteeId;
-      this.ledger.append("GUARANTEE_ATTACHED", { commitmentId, guaranteeId, coveredAmountUsd: g.coveredAmountUsd, premiumUsd: g.premiumUsd, counterpartyUsdot: g.counterpartyUsdot, beneficiaryUsdot: g.beneficiaryUsdot });
-      this.audit.write({ component: "underwriting", event: "guarantee-attached", outcome: "ALLOWED", taskId: t.task.id, evidence: { guaranteeId, coveredAmountUsd: g.coveredAmountUsd, premiumUsd: g.premiumUsd, probabilityOfLoss: quote.assessment.probabilityOfLoss, factors: quote.assessment.factors, exposureAfter: quote.exposureAfter } });
-    } else {
-      this.audit.write({ component: "underwriting", event: "guarantee-declined", outcome: "INFO", reasonCode: quote.reasonCode, taskId: t.task.id, evidence: { ...quote.evidence, proceededUnguaranteed: true } });
     }
-    const day = terms.pickup.windowStart.slice(0, 10);
-    this.exposureFor(t.brokerAgentId).add(terms.carrierEntity.usdot, terms.rateUsd, day);
-    this.exposureFor(t.carrierAgentId).add(terms.brokerEntity.usdot, terms.rateUsd, day);
+    const brokerAgentId = terms.brokerAgentId;
+    const carrierAgentId = terms.carrierAgentId;
+    this.exposureFor(brokerAgentId).add(terms.carrierEntity.usdot, terms.rateUsd, day, j.commitmentId);
+    this.exposureFor(carrierAgentId).add(terms.brokerEntity.usdot, terms.rateUsd, day, j.commitmentId);
 
-    const rec: CommitmentRecord = { commitmentId, taskId: t.task.id, loadRef: terms.loadRef, loadFingerprint: loadFingerprint(terms.load), brokerAgentId: t.brokerAgentId, carrierAgentId: t.carrierAgentId, brokerUsdot: terms.brokerEntity.usdot, carrierUsdot: terms.carrierEntity.usdot, rateUsd: terms.rateUsd, pickupWindowStart: terms.pickup.windowStart, status: "ACTIVE", guaranteeId, artifact };
-    this.state.commitments.set(commitmentId, rec);
-    t.status = "COMMITTED";
-    t.commitmentId = commitmentId;
-    t.task.artifacts = [{ artifactId: commitmentId, name: "commitment", description: "Signed commitment artifact", parts: [{ kind: "data", data: artifact as unknown as Record<string, unknown> }] }];
-    const payload = { type: "COMMITTED" as const, loadRef: terms.loadRef, commitmentId, termsHash: artifact.termsHash, guarantee: quote.decision === "GUARANTEED" ? { guaranteeId: quote.guarantee.guaranteeId, coveredAmountUsd: quote.guarantee.coveredAmountUsd, premiumUsd: quote.guarantee.premiumUsd, scope: quote.guarantee.scope } : undefined, artifact: artifact as unknown as Record<string, unknown> };
-    const notice = this.venueMessage(payload, t.task.id, t.task.contextId);
-    t.task.status = { state: "completed", timestamp: new Date().toISOString(), message: notice };
+    const alreadyRecorded = this.state.commitments.has(j.commitmentId);
+    if (!alreadyRecorded) {
+      const rec: CommitmentRecord = { commitmentId: j.commitmentId, taskId: j.taskId, loadRef: terms.loadRef, loadFingerprint: loadFingerprint(terms.load), brokerAgentId, carrierAgentId, brokerUsdot: terms.brokerEntity.usdot, carrierUsdot: terms.carrierEntity.usdot, rateUsd: terms.rateUsd, pickupWindowStart: terms.pickup.windowStart, status: "ACTIVE", guaranteeId, artifact };
+      this.state.commitments.set(j.commitmentId, rec);
+    }
+    const payload = { type: "COMMITTED" as const, loadRef: terms.loadRef, commitmentId: j.commitmentId, termsHash: artifact.termsHash, guarantee: j.guarantee ? { guaranteeId: j.guarantee.guaranteeId, coveredAmountUsd: j.guarantee.coveredAmountUsd, premiumUsd: j.guarantee.premiumUsd, scope: GUARANTEE_SCOPE } : undefined, artifact: artifact as unknown as Record<string, unknown> };
+    if (t && t.status !== "COMMITTED") {
+      t.status = "COMMITTED";
+      t.commitmentId = j.commitmentId;
+      t.task.artifacts = [{ artifactId: j.commitmentId, name: "commitment", description: "Signed commitment artifact", parts: [{ kind: "data", data: artifact as unknown as Record<string, unknown> }] }];
+      const notice = this.venueMessage(payload, j.taskId, t.task.contextId);
+      t.task.status = { state: "completed", timestamp: new Date().toISOString(), message: notice };
+      // Notices are enqueued in the same snapshot as the state change: either both persist or neither.
+      for (const id of [brokerAgentId, carrierAgentId]) this.enqueue(id, notice, `COMMITTED ${j.commitmentId}`);
+    }
     this.state.persist();
-    this.audit.write({ component: "venue.commitment", event: "commit", outcome: "ALLOWED", taskId: t.task.id, contextId: t.task.contextId, evidence: { commitmentId, termsHash: artifact.termsHash, rateUsd: terms.rateUsd, guaranteed: !!guaranteeId, ledgerSeq: entry.seq } });
-    await Promise.all([this.deliver(brokerReg, notice), this.deliver(carrierReg, notice)]);
-    await this.cancelSiblings(t, rec);
+    this.crashIf("after-apply");
+    this.state.deleteJournal(j.commitmentId);
+
+    if (!alreadyRecorded) {
+      if (j.guarantee) this.audit.write({ component: "underwriting", event: "guarantee-attached", outcome: "ALLOWED", taskId: j.taskId, evidence: { guaranteeId, coveredAmountUsd: j.guarantee.coveredAmountUsd, premiumUsd: j.guarantee.premiumUsd, probabilityOfLoss: j.guarantee.probabilityOfLoss, factors: j.guarantee.factors } });
+      else if (j.declined) this.audit.write({ component: "underwriting", event: "guarantee-declined", outcome: "INFO", reasonCode: j.declined.reasonCode, taskId: j.taskId, evidence: { ...j.declined.evidence, proceededUnguaranteed: true } });
+      this.audit.write({ component: "venue.commitment", event: "commit", outcome: "ALLOWED", taskId: j.taskId, contextId: t?.task.contextId, evidence: { commitmentId: j.commitmentId, termsHash: artifact.termsHash, rateUsd: terms.rateUsd, guaranteed: !!guaranteeId, ledgerSeq: entry.seq, mode } });
+    }
+    await this.flushOutbox();
+    const rec = this.state.commitments.get(j.commitmentId)!;
+    if (t) await this.cancelSiblings(t, rec);
+  }
+
+  // ---------------------------------------------------------------- recovery
+
+  /**
+   * Run once at startup, before serving. Reconciles the journal against the
+   * ledger, finishes in-flight commits, and re-delivers owed notices.
+   */
+  async recover(): Promise<{ applied: string[]; aborted: string[]; retried: string[]; redelivered: number }> {
+    const applied: string[] = [];
+    const aborted: string[] = [];
+    const retried: string[] = [];
+    for (const j of this.state.readJournals()) {
+      const wantType = j.kind === "COMMIT" ? "COMMITMENT" : "VOID";
+      const onLedger = this.ledger.find((e) => e.type === wantType && (e.payload as { commitmentId?: string }).commitmentId === j.commitmentId);
+      if (onLedger) {
+        // Past the commit point: finish applying. Every step is idempotent.
+        if (j.kind === "COMMIT") await this.applyCommit(j, onLedger, "recovery");
+        else await this.applyVoid(j, onLedger, "recovery");
+        applied.push(j.commitmentId);
+      } else {
+        // Before the commit point: nothing happened. Discard the intent.
+        this.state.deleteJournal(j.commitmentId);
+        aborted.push(j.commitmentId);
+        this.audit.write({ component: "venue.commitment", event: "recovery", outcome: "INFO", taskId: j.kind === "COMMIT" ? j.taskId : undefined, evidence: { commitAborted: j.commitmentId, reason: "journal without ledger entry — crash before the commit point" } });
+      }
+    }
+    // Tasks that hold both acceptances but never reached a commitment: the crash hit between
+    // persisting the second acceptance and the commit point. Re-attempt from the persisted state.
+    for (const t of this.state.tasks.values()) {
+      if (TERMINAL_STATES.includes(t.task.status.state)) continue;
+      if (!t.acceptances[t.brokerAgentId] || !t.acceptances[t.carrierAgentId]) continue;
+      if (this.state.commitments.has(t.commitmentId ?? "")) continue;
+      const accept = dataPart(t.acceptances[t.carrierAgentId]!) as unknown as AcceptPayload;
+      retried.push(t.task.id);
+      await this.commit(t, accept.terms);
+    }
+    const before = this.state.outbox.length;
+    await this.flushOutbox();
+    const redelivered = before - this.state.outbox.length;
+    if (applied.length || aborted.length || retried.length || redelivered) {
+      this.audit.write({ component: "venue.commitment", event: "recovery", outcome: "INFO", evidence: { applied, aborted, retriedTasks: retried, redelivered, outboxPending: this.state.outbox.length } });
+    }
+    return { applied, aborted, retried, redelivered };
+  }
+
+  /** SIM-ONLY fault injection: die at a named point inside a commit. Never present in a deployed venue. */
+  simFault?: { crashAt: string };
+  private crashIf(point: string) {
+    if (process.env.SIM_MODE === "1" && this.simFault?.crashAt === point) {
+      this.audit.write({ component: "sim", event: "crash", outcome: "INFO", evidence: { crashAt: point } });
+      process.exit(137);
+    }
   }
 
   /** An ACTIVE commitment in which `brokerAgentId` is the broker for this physical load, if any. */
@@ -625,8 +760,9 @@ export class VenueService {
     t.task.status = { state: disposition === "CANCELED" ? "canceled" : "failed", timestamp: new Date().toISOString(), message: full };
     this.state.persist();
     this.audit.write({ component: refusedBy, event: "negotiation-terminated", outcome: "REFUSED", reasonCode, taskId: t.task.id, contextId: t.task.contextId, subject: subjectId, evidence });
-    const parties = [this.state.agents.get(t.brokerAgentId), this.state.agents.get(t.carrierAgentId)].filter((x): x is RegisteredAgent => !!x);
-    await Promise.all(parties.map((p) => this.deliver(p, !subjectId || p.agentId === subjectId ? full : redacted)));
+    for (const id of [t.brokerAgentId, t.carrierAgentId]) if (this.state.agents.has(id)) this.enqueue(id, !subjectId || id === subjectId ? full : redacted, `REFUSED ${reasonCode}`);
+    this.state.persist();
+    await this.flushOutbox();
   }
 
   // ------------------------------------------------------- outbound to agents
@@ -660,18 +796,61 @@ export class VenueService {
     return venueSignMessage(m, this.kp);
   }
 
-  private async deliver(to: RegisteredAgent, m: Message) {
-    this.state.logMessage("OUT", m, `to ${to.agentId}`);
+  // ------------------------------------------------------------- outbox
+  //
+  // Every message the venue owes an agent goes through a persisted outbox.
+  // Enqueue happens inside the same snapshot as the state change that caused
+  // it; delivery is at-least-once and agents dedupe by messageId.
+
+  private enqueue(toAgentId: string, m: Message, note?: string) {
+    this.state.outbox.push({ id: randomUUID(), toAgentId, message: m, enqueuedAt: new Date().toISOString(), attempts: 0, nextAttemptAt: new Date().toISOString(), note });
+  }
+
+  private flushing = false;
+  async flushOutbox(): Promise<void> {
+    if (this.flushing) return;
+    this.flushing = true;
     try {
-      const res = await rpcCall(`${to.url}/a2a`, "message/send", { message: m });
-      if (res.error) this.audit.write({ component: "venue.routing", event: "deliver", outcome: "INFO", subject: to.agentId, taskId: m.taskId, evidence: { error: res.error } });
-    } catch (e) {
-      this.audit.write({ component: "venue.routing", event: "deliver", outcome: "INFO", subject: to.agentId, taskId: m.taskId, evidence: { error: String(e) } });
+      const now = Date.now();
+      const blocked = new Set<string>(); // per-recipient ordering: a failed delivery blocks only that agent's later notices
+      for (const n of [...this.state.outbox]) {
+        if (blocked.has(n.toAgentId) || new Date(n.nextAttemptAt).getTime() > now) continue;
+        const to = this.state.agents.get(n.toAgentId);
+        if (!to) {
+          this.state.outbox = this.state.outbox.filter((x) => x.id !== n.id);
+          continue;
+        }
+        this.state.logMessage("OUT", n.message, `to ${to.agentId}`);
+        let ok = false;
+        try {
+          const res = await rpcCall(`${to.url}/a2a`, "message/send", { message: n.message });
+          ok = !res.error;
+          if (res.error) this.audit.write({ component: "venue.routing", event: "deliver", outcome: "INFO", subject: to.agentId, taskId: n.message.taskId, evidence: { error: res.error, attempt: n.attempts + 1 } });
+        } catch (e) {
+          this.audit.write({ component: "venue.routing", event: "deliver", outcome: "INFO", subject: to.agentId, taskId: n.message.taskId, evidence: { error: String(e), attempt: n.attempts + 1 } });
+        }
+        if (ok) this.state.outbox = this.state.outbox.filter((x) => x.id !== n.id);
+        else {
+          n.attempts += 1;
+          n.nextAttemptAt = new Date(Date.now() + Math.min(30_000, 250 * 2 ** n.attempts)).toISOString();
+          blocked.add(n.toAgentId);
+        }
+        this.state.persist();
+      }
+    } finally {
+      this.flushing = false;
     }
+  }
+
+  private async deliver(to: RegisteredAgent, m: Message) {
+    this.enqueue(to.agentId, m);
+    this.state.persist();
+    await this.flushOutbox();
   }
 
   // ------------------------------------------------- post-commitment checks
 
+  /** Re-verify both parties of every ACTIVE commitment whose pickup is still ahead. A scheduler would run this; the sim triggers it. */
   /** Re-verify both parties of every ACTIVE commitment whose pickup is still ahead. A scheduler would run this; the sim triggers it. */
   async prePickupChecks(now = new Date()): Promise<CommitmentRecord[]> {
     const voided: CommitmentRecord[] = [];
@@ -685,30 +864,42 @@ export class VenueService {
         if (!bad) continue;
         const reasonCode: ReasonCode = bad.reasonCode === "CREDENTIAL_REVOKED" ? "CREDENTIAL_REVOKED_PRE_PICKUP" : bad.reasonCode!;
         const evidence = { commitmentId: c.commitmentId, party: side, agentId: side === "broker" ? c.brokerAgentId : c.carrierAgentId, pickupWindowStart: c.pickupWindowStart, checkedAt: now.toISOString(), underlying: bad.reasonCode, ...bad.evidence };
-        c.status = "VOIDED";
-        c.voided = { at: now.toISOString(), reasonCode, evidence };
-        this.ledger.append("VOID", { commitmentId: c.commitmentId, reasonCode, evidence });
-        if (c.guaranteeId) {
-          const g = this.underwriting.release(c.guaranteeId, reasonCode);
-          if (g) this.ledger.append("GUARANTEE_RELEASED", { commitmentId: c.commitmentId, guaranteeId: g.guaranteeId, coveredAmountUsd: g.coveredAmountUsd, reason: reasonCode });
-        }
-        const day = c.pickupWindowStart.slice(0, 10);
-        this.exposureFor(c.brokerAgentId).release(c.carrierUsdot, c.rateUsd, day);
-        this.exposureFor(c.carrierAgentId).release(c.brokerUsdot, c.rateUsd, day);
-        this.audit.write({ component: "venue.commitment", event: "pre-pickup-check", outcome: "VOIDED", reasonCode, taskId: c.taskId, evidence: { ...evidence, guaranteeReleased: !!c.guaranteeId, guaranteeWouldHavePaid: guaranteeWouldHavePaid(reasonCode) } });
-        const t = this.state.tasks.get(c.taskId);
-        if (t) t.outcome = { reasonCode, refusedBy: "venue.commitment", evidence, guaranteeWouldHavePaid: guaranteeWouldHavePaid(reasonCode) };
-        const notice = this.venueMessage({ type: "VOIDED", loadRef: c.loadRef, commitmentId: c.commitmentId, reasonCode, evidence }, c.taskId, `ctx_${c.loadRef}`);
-        this.state.persist();
-        for (const id of [c.brokerAgentId, c.carrierAgentId]) {
-          const reg = this.state.agents.get(id);
-          if (reg) await this.deliver(reg, notice);
-        }
+        // Same transaction shape as commit: journal → one ledger entry (carrying the guarantee release) → idempotent apply.
+        const journal: VoidJournal = { kind: "VOID", commitmentId: c.commitmentId, writtenAt: now.toISOString(), reasonCode, evidence };
+        this.state.writeJournal(journal);
+        const g = c.guaranteeId ? this.underwriting.guaranteeForCommitment(c.commitmentId) : undefined;
+        const entry = this.ledger.append("VOID", { commitmentId: c.commitmentId, reasonCode, evidence, guaranteeReleased: g ? { guaranteeId: g.guaranteeId, coveredAmountUsd: g.coveredAmountUsd } : null });
+        await this.applyVoid(journal, entry, "live");
         voided.push(c);
         break;
       }
     }
     return voided;
+  }
+
+  private async applyVoid(j: VoidJournal, entry: LedgerEntry, mode: "live" | "recovery") {
+    const c = this.state.commitments.get(j.commitmentId);
+    if (!c) {
+      this.state.deleteJournal(j.commitmentId);
+      return;
+    }
+    const day = c.pickupWindowStart.slice(0, 10);
+    if (c.guaranteeId) this.underwriting.release(c.guaranteeId, j.reasonCode); // idempotent
+    this.exposureFor(c.brokerAgentId).release(c.carrierUsdot, c.rateUsd, day, j.commitmentId);
+    this.exposureFor(c.carrierAgentId).release(c.brokerUsdot, c.rateUsd, day, j.commitmentId);
+    const first = c.status !== "VOIDED";
+    if (first) {
+      c.status = "VOIDED";
+      c.voided = { at: j.writtenAt, reasonCode: j.reasonCode, evidence: j.evidence };
+      const t = this.state.tasks.get(c.taskId);
+      if (t) t.outcome = { reasonCode: j.reasonCode, refusedBy: "venue.commitment", evidence: j.evidence, guaranteeWouldHavePaid: guaranteeWouldHavePaid(j.reasonCode) };
+      const notice = this.venueMessage({ type: "VOIDED", loadRef: c.loadRef, commitmentId: c.commitmentId, reasonCode: j.reasonCode, evidence: j.evidence }, c.taskId, `ctx_${c.loadRef}`);
+      for (const id of [c.brokerAgentId, c.carrierAgentId]) this.enqueue(id, notice, `VOIDED ${c.commitmentId}`);
+    }
+    this.state.persist();
+    this.state.deleteJournal(j.commitmentId);
+    if (first) this.audit.write({ component: "venue.commitment", event: "pre-pickup-check", outcome: "VOIDED", reasonCode: j.reasonCode, taskId: c.taskId, evidence: { ...j.evidence, guaranteeReleased: !!c.guaranteeId, ledgerSeq: entry.seq, mode, guaranteeWouldHavePaid: guaranteeWouldHavePaid(j.reasonCode) } });
+    await this.flushOutbox();
   }
 }
 

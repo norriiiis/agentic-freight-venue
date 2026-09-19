@@ -3,9 +3,10 @@
  * it, and tracks the venue's aggregate guaranteed exposure.
  */
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ExposureBook } from "../mandate/exposure";
+import { writeFileAtomic } from "../protocol/fsatomic";
 import { assessRisk, pricePremium } from "./model";
 import { DEFAULT_PARAMS, GUARANTEE_CONDITIONS, GUARANTEE_EXCLUSIONS, GUARANTEE_SCOPE, type CounterpartyHistory, type ExposureView, type RiskInputs, type UnderwritingDecision, type UnderwritingParams } from "./types";
 
@@ -16,7 +17,7 @@ export interface GuaranteeRecord {
   beneficiaryUsdot: string;
   coveredAmountUsd: number;
   premiumUsd: number;
-  status: "QUOTED" | "ATTACHED" | "RELEASED" | "CLAIMABLE";
+  status: "ATTACHED" | "RELEASED" | "CLAIMABLE";
   attachedAt?: string;
   releasedAt?: string;
   releaseReason?: string;
@@ -43,8 +44,8 @@ export class UnderwritingEngine {
     this.portfolioUsd = [...this.guarantees.values()].filter((x) => x.status === "ATTACHED").reduce((a, x) => a + x.coveredAmountUsd, 0);
   }
   private persist() {
-    writeFileSync(join(this.dir, "guarantees.json"), JSON.stringify([...this.guarantees.values()], null, 2));
-    writeFileSync(join(this.dir, "history.json"), JSON.stringify(this.history, null, 2));
+    writeFileAtomic(join(this.dir, "guarantees.json"), JSON.stringify([...this.guarantees.values()], null, 2));
+    writeFileAtomic(join(this.dir, "history.json"), JSON.stringify(this.history, null, 2));
   }
 
   historyFor(usdot: string): CounterpartyHistory {
@@ -58,8 +59,8 @@ export class UnderwritingEngine {
   seedExposure(counterpartyUsdot: string, beneficiaryUsdot: string, amountUsd: number, day: string, note: string) {
     const g: GuaranteeRecord = { guaranteeId: `gtee_seed_${randomUUID().slice(0, 8)}`, commitmentId: `seed:${note}`, counterpartyUsdot, beneficiaryUsdot, coveredAmountUsd: amountUsd, premiumUsd: 0, status: "ATTACHED", attachedAt: new Date().toISOString(), day };
     this.guarantees.set(g.guaranteeId, g);
-    this.counterparty.add(counterpartyUsdot, amountUsd, day);
-    this.pair.add(`${beneficiaryUsdot}|${counterpartyUsdot}`, amountUsd, day);
+    this.counterparty.add(counterpartyUsdot, amountUsd, day, g.guaranteeId);
+    this.pair.add(`${beneficiaryUsdot}|${counterpartyUsdot}`, amountUsd, day, g.guaranteeId);
     this.portfolioUsd += amountUsd;
     this.persist();
     return g;
@@ -76,8 +77,9 @@ export class UnderwritingEngine {
   }
 
   /**
-   * Quote a guarantee for `beneficiary` against `counterparty` risk. Does not
-   * consume exposure; call attach() once the commitment is recorded.
+   * Quote a guarantee for `beneficiary` against `counterparty` risk. PURE:
+   * consumes no exposure and writes nothing. attach() makes it real, keyed by
+   * the commitment id so re-applying after a crash is a no-op.
    */
   quote(inputs: RiskInputs, beneficiaryUsdot: string, day: string): UnderwritingDecision {
     const assessment = assessRisk(inputs, this.params);
@@ -99,8 +101,6 @@ export class UnderwritingEngine {
     }
     const premiumUsd = pricePremium(assessment, this.params);
     const guaranteeId = `gtee_${randomUUID()}`;
-    this.guarantees.set(guaranteeId, { guaranteeId, counterpartyUsdot: inputs.usdot, beneficiaryUsdot, coveredAmountUsd: inputs.amountUsd, premiumUsd, status: "QUOTED", day });
-    this.persist();
     return {
       decision: "GUARANTEED",
       assessment,
@@ -109,14 +109,18 @@ export class UnderwritingEngine {
     };
   }
 
-  attach(guaranteeId: string, commitmentId: string): GuaranteeRecord {
-    const g = this.guarantees.get(guaranteeId);
-    if (!g || g.status !== "QUOTED") throw new Error(`guarantee ${guaranteeId} not quoted`);
-    g.status = "ATTACHED";
-    g.commitmentId = commitmentId;
-    g.attachedAt = new Date().toISOString();
-    this.counterparty.add(g.counterpartyUsdot, g.coveredAmountUsd, g.day);
-    this.pair.add(`${g.beneficiaryUsdot}|${g.counterpartyUsdot}`, g.coveredAmountUsd, g.day);
+  /**
+   * Attach a quoted guarantee to a recorded commitment. Idempotent: a second
+   * call for the same commitment returns the existing record and changes
+   * nothing — this is what lets crash recovery re-apply a commit safely.
+   */
+  attach(q: { guaranteeId: string; counterpartyUsdot: string; beneficiaryUsdot: string; coveredAmountUsd: number; premiumUsd: number; day: string }, commitmentId: string): GuaranteeRecord {
+    const existing = this.guaranteeForCommitment(commitmentId);
+    if (existing) return existing;
+    const g: GuaranteeRecord = { ...q, commitmentId, status: "ATTACHED", attachedAt: new Date().toISOString() };
+    this.guarantees.set(g.guaranteeId, g);
+    this.counterparty.add(g.counterpartyUsdot, g.coveredAmountUsd, g.day, commitmentId);
+    this.pair.add(`${g.beneficiaryUsdot}|${g.counterpartyUsdot}`, g.coveredAmountUsd, g.day, commitmentId);
     this.portfolioUsd += g.coveredAmountUsd;
     const h = (this.history[g.counterpartyUsdot] ??= { loadsCommitted: 0, loadsCompleted: 0, claimsPaid: 0, disputesOpen: 0 });
     h.loadsCommitted += 1;
@@ -126,14 +130,16 @@ export class UnderwritingEngine {
     return g;
   }
 
+  /** Idempotent: releasing an already-released guarantee returns it unchanged. */
   release(guaranteeId: string, reason: string): GuaranteeRecord | undefined {
     const g = this.guarantees.get(guaranteeId);
-    if (!g || g.status !== "ATTACHED") return undefined;
+    if (!g) return undefined;
+    if (g.status === "RELEASED") return g;
     g.status = "RELEASED";
     g.releasedAt = new Date().toISOString();
     g.releaseReason = reason;
-    this.counterparty.release(g.counterpartyUsdot, g.coveredAmountUsd, g.day);
-    this.pair.release(`${g.beneficiaryUsdot}|${g.counterpartyUsdot}`, g.coveredAmountUsd, g.day);
+    this.counterparty.release(g.counterpartyUsdot, g.coveredAmountUsd, g.day, g.commitmentId ?? g.guaranteeId);
+    this.pair.release(`${g.beneficiaryUsdot}|${g.counterpartyUsdot}`, g.coveredAmountUsd, g.day, g.commitmentId ?? g.guaranteeId);
     this.portfolioUsd -= g.coveredAmountUsd;
     this.persist();
     return g;
