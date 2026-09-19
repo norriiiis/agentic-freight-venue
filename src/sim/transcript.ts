@@ -65,7 +65,7 @@ export function renderResult(sc: Scenario, res: ScenarioResult, pass: boolean): 
   out.push("");
   out.push(`  OUTCOME     ${res.outcome}${res.commitmentId ? `  ${res.commitmentId}` : ""}`);
   if (res.reasonCode) {
-    out.push(`  refused     ${reason}`);
+    out.push(`  ${res.outcome === "CANCELED" ? "canceled   " : "refused    "} ${reason}`);
     out.push(`  by          ${res.refusedBy}`);
     out.push(`  evidence`);
     out.push(...fmtEvidence(res.evidence));

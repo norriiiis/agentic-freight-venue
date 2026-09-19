@@ -100,5 +100,21 @@ export function carrierSpec(overrides: Partial<AgentSpec> = {}, privateOverrides
   };
 }
 
+/** A second credentialed carrier (Blue Mesa holds both carrier and broker authority). Slightly pricier than Prairie Wind. */
+export function blueMesaCarrierSpec(overrides: Partial<AgentSpec> = {}, privateOverrides: Record<string, unknown> = {}): AgentSpec {
+  const base = carrierSpec(
+    {
+      agentId: "blue-mesa-carrier-agent",
+      entity: { usdot: "1984411", mc: "MC-0711450", legalName: "BLUE MESA CARRIERS INC" },
+      proofOfControlToken: "poc-bluemesa-4e77",
+      principalName: "Blue Mesa Carriers — Operations Manager",
+      ...overrides,
+    },
+    { costPerMileUsd: 2.05, deadheadMiles: 140, targetMarginPct: 0.2, earliestPickup: undefined, ...privateOverrides },
+  );
+  base.privateContext.canary = canary();
+  return base;
+}
+
 /** Prior on-venue history for the carrier, so underwriting has something to look at. */
 export const CARRIER_HISTORY = { loadsCommitted: 16, loadsCompleted: 14, claimsPaid: 0, disputesOpen: 0, firstLoadAt: "2026-02-11T15:02:00.000Z", lastLoadAt: "2026-09-12T18:40:00.000Z" };

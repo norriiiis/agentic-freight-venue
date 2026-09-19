@@ -87,6 +87,7 @@ export class VenueHandle {
   revoke(agentId: string, reason: string, evidence?: Record<string, unknown>) { return httpPost<{ revocation: unknown }>(`${this.url}/admin/credential/revoke`, { agentId, reason, evidence }); }
   seedExposure(counterpartyUsdot: string, beneficiaryUsdot: string, amountUsd: number, day: string, note: string) { return httpPost<{ exposure: unknown }>(`${this.url}/admin/underwriting/seed-exposure`, { counterpartyUsdot, beneficiaryUsdot, amountUsd, day, note }); }
   seedHistory(usdot: string, history: Record<string, unknown>) { return httpPost(`${this.url}/admin/underwriting/seed-history`, { usdot, history }); }
+  expireStaleTasks() { return httpPost<{ expired: { taskId: string; outcome: unknown }[] }>(`${this.url}/admin/expire-stale-tasks`, {}); }
   prePickupChecks() { return httpPost<{ voided: { commitmentId: string; voided: unknown }[] }>(`${this.url}/admin/pre-pickup-checks`, {}); }
   audit() { return httpGet<AuditEntry[]>(`${this.url}/admin/audit`); }
   ledger() { return httpGet<LedgerEntry[]>(`${this.url}/admin/ledger`); }
@@ -120,7 +121,7 @@ export class VenueHandle {
 export interface HarnessOptions {
   workspace: string;
   quiet?: boolean;
-  venue?: { maxRounds?: number; underwriting?: Record<string, unknown> };
+  venue?: { maxRounds?: number; replyTimeoutMs?: number; sweepMs?: number; underwriting?: Record<string, unknown> };
 }
 
 export class Harness {
@@ -143,6 +144,8 @@ export class Harness {
       VENUE_PORT: String(port),
       VENUE_ID: "venue-sim",
       VENUE_MAX_ROUNDS: String(this.opts.venue?.maxRounds ?? 8),
+      VENUE_REPLY_TIMEOUT_MS: String(this.opts.venue?.replyTimeoutMs ?? 120_000),
+      VENUE_SWEEP_MS: String(this.opts.venue?.sweepMs ?? 5_000),
       VENUE_UW_PARAMS: this.opts.venue?.underwriting ? JSON.stringify(this.opts.venue.underwriting) : "",
       SIM_MODE: "1",
     }, "venue  ", !!this.opts.quiet);

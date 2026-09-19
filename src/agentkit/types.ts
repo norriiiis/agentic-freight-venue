@@ -37,6 +37,8 @@ export interface AgentConfig {
     presentAgentId?: string;
     /** Skip onboarding entirely (a spoofer cannot pass proof of control). */
     skipOnboarding?: boolean;
+    /** Acknowledge inbound messages but never act on them (a hung or crashed agent). */
+    dropInbound?: boolean;
   };
 }
 
@@ -74,7 +76,7 @@ export interface LocalTask {
   load: LoadSpec;
   role: "initiator" | "responder";
   counterpartyAgentId?: string;
-  status: "OPEN" | "COMMITTED" | "REFUSED" | "REJECTED" | "VOIDED";
+  status: "OPEN" | "COMMITTED" | "REFUSED" | "REJECTED" | "VOIDED" | "CANCELED";
   round: number;
   myLastOffer?: Offer;
   commitmentId?: string;

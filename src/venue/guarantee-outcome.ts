@@ -34,7 +34,10 @@ export function guaranteeWouldHavePaid(code: ReasonCode): string {
       return "No — the venue declined to guarantee. Commitment was refused only because a party's mandate requires a guarantee; a principal whose mandate permits unguaranteed commits could proceed with NO coverage.";
     case "NEGOTIATION_MAX_ROUNDS":
     case "NEGOTIATION_WALKAWAY":
+    case "NEGOTIATION_TIMEOUT":
       return "N/A — no commitment formed; nothing to guarantee.";
+    case "LOAD_ALREADY_COMMITTED":
+      return "N/A for this negotiation — the load's guarantee rides on the commitment that won.";
     case "CREDENTIAL_REVOKED_PRE_PICKUP":
     case "CREDENTIAL_REVOKED":
       return "Guarantee WAS attached and is now RELEASED with the commitment voided. If the broker ships anyway after the VOIDED notice, PRINCIPAL_OVERRODE_REFUSAL applies: excluded.";

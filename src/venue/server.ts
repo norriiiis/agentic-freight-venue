@@ -7,6 +7,8 @@
  *   VENUE_PORT           listen port (127.0.0.1)
  *   VENUE_ID             venue identifier
  *   VENUE_MAX_ROUNDS     protocol bound on negotiation rounds
+ *   VENUE_REPLY_TIMEOUT_MS  cancel a negotiation when the awaited party is silent this long (default 120s)
+ *   VENUE_SWEEP_MS       how often the timeout sweeper runs (default 5s)
  *   SIM_MODE=1           enables /admin/* (fault injection + introspection for the simulator ONLY)
  */
 import { startServer, type HttpRoute } from "../protocol/rpc";
@@ -19,10 +21,13 @@ const config = {
   port: Number(process.env.VENUE_PORT ?? 4100),
   maxRounds: Number(process.env.VENUE_MAX_ROUNDS ?? 8),
   messageMaxAgeMs: Number(process.env.VENUE_MSG_MAX_AGE_MS ?? 5 * 60_000),
+  replyTimeoutMs: Number(process.env.VENUE_REPLY_TIMEOUT_MS ?? 120_000),
   underwriting: process.env.VENUE_UW_PARAMS ? JSON.parse(process.env.VENUE_UW_PARAMS) : undefined,
 };
 const venue = new VenueService(config);
 const simMode = process.env.SIM_MODE === "1";
+const sweepMs = Number(process.env.VENUE_SWEEP_MS ?? 5_000);
+setInterval(() => { venue.expireStaleTasks().catch((e) => console.error("[venue] sweeper", e)); }, sweepMs).unref();
 
 const ok = (body: unknown) => ({ status: 200, body });
 const routes: Record<string, HttpRoute> = {
@@ -58,6 +63,7 @@ if (simMode) {
       venue.underwriting.seedHistory(usdot, history);
       return ok({ ok: true });
     },
+    "POST /admin/expire-stale-tasks": async () => ok({ expired: (await venue.expireStaleTasks()).map((t) => ({ taskId: t.task.id, outcome: t.outcome })) }),
     "POST /admin/pre-pickup-checks": async () => ok({ voided: (await venue.prePickupChecks()).map((c) => ({ commitmentId: c.commitmentId, voided: c.voided })) }),
     "GET /admin/audit": async () => ok(venue.audit.readAll()),
     "GET /admin/ledger": async () => ok(venue.ledger.all()),
@@ -76,5 +82,5 @@ startServer(config.port, {
   rpc: (method, params, req) => venue.handleRpc(method, params, req.headers as Record<string, string | string[] | undefined>),
   routes,
 }).then(() => {
-  console.log(`[venue] ${config.venueId} listening on ${venue.url} (kid ${venue.kp.kid.slice(0, 12)}…)${simMode ? " SIM_MODE" : ""}`);
+  console.log(`[venue] ${config.venueId} listening on ${venue.url} (kid ${venue.kp.kid.slice(0, 12)}…) replyTimeout ${config.replyTimeoutMs}ms sweep ${sweepMs}ms${simMode ? " SIM_MODE" : ""}`);
 });

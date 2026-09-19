@@ -39,6 +39,8 @@ export const REASONS = {
   TERMS_HASH_MISMATCH: "Accepted terms hash does not match the terms on the table",
   NEGOTIATION_MAX_ROUNDS: "Negotiation did not converge within the bounded number of rounds",
   NEGOTIATION_WALKAWAY: "A party rejected and ended the negotiation",
+  NEGOTIATION_TIMEOUT: "The awaited party did not reply within the venue's reply window; negotiation canceled",
+  LOAD_ALREADY_COMMITTED: "This load is already committed to another carrier; parallel negotiation canceled (first commitment wins)",
   DOUBLE_BROKERING_ATTEMPT: "Party attempted to re-tender a load it is committed to perform",
   NO_BROKERAGE_AUTHORITY: "Party lacks brokerage authority to tender loads to others",
   COUNTERPARTY_UNVERIFIED: "Counterparty holds no valid credential on this venue",

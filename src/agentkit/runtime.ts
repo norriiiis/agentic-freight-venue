@@ -236,6 +236,10 @@ export class AgentRuntime<Ctx extends { canary: string }> {
   }
 
   private async process(m: Message) {
+    if (this.config.rogue?.dropInbound) {
+      this.audit.write({ component: this.comp.runtime, event: "fault-injection", outcome: "INFO", taskId: m.taskId, evidence: { dropInbound: true, note: "acknowledged but not processed" } });
+      return;
+    }
     if (this.config.thinkMs) await new Promise((r) => setTimeout(r, this.config.thinkMs));
     const data = dataPart(m) as unknown as NegotiationPayload;
     const meta = m.metadata as SignedMeta;
@@ -291,9 +295,9 @@ export class AgentRuntime<Ctx extends { canary: string }> {
       }
       case "REFUSED": {
         if (!lt) return;
-        lt.status = "REFUSED";
+        lt.status = data.disposition === "CANCELED" ? "CANCELED" : "REFUSED";
         lt.outcome = { reasonCode: data.reasonCode, refusedBy: data.refusedBy, evidence: data.evidence };
-        this.audit.write({ component: this.comp.runtime, event: "refused-by-venue", outcome: "INFO", taskId, evidence: { reasonCode: data.reasonCode, refusedBy: data.refusedBy } });
+        this.audit.write({ component: this.comp.runtime, event: data.disposition === "CANCELED" ? "canceled-by-venue" : "refused-by-venue", outcome: "INFO", taskId, evidence: { reasonCode: data.reasonCode, refusedBy: data.refusedBy } });
         break;
       }
       case "VOIDED": {

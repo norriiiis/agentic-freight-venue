@@ -4,7 +4,7 @@ A runnable prototype of a third-party venue through which a broker's AI agent an
 
 The two agents are separate OS processes with separate data directories and separate configuration. They never learn each other's address. They talk only through the venue, over A2A-shaped JSON-RPC, and every message is signed with a real Ed25519 key.
 
-**A convincing refusal is the product.** Eight adversarial scenarios each fail with a machine-readable reason, the component that refused, the evidence it relied on, and whether the guarantee would have paid.
+**A convincing refusal is the product.** Ten adversarial scenarios each fail with a machine-readable reason, the component that refused, the evidence it relied on, and whether the guarantee would have paid.
 
 ## Run it
 
@@ -12,7 +12,7 @@ The two agents are separate OS processes with separate data directories and sepa
 npm install
 npm run demo            # happy path: full transcript, independent artifact verification, EDI mapping
 npm run sim -- --all    # every adversarial scenario; exit code 1 if any misbehaves
-npm test                # 56 tests incl. the no-shared-state proof and all scenarios (~20s)
+npm test                # 58 tests incl. the no-shared-state proof and all scenarios (~25s)
 ```
 
 Other entry points:
@@ -61,8 +61,10 @@ The broker's private context (customer rate $2,650, target margin 14%, floor mar
 | `non-convergence` | broker can pay ~$1,953, carrier floor ~$2,339; venue's 8-round bound terminates | `venue.protocol` | `NEGOTIATION_MAX_ROUNDS` | N/A |
 | `revoked-pre-pickup` | commitment recorded; FMCSA revokes authority; pre-pickup re-check voids it, releases guarantee, notifies both | `venue.commitment` | `CREDENTIAL_REVOKED_PRE_PICKUP` | Was attached, now released; shipping anyway is excluded |
 | `replay-and-tamper` | captured ACCEPT replayed; replayed with fresh nonce; artifact rate edited; ledger entry edited | `venue.protocol`, `venue.identity`, `ledger/verify` | `NONCE_REUSED`, `IDENTITY_SIGNATURE_INVALID`, `RECORD_TAMPERED`, `CHAIN_BROKEN` | N/A — original commitment unaffected |
+| `multi-tender` | broker tenders one load to two carriers in parallel; Prairie Wind closes first; Blue Mesa's open negotiation is canceled; re-tendering the committed load is refused at intake | `venue.commitment`, then `venue.routing` | `LOAD_ALREADY_COMMITTED` | N/A for the loser — the guarantee rides on the winning commitment |
+| `negotiation-timeout` | carrier acknowledges the tender and goes silent; the venue's sweeper cancels after the reply window; a late COUNTER is refused | `venue.protocol` | `NEGOTIATION_TIMEOUT`, then `PROTOCOL_VIOLATION` | N/A |
 
-Each scenario prints the wire log, the refusal with evidence, the audit entries by file and sequence number, and PASS/FAIL against its expectation.
+Each scenario prints the wire log, the refusal with evidence, the audit entries by file and sequence number, and PASS/FAIL against its expectation. Refusals distinguish `FAILED` (a check failed) from `CANCELED` (nothing was wrong with this negotiation — it was overtaken or timed out).
 
 ## Architecture
 
@@ -95,7 +97,7 @@ Each scenario prints the wire log, the refusal with evidence, the audit entries 
 | `src/underwriting/` | Parameterized loss model (named factors), guarantee scope/exclusions/conditions, quote → attach → release lifecycle, per-counterparty / per-pair / portfolio exposure. |
 | `src/ledger/` | Hash-chained, venue-signed append-only log; self-contained commitment artifact; independent verifier (library + CLI). |
 | `src/edi/` | Commitment → rate confirmation and X12 850/855/856 segment outline. |
-| `src/sim/` | Process harness, fixtures, nine scenarios, transcript renderer, CLI. |
+| `src/sim/` | Process harness, fixtures, eleven scenarios, transcript renderer, CLI. |
 | `test/` | Identity and mandate refusal tests, ledger/protocol tests, the no-shared-state proof, scenario acceptance. |
 
 ### Wire protocol
@@ -108,6 +110,8 @@ Two signatures can sit on a message:
 - `metadata.venueSig` — the venue's detached JWS over the message *including* the agent's signature and the venue's attachment (`metadata.venue`: task/context ids, round, and the sender's verified identity, credential id, public key and current insurance).
 
 The venue never mutates a signed message; it only adds. Agents accept inbound only with a valid `venueSig` against the venue key they pinned at startup, and additionally verify the counterparty's `sig` against the key the venue attested. A message sent from one agent directly to the other is refused as `ENVELOPE_NOT_FROM_VENUE`; the isolation test does exactly that.
+
+**Negotiation lifecycle rules.** One A2A task per (load, counterparty). A broker may tender the same load to several carriers at once; the first commitment recorded wins and the venue cancels the rest (`LOAD_ALREADY_COMMITTED`), telling losing carriers only that the load went elsewhere. A load with an ACTIVE commitment cannot be tendered again until that commitment is voided. Every task tracks whom it is waiting on and since when; a sweeper cancels tasks whose awaited party has been silent longer than `VENUE_REPLY_TIMEOUT_MS` (default 120s), naming the silent party (`NEGOTIATION_TIMEOUT`). Terminal tasks accept nothing further.
 
 ### What the venue sees
 
@@ -125,7 +129,7 @@ A commitment is formed when the venue holds ACCEPT messages from both parties ov
 - Process isolation: three OS processes, three data directories, agents configured with only their own directory and the venue URL. Verified statically (import graph) and at runtime (canaries, wire vocabulary, direct-contact refusal, private keys never cross).
 - Credential lifecycle: issuance against registry evidence, expiry, revocation list, three-layer verification on every exchange, live re-check at tender / commit / pre-pickup.
 - Mandate engine and its two-layer enforcement (local + venue envelope), both principal-signed.
-- Negotiation state machine, round bound, terms-hash consistency, nonce/timestamp replay protection, per-recipient redaction.
+- Negotiation state machine, round bound, reply timeout with sweeper, first-commit-wins multi-tender, terms-hash consistency, nonce/timestamp replay protection, per-recipient redaction.
 - Hash-chained ledger and self-contained artifact verification without the venue.
 - Underwriting *interfaces*: quote → attach → release, exposure per counterparty / pair / portfolio, guarantee scope embedded in the artifact.
 - Agent negotiation logic with genuine private economics that converge or stalemate for real reasons.
@@ -161,7 +165,7 @@ In the order it would hurt:
 
 ## Reason codes
 
-All refusals use codes from `src/protocol/reasons.ts`, grouped: identity (`IDENTITY_*`, `CREDENTIAL_*`, `AUTHORITY_*`, `INSURANCE_*`, `ONBOARDING_*`), mandate (`MANDATE_*`), protocol and routing (`PROTOCOL_VIOLATION`, `NONCE_REUSED`, `MESSAGE_STALE`, `ENVELOPE_NOT_FROM_VENUE`, `TERMS_HASH_MISMATCH`, `NEGOTIATION_*`, `DOUBLE_BROKERING_ATTEMPT`, `NO_BROKERAGE_AUTHORITY`, `COUNTERPARTY_UNVERIFIED`, `REPLAY_DETECTED`, `RECORD_TAMPERED`, `CHAIN_BROKEN`), underwriting (`UNDERWRITING_DECLINED_RISK`, `VENUE_EXPOSURE_LIMIT_EXCEEDED`, `VENUE_PORTFOLIO_LIMIT_EXCEEDED`), post-commitment (`CREDENTIAL_REVOKED_PRE_PICKUP`). Every audit entry names its component, its reason code, and its evidence.
+All refusals use codes from `src/protocol/reasons.ts`, grouped: identity (`IDENTITY_*`, `CREDENTIAL_*`, `AUTHORITY_*`, `INSURANCE_*`, `ONBOARDING_*`), mandate (`MANDATE_*`), protocol and routing (`PROTOCOL_VIOLATION`, `NONCE_REUSED`, `MESSAGE_STALE`, `ENVELOPE_NOT_FROM_VENUE`, `TERMS_HASH_MISMATCH`, `NEGOTIATION_*` (max rounds, walkaway, timeout), `LOAD_ALREADY_COMMITTED`, `DOUBLE_BROKERING_ATTEMPT`, `NO_BROKERAGE_AUTHORITY`, `COUNTERPARTY_UNVERIFIED`, `REPLAY_DETECTED`, `RECORD_TAMPERED`, `CHAIN_BROKEN`), underwriting (`UNDERWRITING_DECLINED_RISK`, `VENUE_EXPOSURE_LIMIT_EXCEEDED`, `VENUE_PORTFOLIO_LIMIT_EXCEEDED`), post-commitment (`CREDENTIAL_REVOKED_PRE_PICKUP`). Every audit entry names its component, its reason code, and its evidence.
 
 ## Decisions
 

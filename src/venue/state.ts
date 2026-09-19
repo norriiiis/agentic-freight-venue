@@ -33,11 +33,13 @@ export interface NegotiationTask {
   brokerAgentId: string;
   carrierAgentId: string;
   round: number;
-  /** Whose message the venue is waiting for. */
+  createdAt: string;
+  /** Whose message the venue is waiting for, and since when (drives the reply timeout). */
   awaiting: string;
+  awaitingSince: string;
   onTable?: { offer: Offer; by: string; round: number };
   acceptances: Record<string, Message>;
-  status: "NEGOTIATING" | "COUNTERSIGN" | "COMMITTED" | "FAILED" | "REJECTED";
+  status: "NEGOTIATING" | "COUNTERSIGN" | "COMMITTED" | "FAILED" | "REJECTED" | "CANCELED";
   outcome?: { reasonCode: ReasonCode; refusedBy: string; evidence: Record<string, unknown>; guaranteeWouldHavePaid?: string };
   commitmentId?: string;
 }

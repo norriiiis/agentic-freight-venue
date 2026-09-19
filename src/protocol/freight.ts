@@ -115,6 +115,8 @@ export interface RefusedPayload {
   reasonCode: string;
   refusedBy: string;
   evidence: Record<string, unknown>;
+  /** FAILED: a check failed. CANCELED: nothing was wrong with this negotiation; it was overtaken (multi-tender) or timed out. */
+  disposition?: "FAILED" | "CANCELED";
 }
 
 export interface VoidedPayload {

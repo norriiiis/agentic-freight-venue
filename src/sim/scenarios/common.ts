@@ -20,7 +20,7 @@ export async function negotiate(h: Harness, broker: AgentHandle, carrier: AgentH
   if (r.localRefusal) return { localRefusal: true as const, r };
   if (!r.taskId) return { refusal: r.refusal, r };
   const t = await h.venue.waitTerminal(r.taskId);
-  const terminal: Parameters<AgentHandle["waitStatus"]>[1] = ["COMMITTED", "REFUSED", "REJECTED", "VOIDED"];
+  const terminal: Parameters<AgentHandle["waitStatus"]>[1] = ["COMMITTED", "REFUSED", "REJECTED", "VOIDED", "CANCELED"];
   // A tender rejected at intake never reaches the counterparty, so only the initiator has a record of it.
   const waits = t.task.status.state === "rejected" ? [broker.waitStatus(r.taskId, terminal)] : [broker.waitStatus(r.taskId, terminal), carrier.waitStatus(r.taskId, terminal)];
   await Promise.all(waits);
@@ -35,7 +35,7 @@ export async function resultFromTask(h: Harness, t: NegotiationTask, extra: Part
   }
   const o = t.outcome!;
   return {
-    outcome: "REFUSED",
+    outcome: t.status === "CANCELED" ? "CANCELED" : "REFUSED",
     reasonCode: o.reasonCode,
     refusedBy: o.refusedBy,
     evidence: o.evidence,

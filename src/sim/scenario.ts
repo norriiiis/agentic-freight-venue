@@ -10,7 +10,7 @@ export interface Finding {
 }
 
 export interface ScenarioResult {
-  outcome: "COMMITTED" | "REFUSED" | "VOIDED";
+  outcome: "COMMITTED" | "REFUSED" | "VOIDED" | "CANCELED";
   reasonCode?: string;
   refusedBy?: string;
   evidence?: Record<string, unknown>;

@@ -41,6 +41,8 @@ export interface VenueConfig {
   port: number;
   maxRounds: number;
   messageMaxAgeMs: number;
+  /** How long the venue waits for the awaited party's reply before canceling the negotiation. */
+  replyTimeoutMs: number;
   underwriting?: Partial<UnderwritingParams>;
 }
 
@@ -272,6 +274,10 @@ export class VenueService {
       }
     }
 
+    // (b2) first commitment wins: a load the sender already has an ACTIVE commitment for cannot be tendered again
+    const already = this.activeCommitmentForLoad(sender.agentId, data.load.loadRef, fp);
+    if (already) violations.push({ code: "LOAD_ALREADY_COMMITTED", evidence: { existingCommitmentId: already.commitmentId, matchedBy: already.loadRef === data.load.loadRef ? "loadRef" : "loadFingerprint", committedAt: already.artifact.createdAt } });
+
     // (c) counterparty must be a credentialed carrier in good standing NOW
     const cp = this.state.agents.get(data.to.agentId);
     let cpCred: Credential | undefined;
@@ -297,9 +303,9 @@ export class VenueService {
 
     if (violations.length) {
       // most specific first
-      const order: ReasonCode[] = ["DOUBLE_BROKERING_ATTEMPT", "NO_BROKERAGE_AUTHORITY", "INSURANCE_LAPSED", "INSURANCE_BELOW_MINIMUM", "AUTHORITY_NOT_ACTIVE", "CREDENTIAL_REVOKED", "CREDENTIAL_EXPIRED", "COUNTERPARTY_UNVERIFIED", "MANDATE_RATE_ABOVE_CEILING", "MANDATE_RATE_BELOW_FLOOR", "MANDATE_LANE_NOT_APPROVED", "MANDATE_EQUIPMENT_NOT_APPROVED"];
+      const order: ReasonCode[] = ["DOUBLE_BROKERING_ATTEMPT", "LOAD_ALREADY_COMMITTED", "NO_BROKERAGE_AUTHORITY", "INSURANCE_LAPSED", "INSURANCE_BELOW_MINIMUM", "AUTHORITY_NOT_ACTIVE", "CREDENTIAL_REVOKED", "CREDENTIAL_EXPIRED", "COUNTERPARTY_UNVERIFIED", "MANDATE_RATE_ABOVE_CEILING", "MANDATE_RATE_BELOW_FLOOR", "MANDATE_LANE_NOT_APPROVED", "MANDATE_EQUIPMENT_NOT_APPROVED"];
       const primary = [...violations].sort((a, b) => (order.indexOf(a.code) === -1 ? 99 : order.indexOf(a.code)) - (order.indexOf(b.code) === -1 ? 99 : order.indexOf(b.code)))[0]!;
-      const refusedBy: Component = primary.code.startsWith("MANDATE_") ? "venue.mandate" : primary.code === "DOUBLE_BROKERING_ATTEMPT" || primary.code === "COUNTERPARTY_UNVERIFIED" || primary.code === "NO_BROKERAGE_AUTHORITY" ? "venue.routing" : "venue.identity";
+      const refusedBy: Component = primary.code.startsWith("MANDATE_") ? "venue.mandate" : ["DOUBLE_BROKERING_ATTEMPT", "COUNTERPARTY_UNVERIFIED", "NO_BROKERAGE_AUTHORITY", "LOAD_ALREADY_COMMITTED"].includes(primary.code) ? "venue.routing" : "venue.identity";
       const evidence = { ...primary.evidence, allViolations: violations.map((v) => v.code), details: violations };
       const task = this.newTask(taskId, contextId, data, sender.agentId, data.to.agentId, m);
       task.status = "REJECTED";
@@ -324,7 +330,8 @@ export class VenueService {
 
   private newTask(taskId: string, contextId: string, data: TenderPayload, brokerAgentId: string, carrierAgentId: string, m: Message): NegotiationTask {
     const t: Task = { kind: "task", id: taskId, contextId, status: { state: "submitted", timestamp: new Date().toISOString() }, history: [m], artifacts: [], metadata: { loadRef: data.load.loadRef, extension: FREIGHT_EXTENSION_URI } };
-    return { task: t, loadRef: data.load.loadRef, load: data.load, brokerAgentId, carrierAgentId, round: 1, awaiting: carrierAgentId, acceptances: {}, status: "NEGOTIATING" };
+    const now = new Date().toISOString();
+    return { task: t, loadRef: data.load.loadRef, load: data.load, brokerAgentId, carrierAgentId, round: 1, createdAt: now, awaiting: carrierAgentId, awaitingSince: now, acceptances: {}, status: "NEGOTIATING" };
   }
 
   private async advance(m: Message, data: CounterPayload | AcceptPayload | RejectPayload, sender: RegisteredAgent, senderCred: Credential): Promise<Task> {
@@ -362,6 +369,7 @@ export class VenueService {
       t.round = round;
       t.onTable = { offer: data.offer, by: sender.agentId, round };
       t.awaiting = otherId;
+      t.awaitingSince = new Date().toISOString();
       t.status = "NEGOTIATING";
       this.state.persist();
       this.audit.write({ component: "venue.routing", event: "counter", outcome: "ALLOWED", subject: sender.agentId, taskId: t.task.id, evidence: { round, rateUsd: data.offer.rateUsd } });
@@ -369,7 +377,12 @@ export class VenueService {
       return t.task;
     }
 
-    // ACCEPT
+    // ACCEPT — first commitment wins: if the broker's load was committed elsewhere while this ran, cancel.
+    const won = this.activeCommitmentForLoad(t.brokerAgentId, t.loadRef, loadFingerprint(t.load));
+    if (won) {
+      await this.fail(t, "LOAD_ALREADY_COMMITTED", "venue.commitment", { agentId: t.brokerAgentId, winningCommitmentId: won.commitmentId, canceledTaskId: t.task.id, atRound: data.round, acceptedBy: sender.agentId }, m, other, t.brokerAgentId, "CANCELED");
+      return t.task;
+    }
     const check = this.checkAcceptTerms(t, data, sender, senderCred);
     if (check) {
       await this.fail(t, "TERMS_HASH_MISMATCH", "venue.protocol", check, m, other);
@@ -414,6 +427,7 @@ export class VenueService {
     if (!t.acceptances[otherId]) {
       t.status = "COUNTERSIGN";
       t.awaiting = otherId;
+      t.awaitingSince = new Date().toISOString();
       this.state.persist();
       await this.forward(m, t, other, sender, senderCred, senderLive, data.round, guaranteeAvailable);
       return t.task;
@@ -550,6 +564,42 @@ export class VenueService {
     this.state.persist();
     this.audit.write({ component: "venue.commitment", event: "commit", outcome: "ALLOWED", taskId: t.task.id, contextId: t.task.contextId, evidence: { commitmentId, termsHash: artifact.termsHash, rateUsd: terms.rateUsd, guaranteed: !!guaranteeId, ledgerSeq: entry.seq } });
     await Promise.all([this.deliver(brokerReg, notice), this.deliver(carrierReg, notice)]);
+    await this.cancelSiblings(t, rec);
+  }
+
+  /** An ACTIVE commitment in which `brokerAgentId` is the broker for this physical load, if any. */
+  private activeCommitmentForLoad(brokerAgentId: string, loadRef: string, fingerprint: string): CommitmentRecord | undefined {
+    for (const c of this.state.commitments.values()) {
+      if (c.status === "ACTIVE" && c.brokerAgentId === brokerAgentId && (c.loadRef === loadRef || c.loadFingerprint === fingerprint)) return c;
+    }
+    return undefined;
+  }
+
+  /** Multi-tender: once one carrier's commitment is recorded, every other open negotiation for the same load is canceled. */
+  private async cancelSiblings(winner: NegotiationTask, rec: CommitmentRecord) {
+    for (const s of this.state.tasks.values()) {
+      if (s.task.id === winner.task.id || s.brokerAgentId !== winner.brokerAgentId) continue;
+      if (TERMINAL_STATES.includes(s.task.status.state)) continue;
+      if (s.loadRef !== rec.loadRef && loadFingerprint(s.load) !== rec.loadFingerprint) continue;
+      await this.fail(s, "LOAD_ALREADY_COMMITTED", "venue.commitment", { agentId: s.brokerAgentId, winningCommitmentId: rec.commitmentId, canceledTaskId: s.task.id, canceledCounterparty: s.carrierAgentId, round: s.round, stateAtCancel: s.status }, undefined, undefined, s.brokerAgentId, "CANCELED");
+    }
+  }
+
+  /**
+   * Reply timeout. A negotiation in which the awaited party has not replied
+   * within `replyTimeoutMs` is canceled, naming the silent party as subject.
+   * A scheduler runs this on an interval; the sim can also trigger it.
+   */
+  async expireStaleTasks(now = new Date()): Promise<NegotiationTask[]> {
+    const expired: NegotiationTask[] = [];
+    for (const t of this.state.tasks.values()) {
+      if (TERMINAL_STATES.includes(t.task.status.state)) continue;
+      const waitedMs = now.getTime() - new Date(t.awaitingSince).getTime();
+      if (waitedMs < this.config.replyTimeoutMs) continue;
+      await this.fail(t, "NEGOTIATION_TIMEOUT", "venue.protocol", { agentId: t.awaiting, awaiting: t.awaiting, awaitingSince: t.awaitingSince, waitedMs, replyTimeoutMs: this.config.replyTimeoutMs, round: t.round, state: t.status, lastOffers: { onTable: t.onTable } }, undefined, undefined, t.awaiting, "CANCELED");
+      expired.push(t);
+    }
+    return expired;
   }
 
   /**
@@ -558,13 +608,13 @@ export class VenueService {
    * ceiling or a carrier's other guaranteed loads must never leak to the
    * counterparty through a refusal (see DECISIONS.md Q2).
    */
-  private async fail(t: NegotiationTask, reasonCode: ReasonCode, refusedBy: Component, evidence: Record<string, unknown>, _triggering?: Message, _other?: RegisteredAgent, subject?: string) {
-    t.status = reasonCode === "NEGOTIATION_WALKAWAY" ? "REJECTED" : "FAILED";
+  private async fail(t: NegotiationTask, reasonCode: ReasonCode, refusedBy: Component, evidence: Record<string, unknown>, _triggering?: Message, _other?: RegisteredAgent, subject?: string, disposition: "FAILED" | "CANCELED" = reasonCode === "NEGOTIATION_WALKAWAY" ? "CANCELED" : "FAILED") {
+    t.status = reasonCode === "NEGOTIATION_WALKAWAY" ? "REJECTED" : disposition === "CANCELED" ? "CANCELED" : "FAILED";
     t.outcome = { reasonCode, refusedBy, evidence, guaranteeWouldHavePaid: guaranteeWouldHavePaid(reasonCode) };
     const subjectId = subject ?? (typeof evidence.agentId === "string" ? evidence.agentId : typeof evidence.acceptedBy === "string" ? evidence.acceptedBy : typeof evidence.by === "string" ? evidence.by : undefined);
-    const full = this.venueMessage({ type: "REFUSED", loadRef: t.loadRef, reasonCode, refusedBy, evidence }, t.task.id, t.task.contextId);
-    const redacted = this.venueMessage({ type: "REFUSED", loadRef: t.loadRef, reasonCode, refusedBy, evidence: redactForCounterparty(evidence, subjectId) }, t.task.id, t.task.contextId);
-    t.task.status = { state: reasonCode === "NEGOTIATION_WALKAWAY" ? "canceled" : "failed", timestamp: new Date().toISOString(), message: full };
+    const full = this.venueMessage({ type: "REFUSED", loadRef: t.loadRef, reasonCode, refusedBy, evidence, disposition }, t.task.id, t.task.contextId);
+    const redacted = this.venueMessage({ type: "REFUSED", loadRef: t.loadRef, reasonCode, refusedBy, evidence: redactForCounterparty(evidence, subjectId), disposition }, t.task.id, t.task.contextId);
+    t.task.status = { state: disposition === "CANCELED" ? "canceled" : "failed", timestamp: new Date().toISOString(), message: full };
     this.state.persist();
     this.audit.write({ component: refusedBy, event: "negotiation-terminated", outcome: "REFUSED", reasonCode, taskId: t.task.id, contextId: t.task.contextId, subject: subjectId, evidence });
     const parties = [this.state.agents.get(t.brokerAgentId), this.state.agents.get(t.carrierAgentId)].filter((x): x is RegisteredAgent => !!x);
@@ -655,7 +705,7 @@ export class VenueService {
 }
 
 /** Non-sensitive keys a counterparty may see about a refusal that concerns the other party. */
-const COUNTERPARTY_SAFE_KEYS = new Set(["round", "maxRounds", "stage", "atRound", "error", "taskId", "state", "awaiting", "lastOffers", "by", "reason"]);
+const COUNTERPARTY_SAFE_KEYS = new Set(["round", "maxRounds", "stage", "atRound", "error", "taskId", "state", "awaiting", "awaitingSince", "waitedMs", "replyTimeoutMs", "lastOffers", "by", "reason", "canceledTaskId"]);
 
 export function redactForCounterparty(evidence: Record<string, unknown>, subjectAgentId: string | undefined): Record<string, unknown> {
   if (!subjectAgentId) return evidence;
