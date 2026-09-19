@@ -15,7 +15,7 @@ import { A2A_PROTOCOL_VERSION, FREIGHT_EXTENSION_URI, RPC_ERR, TERMINAL_STATES, 
 import { canonicalize, hashObject } from "../protocol/canonical";
 import { exportPrivateJwk, generateKeyPair, importKeyPair, importPublicKey, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import { buildMessage, venueSignMessage, type SignedMeta, type VenueAttachment } from "../protocol/envelope";
-import { loadFingerprint, termsHash, type AcceptPayload, type CounterPayload, type NegotiationPayload, type RejectPayload, type TenderPayload, type Terms } from "../protocol/freight";
+import { loadFingerprint, termsHash, textDigest, validateNegotiationPayload, type AcceptPayload, type CounterPayload, type NegotiationPayload, type RejectPayload, type TenderPayload, type Terms } from "../protocol/freight";
 import { REASONS, type ReasonCode } from "../protocol/reasons";
 import { AuditLog, type Component } from "../protocol/audit";
 import { rpcCall, RpcRefusal } from "../protocol/rpc";
@@ -234,6 +234,14 @@ export class VenueService {
     if (!sender || sender.agentId !== meta.senderAgentId) {
       throw new Refusal("CREDENTIAL_UNKNOWN", "venue.identity", { credentialId: cred.credentialId, senderAgentId: meta.senderAgentId });
     }
+    // 4. closed wire schema — after identity, so the refusal is attributable to an authenticated sender
+    const schema = validateNegotiationPayload(data);
+    if (!schema.ok) {
+      const code: ReasonCode = schema.violations.some((x) => x.rule === "TOO_LONG" || x.rule === "UNSAFE_CHARS" || x.rule === "BAD_ENUM" || x.rule === "UNKNOWN_KEY") ? "UNTRUSTED_TEXT_REJECTED" : "PROTOCOL_VIOLATION";
+      const ev = { payloadType: data.type, violations: schema.violations, ...textDigest(typeof (data as { text?: unknown }).text === "string" ? (data as { text: string }).text : undefined) };
+      this.audit.write({ component: "venue.protocol", event: "schema", outcome: "REFUSED", reasonCode: code, subject: sender.agentId, taskId: m.taskId, evidence: ev });
+      throw new Refusal(code, "venue.protocol", ev);
+    }
     this.state.nonces.set(meta.nonce, { messageId: m.messageId, ts: meta.ts, senderAgentId: sender.agentId });
     this.state.logMessage("IN", m, data.type);
     this.audit.write({ component: "venue.identity", event: "ingest", outcome: "ALLOWED", subject: sender.agentId, taskId: m.taskId, evidence: { payloadType: data.type, credentialId: cred.credentialId, kid: pv.evidence.kid } });
@@ -349,7 +357,7 @@ export class VenueService {
     const senderLive = liveCheck(this.registry, senderCred, { hazmat: t.load.hazmat });
 
     if (data.type === "REJECT") {
-      await this.fail(t, "NEGOTIATION_WALKAWAY", "venue.protocol", { by: sender.agentId, round: data.round, reason: data.reason }, m, other);
+      await this.fail(t, "NEGOTIATION_WALKAWAY", "venue.protocol", { by: sender.agentId, round: data.round, reasonCode: data.reasonCode, ...textDigest(data.text) }, m, other);
       return t.task;
     }
 
@@ -372,7 +380,7 @@ export class VenueService {
       t.awaitingSince = new Date().toISOString();
       t.status = "NEGOTIATING";
       this.state.persist();
-      this.audit.write({ component: "venue.routing", event: "counter", outcome: "ALLOWED", subject: sender.agentId, taskId: t.task.id, evidence: { round, rateUsd: data.offer.rateUsd } });
+      this.audit.write({ component: "venue.routing", event: "counter", outcome: "ALLOWED", subject: sender.agentId, taskId: t.task.id, evidence: { round, rateUsd: data.offer.rateUsd, noteCode: data.noteCode, ...textDigest(data.text) } });
       await this.forward(m, t, other, sender, senderCred, senderLive, round);
       return t.task;
     }
@@ -705,7 +713,7 @@ export class VenueService {
 }
 
 /** Non-sensitive keys a counterparty may see about a refusal that concerns the other party. */
-const COUNTERPARTY_SAFE_KEYS = new Set(["round", "maxRounds", "stage", "atRound", "error", "taskId", "state", "awaiting", "awaitingSince", "waitedMs", "replyTimeoutMs", "lastOffers", "by", "reason", "canceledTaskId"]);
+const COUNTERPARTY_SAFE_KEYS = new Set(["round", "maxRounds", "stage", "atRound", "error", "taskId", "state", "awaiting", "awaitingSince", "waitedMs", "replyTimeoutMs", "lastOffers", "by", "reasonCode", "canceledTaskId"]);
 
 export function redactForCounterparty(evidence: Record<string, unknown>, subjectAgentId: string | undefined): Record<string, unknown> {
   if (!subjectAgentId) return evidence;

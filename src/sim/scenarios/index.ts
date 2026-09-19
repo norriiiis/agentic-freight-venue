@@ -10,6 +10,7 @@ import { revokedPrePickup } from "./revoked-pre-pickup";
 import { replayAndTamper } from "./replay-and-tamper";
 import { multiTender } from "./multi-tender";
 import { negotiationTimeout } from "./negotiation-timeout";
+import { promptInjection } from "./prompt-injection";
 
-export const SCENARIOS: Scenario[] = [happyPath, insuranceLapsed, spoofedCarrier, doubleBrokering, brokerOverCeiling, exposureMidNegotiation, nonConvergence, revokedPrePickup, replayAndTamper, multiTender, negotiationTimeout];
+export const SCENARIOS: Scenario[] = [happyPath, insuranceLapsed, spoofedCarrier, doubleBrokering, brokerOverCeiling, exposureMidNegotiation, nonConvergence, revokedPrePickup, replayAndTamper, multiTender, negotiationTimeout, promptInjection];
 export const ADVERSARIAL = SCENARIOS.filter((s) => s.id !== "happy-path");

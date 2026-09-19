@@ -1,5 +1,5 @@
 import type { OkpJwk } from "../protocol/crypto";
-import type { LoadSpec, Terms } from "../protocol/freight";
+import type { CounterNoteCode, LoadSpec, RejectReasonCode, Terms } from "../protocol/freight";
 import type { VenueAttachment } from "../protocol/envelope";
 import type { Mandate } from "../mandate/types";
 
@@ -39,10 +39,12 @@ export interface AgentConfig {
     skipOnboarding?: boolean;
     /** Acknowledge inbound messages but never act on them (a hung or crashed agent). */
     dropInbound?: boolean;
+    /** Attach this text to every outbound COUNTER/REJECT (a malicious agent probing the counterparty's LLM). */
+    injectText?: string;
   };
 }
 
-export type Decision = { kind: "COUNTER"; offer: Offer; note?: string } | { kind: "ACCEPT" } | { kind: "REJECT"; reason: string };
+export type Decision = { kind: "COUNTER"; offer: Offer; noteCode?: CounterNoteCode } | { kind: "ACCEPT" } | { kind: "REJECT"; reasonCode: RejectReasonCode };
 
 export interface NegotiationView {
   taskId: string;
@@ -51,10 +53,14 @@ export interface NegotiationView {
   round: number;
   /** The counterparty's current offer. */
   offer: Offer;
+  /** Why the counterparty says its offer differs — a code, never prose. */
+  noteCode?: CounterNoteCode;
   /** What I last offered, if anything. */
   myLastOffer?: Offer;
   counterparty: VenueAttachment["counterparty"];
   guaranteeAvailable?: boolean;
+  // Deliberately absent: any free-text field from the counterparty. Strategies (LLM-backed or not)
+  // reason over codes and numbers only. See agentkit/prompting.ts.
 }
 
 /**
@@ -66,7 +72,7 @@ export interface Strategy<Ctx> {
   openingOffer(load: LoadSpec, ctx: Ctx, mandate: Mandate): Offer;
   onTender(view: NegotiationView, ctx: Ctx, mandate: Mandate): Decision;
   onCounter(view: NegotiationView, ctx: Ctx, mandate: Mandate): Decision;
-  onAcceptRequest(terms: Terms, view: NegotiationView, ctx: Ctx, mandate: Mandate): { kind: "ACCEPT" } | { kind: "REJECT"; reason: string };
+  onAcceptRequest(terms: Terms, view: NegotiationView, ctx: Ctx, mandate: Mandate): { kind: "ACCEPT" } | { kind: "REJECT"; reasonCode: RejectReasonCode };
 }
 
 export interface LocalTask {

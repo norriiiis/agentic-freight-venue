@@ -55,7 +55,7 @@ export const carrierStrategy: Strategy<CarrierPrivateContext> = {
     const pickup = pickupFor(view.load, ctx, view.offer.pickup);
     const windowsOk = pickup.windowStart === view.offer.pickup.windowStart;
     if (windowsOk && view.offer.rateUsd >= e.target) return { kind: "ACCEPT" };
-    return { kind: "COUNTER", offer: { rateUsd: Math.max(e.openingAsk, view.offer.rateUsd), pickup, delivery: view.offer.delivery, paymentTermsDays: ctx.paymentTermsDays }, note: windowsOk ? undefined : "earliest available pickup" };
+    return { kind: "COUNTER", offer: { rateUsd: Math.max(e.openingAsk, view.offer.rateUsd), pickup, delivery: view.offer.delivery, paymentTermsDays: ctx.paymentTermsDays }, noteCode: windowsOk ? "RATE" : "PICKUP_WINDOW" };
   },
 
   onCounter(view: NegotiationView, ctx, mandate): Decision {
@@ -67,14 +67,14 @@ export const carrierStrategy: Strategy<CarrierPrivateContext> = {
     if (windowsOk && offer >= e.floor && (offer >= e.target || (mine - offer) / offer <= ctx.acceptGapPct)) return { kind: "ACCEPT" };
     const next = Math.max(e.floor, round5(mine - ctx.concessionPct * (mine - Math.max(offer, e.floor))));
     if (windowsOk && next <= offer) return { kind: "ACCEPT" };
-    return { kind: "COUNTER", offer: { rateUsd: Math.min(next, mine), pickup, delivery: view.offer.delivery, paymentTermsDays: ctx.paymentTermsDays } };
+    return { kind: "COUNTER", offer: { rateUsd: Math.min(next, mine), pickup, delivery: view.offer.delivery, paymentTermsDays: ctx.paymentTermsDays }, noteCode: windowsOk ? "RATE" : "PICKUP_WINDOW" };
   },
 
   onAcceptRequest(terms: Terms, view: NegotiationView, ctx, mandate) {
     const e = economics(view.load, ctx, mandate);
     const mine = view.myLastOffer;
-    if (!mine || terms.rateUsd !== mine.rateUsd) return { kind: "REJECT", reason: "accepted terms do not match our last offer" };
-    if (terms.rateUsd < e.floor) return { kind: "REJECT", reason: "below minimum" };
+    if (!mine || terms.rateUsd !== mine.rateUsd) return { kind: "REJECT", reasonCode: "TERMS_MISMATCH" };
+    if (terms.rateUsd < e.floor) return { kind: "REJECT", reasonCode: "BELOW_MINIMUM" };
     return { kind: "ACCEPT" };
   },
 };

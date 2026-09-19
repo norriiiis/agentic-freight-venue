@@ -97,9 +97,9 @@ describe("runtime: separate processes, no shared state", () => {
   it("the wire carries only the negotiation vocabulary — no private-context fields", async () => {
     const allowed: Record<string, string[]> = {
       TENDER: ["type", "load", "offer", "from", "to"],
-      COUNTER: ["type", "loadRef", "round", "offer", "from", "note"],
+      COUNTER: ["type", "loadRef", "round", "offer", "from", "noteCode", "text"],
       ACCEPT: ["type", "loadRef", "round", "terms", "termsHash", "from"],
-      REJECT: ["type", "loadRef", "round", "reason", "from"],
+      REJECT: ["type", "loadRef", "round", "reasonCode", "from", "text"],
     };
     const privateFields = ["customerRateUsd", "targetMarginPct", "minMarginPct", "costPerMileUsd", "deadheadMiles", "fixedCostPerLoadUsd", "concessionPct", "canary"];
     const log = await h.venue.messages();

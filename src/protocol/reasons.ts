@@ -33,6 +33,7 @@ export const REASONS = {
 
   // venue protocol / routing
   PROTOCOL_VIOLATION: "Message violates the negotiation protocol state machine",
+  UNTRUSTED_TEXT_REJECTED: "Payload violates the closed wire schema: unknown key, unknown code, or a string that is too long, multi-line, or carries control/bidi/zero-width characters",
   NONCE_REUSED: "Message nonce already seen",
   MESSAGE_STALE: "Message timestamp outside the acceptance window",
   ENVELOPE_NOT_FROM_VENUE: "Inbound envelope is not signed by the venue",

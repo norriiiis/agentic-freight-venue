@@ -41,6 +41,8 @@ export function guaranteeWouldHavePaid(code: ReasonCode): string {
     case "CREDENTIAL_REVOKED_PRE_PICKUP":
     case "CREDENTIAL_REVOKED":
       return "Guarantee WAS attached and is now RELEASED with the commitment voided. If the broker ships anyway after the VOIDED notice, PRINCIPAL_OVERRODE_REFUSAL applies: excluded.";
+    case "UNTRUSTED_TEXT_REJECTED":
+      return "N/A — the message never entered the negotiation. Had it been forwarded, the counterparty's strategy would still not have seen the text (quarantined by the runtime).";
     case "NONCE_REUSED":
     case "REPLAY_DETECTED":
     case "RECORD_TAMPERED":

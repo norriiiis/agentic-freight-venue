@@ -15,7 +15,7 @@ import { A2A_PROTOCOL_VERSION, FREIGHT_EXTENSION_URI, RPC_ERR, dataPart, signAge
 import { hashObject } from "../protocol/canonical";
 import { exportPrivateJwk, generateKeyPair, importKeyPair, signJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import { buildMessage, signMessage, verifyMessageSignature, verifyVenueSignature, type SignedMeta, type VenueAttachment } from "../protocol/envelope";
-import { termsHash, type AcceptPayload, type CounterPayload, type LoadSpec, type NegotiationPayload, type TenderPayload, type Terms } from "../protocol/freight";
+import { termsHash, textDigest, validateNegotiationPayload, type AcceptPayload, type CounterPayload, type LoadSpec, type NegotiationPayload, type RejectPayload, type TenderPayload, type Terms } from "../protocol/freight";
 import { AuditLog, type Component } from "../protocol/audit";
 import { httpGet, rpcCall, RpcRefusal, startServer, type HttpRoute } from "../protocol/rpc";
 import type { Credential, MandateEnvelope } from "../protocol/types";
@@ -230,6 +230,15 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         throw new RpcRefusal(RPC_ERR.VENUE_REFUSED, "IDENTITY_SIGNATURE_INVALID");
       }
     }
+    // Closed wire schema, enforced here too: even a compromised venue cannot push unbounded or multi-line text into this process.
+    const inboundType = (dataPart(m) as { type?: string } | undefined)?.type;
+    if (inboundType === "TENDER" || inboundType === "COUNTER" || inboundType === "ACCEPT" || inboundType === "REJECT") {
+      const schema = validateNegotiationPayload(dataPart(m));
+      if (!schema.ok) {
+        this.audit.write({ component: this.comp.runtime, event: "inbound", outcome: "REFUSED", reasonCode: "UNTRUSTED_TEXT_REJECTED", taskId: m.taskId, evidence: { violations: schema.violations } });
+        throw new RpcRefusal(RPC_ERR.VENUE_REFUSED, "UNTRUSTED_TEXT_REJECTED", { reasonCode: "UNTRUSTED_TEXT_REJECTED", violations: schema.violations });
+      }
+    }
     const ack: Task = { kind: "task", id: m.taskId ?? "n/a", contextId: m.contextId ?? "n/a", status: { state: "working", timestamp: new Date().toISOString() } };
     setImmediate(() => this.process(m).catch((e) => this.audit.write({ component: this.comp.runtime, event: "process", outcome: "INFO", taskId: m.taskId, evidence: { error: String(e) } })));
     return ack;
@@ -262,8 +271,9 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         const load = this.loadFor(lt);
         const round = att!.round;
         lt.round = round;
-        const view: NegotiationView = { taskId, contextId, load, round, offer: data.offer, myLastOffer: lt.myLastOffer, counterparty: att!.counterparty };
-        this.audit.write({ component: this.comp.strategy, event: "counter-received", outcome: "INFO", taskId, evidence: { round, theirRateUsd: data.offer.rateUsd, myLastRateUsd: lt.myLastOffer?.rateUsd } });
+        // Quarantine: the strategy sees the code, never the text. Only a digest reaches the audit log.
+        const view: NegotiationView = { taskId, contextId, load, round, offer: data.offer, noteCode: data.noteCode, myLastOffer: lt.myLastOffer, counterparty: att!.counterparty };
+        this.audit.write({ component: this.comp.strategy, event: "counter-received", outcome: "INFO", taskId, evidence: { round, theirRateUsd: data.offer.rateUsd, myLastRateUsd: lt.myLastOffer?.rateUsd, noteCode: data.noteCode, textQuarantined: data.text !== undefined, ...textDigest(data.text) } });
         const d = this.strategy.onCounter(view, this.ctx, this.mandate);
         await this.act(d, view, lt);
         break;
@@ -274,7 +284,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         const view: NegotiationView = { taskId, contextId, load, round: att!.round, offer: { rateUsd: data.terms.rateUsd, pickup: data.terms.pickup, delivery: data.terms.delivery, paymentTermsDays: data.terms.paymentTermsDays }, myLastOffer: lt.myLastOffer, counterparty: att!.counterparty, guaranteeAvailable: att!.guaranteeAvailable };
         const d = this.strategy.onAcceptRequest(data.terms, view, this.ctx, this.mandate);
         if (d.kind === "REJECT") {
-          await this.send({ type: "REJECT", loadRef: lt.loadRef, round: att!.round, reason: d.reason, from: this.identity().from }, taskId, contextId);
+          await this.send(this.rejectPayload(lt, att!.round, d.reasonCode), taskId, contextId);
           lt.status = "REJECTED";
         } else {
           await this.accept(data.terms, view, lt);
@@ -326,21 +336,21 @@ export class AgentRuntime<Ctx extends { canary: string }> {
   private async act(d: Decision, view: NegotiationView, lt: LocalTask) {
     const id = this.identity();
     if (d.kind === "REJECT") {
-      this.audit.write({ component: this.comp.strategy, event: "decision", outcome: "INFO", taskId: view.taskId, evidence: { decision: "REJECT", reason: d.reason, round: view.round } });
-      await this.send({ type: "REJECT", loadRef: lt.loadRef, round: view.round, reason: d.reason, from: id.from }, view.taskId, view.contextId);
+      this.audit.write({ component: this.comp.strategy, event: "decision", outcome: "INFO", taskId: view.taskId, evidence: { decision: "REJECT", reasonCode: d.reasonCode, round: view.round } });
+      await this.send(this.rejectPayload(lt, view.round, d.reasonCode), view.taskId, view.contextId);
       lt.status = "REJECTED";
       return;
     }
     if (d.kind === "COUNTER") {
       const offer = this.forceRate(d.offer);
       const round = view.round + 1;
-      this.audit.write({ component: this.comp.strategy, event: "decision", outcome: "INFO", taskId: view.taskId, evidence: { decision: "COUNTER", round, rateUsd: offer.rateUsd, note: d.note } });
+      this.audit.write({ component: this.comp.strategy, event: "decision", outcome: "INFO", taskId: view.taskId, evidence: { decision: "COUNTER", round, rateUsd: offer.rateUsd, noteCode: d.noteCode } });
       if (!this.guard(this.offerAction(view.load, offer, round), view.taskId, "counter")) {
-        await this.send({ type: "REJECT", loadRef: lt.loadRef, round: view.round, reason: "outside mandate", from: id.from }, view.taskId, view.contextId);
+        await this.send(this.rejectPayload(lt, view.round, "OUTSIDE_MANDATE"), view.taskId, view.contextId);
         lt.status = "REJECTED";
         return;
       }
-      const payload: CounterPayload = { type: "COUNTER", loadRef: lt.loadRef, round, offer, from: id.from, note: d.note };
+      const payload: CounterPayload = { type: "COUNTER", loadRef: lt.loadRef, round, offer, from: id.from, noteCode: d.noteCode, ...(this.config.rogue?.injectText !== undefined ? { text: this.config.rogue.injectText } : {}) };
       lt.myLastOffer = offer;
       lt.round = round;
       await this.send(payload, view.taskId, view.contextId);
@@ -349,6 +359,10 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     // ACCEPT the counterparty's offer as it stands
     const terms = this.termsFrom(view, lt);
     await this.accept(terms, view, lt);
+  }
+
+  private rejectPayload(lt: LocalTask, round: number, reasonCode: RejectPayload["reasonCode"]): RejectPayload {
+    return { type: "REJECT", loadRef: lt.loadRef, round, reasonCode, from: this.identity().from, ...(this.config.rogue?.injectText !== undefined ? { text: this.config.rogue.injectText } : {}) };
   }
 
   private termsFrom(view: NegotiationView, lt: LocalTask): Terms {
@@ -384,7 +398,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     };
     this.audit.write({ component: this.comp.strategy, event: "decision", outcome: "INFO", taskId: view.taskId, evidence: { decision: "ACCEPT", round: view.round, rateUsd: t.rateUsd } });
     if (!this.guard(action, view.taskId, "accept")) {
-      await this.send({ type: "REJECT", loadRef: lt.loadRef, round: view.round, reason: "outside mandate", from: this.identity().from }, view.taskId, view.contextId);
+      await this.send(this.rejectPayload(lt, view.round, "OUTSIDE_MANDATE"), view.taskId, view.contextId);
       lt.status = "REJECTED";
       return;
     }

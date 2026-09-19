@@ -24,7 +24,7 @@ export function renderWire(log: { ts: string; direction: "IN" | "OUT"; note?: st
     if (e.direction === "IN") {
       n++;
       const who = roles[meta.senderAgentId] ?? meta.senderAgentId;
-      const detail = [offer ? usd(offer.rateUsd) : "", offer?.pickup ? `pickup ${hhmm(offer.pickup.windowStart)}–${offer.pickup.windowEnd.slice(11, 16)}` : "", d.note ? `"${d.note}"` : "", d.reason ? `"${d.reason}"` : "", d.termsHash ? `termsHash ${String(d.termsHash).slice(0, 12)}…` : ""].filter(Boolean).join("  ");
+      const detail = [offer ? usd(offer.rateUsd) : "", offer?.pickup ? `pickup ${hhmm(offer.pickup.windowStart)}–${offer.pickup.windowEnd.slice(11, 16)}` : "", d.noteCode ? `[${d.noteCode}]` : "", type === "REJECT" && d.reasonCode ? `[${d.reasonCode}]` : "", typeof d.text === "string" ? `text(untrusted,${d.text.length}ch)` : "", d.termsHash ? `termsHash ${String(d.termsHash).slice(0, 12)}…` : ""].filter(Boolean).join("  ");
       out.push(`  ${String(n).padStart(2)}  ${who.padEnd(8)} → venue    ${type.padEnd(8)} ${detail}`);
     } else {
       const to = e.note?.replace("to ", "") ?? "";

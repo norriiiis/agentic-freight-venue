@@ -48,7 +48,7 @@ export const brokerStrategy: Strategy<BrokerPrivateContext> = {
   },
 
   onTender(): Decision {
-    return { kind: "REJECT", reason: "broker agent does not accept inbound tenders" };
+    return { kind: "REJECT", reasonCode: "NO_INBOUND_TENDERS" };
   },
 
   onCounter(view: NegotiationView, ctx, mandate): Decision {
@@ -66,10 +66,12 @@ export const brokerStrategy: Strategy<BrokerPrivateContext> = {
     }
     const next = Math.min(cap, round5(mine + ctx.concessionPct * (Math.min(ask, cap) - mine)));
     if (windowsOk && next >= ask) return { kind: "ACCEPT" };
+    // The window we want is in the offer itself; a code says which term is the sticking point.
+    // (A free-text note here once leaked pickupFlexHours — private context — onto the wire.)
     return {
       kind: "COUNTER",
       offer: { rateUsd: Math.max(next, mine), pickup, delivery: view.offer.delivery, paymentTermsDays: ctx.paymentTermsDays },
-      note: windowsOk ? undefined : `pickup must be within ${ctx.pickupFlexHours}h of ${view.load.origin.windowStart}`,
+      noteCode: windowsOk ? "RATE" : "PICKUP_WINDOW",
     };
   },
 
@@ -77,9 +79,9 @@ export const brokerStrategy: Strategy<BrokerPrivateContext> = {
     // The carrier accepted an offer; countersign only if it is exactly what we last put on the table.
     const mine = view.myLastOffer;
     if (!mine || terms.rateUsd !== mine.rateUsd || terms.paymentTermsDays !== mine.paymentTermsDays) {
-      return { kind: "REJECT", reason: "accepted terms do not match our last offer" };
+      return { kind: "REJECT", reasonCode: "TERMS_MISMATCH" };
     }
-    if (terms.rateUsd > maxPay(ctx, mandate, view.load.miles)) return { kind: "REJECT", reason: "above maximum" };
+    if (terms.rateUsd > maxPay(ctx, mandate, view.load.miles)) return { kind: "REJECT", reasonCode: "ABOVE_MAXIMUM" };
     return { kind: "ACCEPT" };
   },
 };
