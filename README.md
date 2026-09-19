@@ -1,0 +1,168 @@
+# Agentic freight transaction venue — working skeleton
+
+A runnable prototype of a third-party venue through which a broker's AI agent and a carrier's AI agent negotiate and commit to a load with no human approving each step. The venue verifies who each agent is (rooted in the public carrier registry), enforces the limits each principal set, records what was agreed in a tamper-evident ledger, and decides whether to stand behind the transaction with a guarantee.
+
+The two agents are separate OS processes with separate data directories and separate configuration. They never learn each other's address. They talk only through the venue, over A2A-shaped JSON-RPC, and every message is signed with a real Ed25519 key.
+
+**A convincing refusal is the product.** Eight adversarial scenarios each fail with a machine-readable reason, the component that refused, the evidence it relied on, and whether the guarantee would have paid.
+
+## Run it
+
+```bash
+npm install
+npm run demo            # happy path: full transcript, independent artifact verification, EDI mapping
+npm run sim -- --all    # every adversarial scenario; exit code 1 if any misbehaves
+npm test                # 56 tests incl. the no-shared-state proof and all scenarios (~20s)
+```
+
+Other entry points:
+
+```bash
+npm run sim -- --scenario double-brokering    # one scenario (see --list)
+npm run sim -- --all --verbose                # with each process's stdout
+npm run verify -- <artifact.json> --venue-key <venue-public.jwk.json> --ledger <ledger.jsonl>
+npm run check:boundaries                      # static import-boundary check
+FV_SKIP_SCENARIOS=1 npm test                  # unit tests only (<1s)
+```
+
+Every run writes its workspace under `.sim/<timestamp>/<scenario>/` with one directory per process: `venue/`, `northline-broker-agent/`, `prairie-wind-carrier-agent/`. Each contains that process's audit log, keys, state, and (for agents) its own copy of any commitment artifact.
+
+Requires Node ≥ 20 (developed on 26). No cloud dependencies, no database, no network beyond `127.0.0.1`.
+
+## What happens in the happy path
+
+```
+ 1  BROKER   → venue    TENDER   $2,050  pickup 09-23 13:00Z–19:00
+    venue    → CARRIER  fwd TENDER  verified cred_4379d3a5… NORTHLINE LOGISTICS LLC MC-1088412 · bond $75,000
+ 2  CARRIER  → venue    COUNTER  $2,380  pickup 09-23 15:00Z–19:00  "earliest available pickup"
+    venue    → BROKER   fwd COUNTER verified cred_78dea827… PRAIRIE WIND TRANSPORT INC MC-0938251 · BIPD $1,000,000
+ 3  BROKER   → venue    COUNTER  $2,165
+ 4  CARRIER  → venue    COUNTER  $2,305
+ 5  BROKER   → venue    COUNTER  $2,215
+ 6  CARRIER  → venue    ACCEPT   $2,215  termsHash 696349cbf0b5…
+    venue    → BROKER   fwd ACCEPT  … · guarantee quoted
+ 7  BROKER   → venue    ACCEPT   $2,215  termsHash 696349cbf0b5…
+    venue    → BROKER   COMMITTED cmt_10c1712b…  guarantee gtee_a00a3ab7… covers $2,215 premium $35.21
+    venue    → CARRIER  COMMITTED cmt_10c1712b…  guarantee gtee_a00a3ab7… covers $2,215 premium $35.21
+```
+
+The broker's private context (customer rate $2,650, target margin 14%, floor margin 7%) and the carrier's ($1.85/mi, 110 deadhead miles, $160 fixed, 22% target margin) never appear on the wire; the test suite asserts that. They converge at $2,215 — $2.84/mi — in five rounds, the carrier having moved the pickup window two hours later to match truck availability.
+
+## Scenarios
+
+| id | what happens | refused by | reason code | guarantee would have paid? |
+|---|---|---|---|---|
+| `happy-path` | converge, both sign, venue records, guarantee attaches | — | — | attached: $2,215 covered, $35.21 premium |
+| `insurance-lapsed` | credential valid; insurer files BMC-91X cancellation after onboarding, before tender | `venue.identity` | `INSURANCE_LAPSED` | No — refused before commitment; an uninsured accident is excluded anyway |
+| `spoofed-carrier` | attacker presents the real carrier's USDOT/MC *and* genuine credential id, signs with own key | `venue.identity` | `IDENTITY_KEY_MISMATCH` | Yes — impersonation is the covered peril; caught, so no loss |
+| `double-brokering` | committed carrier re-tenders the same physical load (new reference) to an unverified party | `venue.routing` | `DOUBLE_BROKERING_ATTEMPT` (+ `NO_BROKERAGE_AUTHORITY`, `COUNTERPARTY_UNVERIFIED`) | Yes for the original broker, had the venue missed it; off-venue re-tender excluded |
+| `broker-over-ceiling` | agent wants $2,400 against a $2,000 ceiling; phase 1 local mandate refuses, phase 2 local check bypassed | `agent.broker.mandate`, then `venue.mandate` | `MANDATE_RATE_ABOVE_CEILING` | N/A — no transaction; a fully bypassed control is excluded |
+| `exposure-mid-negotiation` | other brokers' guaranteed loads push the carrier to $38.5k of a $40k limit during round 3 | `underwriting` | `VENUE_EXPOSURE_LIMIT_EXCEEDED` | No — venue declined; refused only because the broker's mandate requires a guarantee |
+| `non-convergence` | broker can pay ~$1,953, carrier floor ~$2,339; venue's 8-round bound terminates | `venue.protocol` | `NEGOTIATION_MAX_ROUNDS` | N/A |
+| `revoked-pre-pickup` | commitment recorded; FMCSA revokes authority; pre-pickup re-check voids it, releases guarantee, notifies both | `venue.commitment` | `CREDENTIAL_REVOKED_PRE_PICKUP` | Was attached, now released; shipping anyway is excluded |
+| `replay-and-tamper` | captured ACCEPT replayed; replayed with fresh nonce; artifact rate edited; ledger entry edited | `venue.protocol`, `venue.identity`, `ledger/verify` | `NONCE_REUSED`, `IDENTITY_SIGNATURE_INVALID`, `RECORD_TAMPERED`, `CHAIN_BROKEN` | N/A — original commitment unaffected |
+
+Each scenario prints the wire log, the refusal with evidence, the audit entries by file and sequence number, and PASS/FAIL against its expectation.
+
+## Architecture
+
+```
+                         ┌──────────────────────────────────────────────┐
+                         │                   venue/                     │
+   broker process        │  ingest ─► identity ─► protocol ─► mandate    │       carrier process
+  ┌──────────────┐       │     │        │   ▲        │           │       │      ┌──────────────┐
+  │ agentkit     │──────►│     │   identity/  │   state machine   │       │◄─────│ agentkit     │
+  │  runtime     │  A2A  │     │   (registry, │   (rounds, terms  │  A2A  │      │  runtime     │
+  │ mandate/     │◄──────│     │   issuer,    │    hash, accept)  │       │─────►│ mandate/     │
+  │  engine      │       │     │   verifier)  │        │          │       │      │  engine      │
+  │ strategy.ts  │       │     ▼              │        ▼          │       │      │ strategy.ts  │
+  │ private.json │       │  underwriting/ ◄───┘   ledger/         │       │      │ private.json │
+  │ own key      │       │  (risk, price,        (hash chain,     │       │      │ own key      │
+  │ own audit    │       │   exposure)            signed artifact)│       │      │ own audit    │
+  └──────────────┘       └──────────────────────────────────────────────┘      └──────────────┘
+        │                                                                              │
+        └──── knows: venue URL, own principal's public key ── nothing about the other ─┘
+```
+
+| directory | role |
+|---|---|
+| `src/protocol/` | Wire layer, shared and stateless: canonical JSON, Ed25519/JWS, A2A shapes (Agent Card, Message, Task, JSON-RPC), the freight negotiation vocabulary, message envelopes, reason codes, audit entries. |
+| `src/identity/` | Mock FMCSA registry (L&I schema: BMC-91X/34/84 filings, authority records, cancellation dates), credential issuer with expiry and revocation, three-layer verifier (credential → presentation → live registry), vetting-provider stub. |
+| `src/mandate/` | Principal-signed mandates and envelopes, the policy engine (rate floor/ceiling per load and per mile, lanes, equipment, insurance minimums, per-counterparty and daily exposure, guarantee requirement, tender authority, round bound), exposure book. |
+| `src/agentkit/` | The agent runtime — equivalent of an A2A SDK. Accepts inbound only from the venue, guards every outbound offer/accept with the mandate engine, keeps its own audit/exposure/task state. |
+| `src/agents/broker/`, `src/agents/carrier/` | The two agents: process entry + private strategy. Import nothing from each other or from the venue side (enforced by `test/boundaries.ts`). |
+| `src/venue/` | The service in the middle: onboarding, per-exchange verification, routing with attested enrichment, negotiation state machine, envelope enforcement, commitment assembly, pre-pickup re-verification, per-recipient redaction. |
+| `src/underwriting/` | Parameterized loss model (named factors), guarantee scope/exclusions/conditions, quote → attach → release lifecycle, per-counterparty / per-pair / portfolio exposure. |
+| `src/ledger/` | Hash-chained, venue-signed append-only log; self-contained commitment artifact; independent verifier (library + CLI). |
+| `src/edi/` | Commitment → rate confirmation and X12 850/855/856 segment outline. |
+| `src/sim/` | Process harness, fixtures, nine scenarios, transcript renderer, CLI. |
+| `test/` | Identity and mandate refusal tests, ledger/protocol tests, the no-shared-state proof, scenario acceptance. |
+
+### Wire protocol
+
+A2A shapes are emulated, not reinvented: signed Agent Cards at `/.well-known/agent-card.json` (JWS with embedded JWK), `message/send` and `tasks/get` over JSON-RPC 2.0, Messages with DataParts, Tasks with the A2A state vocabulary (`submitted / working / completed / failed / rejected / canceled`). Freight content rides in a DataPart under a declared extension URI; signatures ride in `metadata`.
+
+Two signatures can sit on a message:
+
+- `metadata.sig` — the originating agent's detached JWS over the message *excluding* anything the venue adds.
+- `metadata.venueSig` — the venue's detached JWS over the message *including* the agent's signature and the venue's attachment (`metadata.venue`: task/context ids, round, and the sender's verified identity, credential id, public key and current insurance).
+
+The venue never mutates a signed message; it only adds. Agents accept inbound only with a valid `venueSig` against the venue key they pinned at startup, and additionally verify the counterparty's `sig` against the key the venue attested. A message sent from one agent directly to the other is refused as `ENVELOPE_NOT_FROM_VENUE`; the isolation test does exactly that.
+
+### What the venue sees
+
+Terms, on every message: rate, lane, windows, equipment, payment terms. Not private context. The wire vocabulary is closed (`protocol/freight.ts`) and tested. See `DECISIONS.md` Q5 for why terms rather than attest-only, and Q2 for what the venue tells each party about a refusal.
+
+### Commitment artifact
+
+A commitment is formed when the venue holds ACCEPT messages from both parties over the same `termsHash`. The artifact bundles both signed ACCEPTs, both credentials (each binding a key to a registry entity, signed by the venue's issuer key), the underwriting decision, a ledger position, and the venue's attestation over the whole. `npm run verify` checks 21 properties from the file alone — pin the venue key and pass the ledger file to also check chain integrity and inclusion. Either party keeps its own copy (`<agent-dir>/commitments/`).
+
+## What is real, what is stubbed
+
+**Real (works as it would in production, modulo scale):**
+
+- Ed25519 signing, JWS (RFC 7515 compact, EdDSA), JWK thumbprints, canonical JSON. Nothing is faked; signatures verify with any standard library.
+- Process isolation: three OS processes, three data directories, agents configured with only their own directory and the venue URL. Verified statically (import graph) and at runtime (canaries, wire vocabulary, direct-contact refusal, private keys never cross).
+- Credential lifecycle: issuance against registry evidence, expiry, revocation list, three-layer verification on every exchange, live re-check at tender / commit / pre-pickup.
+- Mandate engine and its two-layer enforcement (local + venue envelope), both principal-signed.
+- Negotiation state machine, round bound, terms-hash consistency, nonce/timestamp replay protection, per-recipient redaction.
+- Hash-chained ledger and self-contained artifact verification without the venue.
+- Underwriting *interfaces*: quote → attach → release, exposure per counterparty / pair / portfolio, guarantee scope embedded in the artifact.
+- Agent negotiation logic with genuine private economics that converge or stalemate for real reasons.
+
+**Stubbed (interface is real, implementation is a placeholder — each is marked `STUB` in source):**
+
+- **FMCSA registry** — a JSON file with a faithful L&I schema. Production reads FMCSA's L&I / QCMobile feeds or a vetting provider's normalized feed. `identity/registry.ts`
+- **Proof of control at onboarding** — a token in the fixture standing in for a challenge to the FMCSA-registered email/phone, or a vetting provider's verified-identity assertion. `identity/issuer.ts`
+- **Vetting provider** — returns flags from the fixture. Highway / MyCarrierPortal / Carrier Assure / Carrier411 plug in here. `identity/vetting.ts`
+- **Loss model coefficients** — illustrative, not fitted. The factor structure is the deliverable. `underwriting/model.ts`
+- **Guarantee backstop** — there is no insurer or capital behind the guarantee record. `underwriting/engine.ts`
+- **Revocation feed** — revocations are injected by the simulator; production subscribes to FMCSA authority/insurance changes. `venue/server.ts` admin routes
+- **Scheduler** — pre-pickup re-verification is triggered by the simulator rather than a job. `venue/service.ts → prePickupChecks()`
+- **EDI** — segment-level outline of 850/855/856 and a rate-confirmation object, not an X12 serializer. Motor-carrier sets (204/990/214) map the same way. `edi/mapping.ts`
+- **Payments** — none. AP2 would attach at the COMMITTED event.
+- **Agent reasoning** — deterministic strategies, not LLMs. The `Strategy` interface is where an LLM-backed agent would sit; the mandate guard wraps it either way.
+
+**Simulation-only surfaces** — never present in a deployed system: `/admin/*` on the venue and `/control/*` on agents (gated by `SIM_MODE=1`), and the `rogue` fault-injection block in agent config.
+
+## What breaks first at scale
+
+In the order it would hurt:
+
+1. **The venue's in-process negotiation loop and JSON-file state.** Every task, nonce and commitment is a map persisted by rewriting a JSON file. Under concurrent load this is both a throughput ceiling and a correctness risk (no transactions; two tasks committing against the same exposure book race). First move: a real database with row-level locking on the exposure book and task rows; nonces to a TTL store.
+2. **Synchronous delivery.** The venue delivers by HTTP POST to the agent's endpoint and awaits the ack. An unreachable agent stalls the handler. Needs a durable outbox with retries and A2A push notifications (`capabilities.pushNotifications`).
+3. **Nonce set growth and clock skew.** The seen-nonce map grows forever and the ±5-minute timestamp window assumes synced clocks. Needs a TTL and a skew policy.
+4. **Key custody.** Agent and venue private keys are JWK files on disk. The venue key in particular must move to an HSM/KMS, and agent keys to the principal's own key management with rotation and a rebinding flow (`ONBOARDING_KEY_ALREADY_BOUND` currently blocks rotation until the old credential is revoked).
+5. **Revocation propagation.** A revocation list checked on every exchange is fine at one venue; across venues or for offline verification of old artifacts it needs signed, timestamped revocation status (OCSP-style) so a verifier months later can establish validity *at signing time*, which the artifact verifier currently approximates from the credential's expiry only.
+6. **The ledger file.** A JSONL hash chain is verifiable but not queryable, not replicated, and not publicly auditable. Production needs replication, a public transparency log (or periodic root publication) so inclusion proofs work without trusting the venue's copy, and a query layer.
+7. **Underwriting.** Single-threaded exposure accounting is a feature until it isn't; the model needs fitting on real losses; the guarantee needs a capital reserve and a dispute/claims process that does not exist here.
+8. **Registry freshness.** Live checks read a local snapshot. Real L&I data lags insurer filings by days; the venue must decide what "as of now" means and price the gap.
+9. **Onboarding fraud.** Proof of control is the gate that keeps a fraudster from binding a key to a real carrier's MC. The stub token is the weakest link in the prototype and the hardest problem in the real system.
+
+## Reason codes
+
+All refusals use codes from `src/protocol/reasons.ts`, grouped: identity (`IDENTITY_*`, `CREDENTIAL_*`, `AUTHORITY_*`, `INSURANCE_*`, `ONBOARDING_*`), mandate (`MANDATE_*`), protocol and routing (`PROTOCOL_VIOLATION`, `NONCE_REUSED`, `MESSAGE_STALE`, `ENVELOPE_NOT_FROM_VENUE`, `TERMS_HASH_MISMATCH`, `NEGOTIATION_*`, `DOUBLE_BROKERING_ATTEMPT`, `NO_BROKERAGE_AUTHORITY`, `COUNTERPARTY_UNVERIFIED`, `REPLAY_DETECTED`, `RECORD_TAMPERED`, `CHAIN_BROKEN`), underwriting (`UNDERWRITING_DECLINED_RISK`, `VENUE_EXPOSURE_LIMIT_EXCEEDED`, `VENUE_PORTFOLIO_LIMIT_EXCEEDED`), post-commitment (`CREDENTIAL_REVOKED_PRE_PICKUP`). Every audit entry names its component, its reason code, and its evidence.
+
+## Decisions
+
+The five open questions — who pays, neutrality, guarantee trigger, federated vs. centralized, and whether the venue sees negotiation content — are argued both ways in [`DECISIONS.md`](DECISIONS.md), each with a choice, the strongest case against it, and the evidence that would change it.

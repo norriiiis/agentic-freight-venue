@@ -1,0 +1,100 @@
+[
+  {
+    "usdot": "3312874",
+    "mc": "MC-1088412",
+    "legalName": "NORTHLINE LOGISTICS LLC",
+    "dbaName": "Northline Freight",
+    "entityType": "BROKER",
+    "operatingStatus": "AUTHORIZED",
+    "physicalAddress": { "street": "4100 Westport Pkwy Ste 220", "city": "Fort Worth", "state": "TX", "zip": "76177" },
+    "phone": "(817) 555-0142",
+    "email": "compliance@northlinelogistics.example",
+    "authorities": [{ "type": "BROKER", "status": "ACTIVE", "grantDate": "2019-03-14" }],
+    "insurance": [
+      { "type": "BOND", "form": "BMC-84", "insurer": "Meridian Surety Company", "policyNumber": "SB-4471902", "coverageFromUsd": 0, "coverageToUsd": 75000, "effectiveDate": "2019-03-01" }
+    ],
+    "safetyRating": "NONE",
+    "powerUnits": 0,
+    "drivers": 0,
+    "mcs150Date": "2025-11-02",
+    "carrierOperation": "INTERSTATE",
+    "cargoCarried": [],
+    "_proofOfControlToken": "poc-northline-7f3a",
+    "_vettingFlags": ["identity-verified", "bank-account-verified"]
+  },
+  {
+    "usdot": "2751903",
+    "mc": "MC-0938251",
+    "legalName": "PRAIRIE WIND TRANSPORT INC",
+    "entityType": "CARRIER",
+    "operatingStatus": "AUTHORIZED",
+    "physicalAddress": { "street": "1820 S Industrial Rd", "city": "Salina", "state": "KS", "zip": "67401" },
+    "phone": "(785) 555-0193",
+    "email": "dispatch@prairiewindtransport.example",
+    "authorities": [
+      { "type": "COMMON", "status": "ACTIVE", "grantDate": "2017-06-22" },
+      { "type": "CONTRACT", "status": "ACTIVE", "grantDate": "2017-06-22" }
+    ],
+    "insurance": [
+      { "type": "BIPD", "form": "BMC-91X", "insurer": "Great Plains Mutual Insurance Co", "policyNumber": "TRK-0092817-24", "coverageFromUsd": 0, "coverageToUsd": 1000000, "effectiveDate": "2025-07-01" },
+      { "type": "CARGO", "form": "BMC-34", "insurer": "Great Plains Mutual Insurance Co", "policyNumber": "CGO-0092817-24", "coverageFromUsd": 0, "coverageToUsd": 100000, "effectiveDate": "2025-07-01" }
+    ],
+    "safetyRating": "SATISFACTORY",
+    "powerUnits": 42,
+    "drivers": 47,
+    "mcs150Date": "2026-01-18",
+    "carrierOperation": "INTERSTATE",
+    "cargoCarried": ["General Freight", "Grain, Feed, Hay", "Building Materials"],
+    "_proofOfControlToken": "poc-prairie-2c91",
+    "_vettingFlags": ["identity-verified", "phone-matches-registry", "insurance-cert-verified"]
+  },
+  {
+    "usdot": "4102217",
+    "mc": "MC-1592208",
+    "legalName": "REDLINE XPRESS LLC",
+    "entityType": "CARRIER",
+    "operatingStatus": "AUTHORIZED",
+    "physicalAddress": { "street": "7710 NW 72nd Ave Unit B", "city": "Miami", "state": "FL", "zip": "33166" },
+    "phone": "(305) 555-0177",
+    "email": "ops@redlinexpress.example",
+    "authorities": [{ "type": "COMMON", "status": "ACTIVE", "grantDate": "2026-05-09" }],
+    "insurance": [
+      { "type": "BIPD", "form": "BMC-91", "insurer": "Coastal Commercial Auto Ins", "policyNumber": "CA-55120-26", "coverageFromUsd": 0, "coverageToUsd": 750000, "effectiveDate": "2026-05-01" }
+    ],
+    "safetyRating": "NONE",
+    "powerUnits": 3,
+    "drivers": 3,
+    "mcs150Date": "2026-05-09",
+    "carrierOperation": "INTERSTATE",
+    "cargoCarried": ["General Freight"],
+    "_proofOfControlToken": "poc-redline-9b04",
+    "_vettingFlags": ["identity-verified", "phone-recently-changed", "address-is-virtual-office"]
+  },
+  {
+    "usdot": "1984411",
+    "mc": "MC-0711450",
+    "legalName": "BLUE MESA CARRIERS INC",
+    "entityType": "CARRIER_BROKER",
+    "operatingStatus": "AUTHORIZED",
+    "physicalAddress": { "street": "2201 E Main St", "city": "Farmington", "state": "NM", "zip": "87401" },
+    "phone": "(505) 555-0119",
+    "email": "admin@bluemesacarriers.example",
+    "authorities": [
+      { "type": "COMMON", "status": "ACTIVE", "grantDate": "2012-02-03" },
+      { "type": "BROKER", "status": "ACTIVE", "grantDate": "2020-09-15" }
+    ],
+    "insurance": [
+      { "type": "BIPD", "form": "BMC-91X", "insurer": "Four Corners Casualty", "policyNumber": "FC-88210-25", "coverageFromUsd": 0, "coverageToUsd": 1000000, "effectiveDate": "2025-10-01" },
+      { "type": "CARGO", "form": "BMC-34", "insurer": "Four Corners Casualty", "policyNumber": "FC-88211-25", "coverageFromUsd": 0, "coverageToUsd": 250000, "effectiveDate": "2025-10-01" },
+      { "type": "BOND", "form": "BMC-84", "insurer": "Meridian Surety Company", "policyNumber": "SB-5580021", "coverageFromUsd": 0, "coverageToUsd": 75000, "effectiveDate": "2020-09-01" }
+    ],
+    "safetyRating": "SATISFACTORY",
+    "powerUnits": 18,
+    "drivers": 21,
+    "mcs150Date": "2025-12-30",
+    "carrierOperation": "INTERSTATE",
+    "cargoCarried": ["General Freight", "Oilfield Equipment"],
+    "_proofOfControlToken": "poc-bluemesa-4e77",
+    "_vettingFlags": ["identity-verified"]
+  }
+]
