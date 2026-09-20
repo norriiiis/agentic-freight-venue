@@ -20,7 +20,7 @@ import { termsHash, textDigest, validateNegotiationPayload, type AcceptPayload, 
 import { AuditLog, type Component } from "../protocol/audit";
 import { httpGet, rpcCall, RpcRefusal, startServer, type HttpRoute } from "../protocol/rpc";
 import type { Credential, CredentialStatusEntry, MandateEnvelope, RotationAuthorization, RotationClaims, RotationReason } from "../protocol/types";
-import { makeResolver, type VenueKeyCert, type VenueKeyHistory, type VenueKeyResolver } from "../protocol/venue-keys";
+import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyHistory, type VenueKeyResolver } from "../protocol/venue-keys";
 import { evaluateMandate } from "../mandate/engine";
 import { ExposureBook } from "../mandate/exposure";
 import { verifyMandate } from "../mandate/sign";
@@ -97,33 +97,54 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     const card = await httpGet<AgentCard>(`${this.config.venueUrl}/.well-known/agent-card.json`);
     const v = verifyAgentCard(card);
     if (!v.ok || !v.jwk) throw new Error(`venue agent card does not verify: ${v.error}`);
-    const vk = card.metadata?.venueKeys as { rootPublicKey?: OkpJwk; cert?: VenueKeyCert } | undefined;
+    const vk = card.metadata?.venueKeys as { rootPublicKey?: OkpJwk; rootLog?: RootEvent[]; cert?: VenueKeyCert } | undefined;
     if (!vk?.rootPublicKey || !vk.cert) throw new Error("venue agent card carries no key hierarchy");
     const pinnedPath = join(this.config.dataDir, "venue-root.pinned.json");
-    // Trust on first use for the ROOT; afterwards the pinned root must match.
     if (existsSync(pinnedPath)) {
+      // Trust continues from the root this agent pinned. If the venue now names a different root, the ONLY
+      // acceptable proof is a pre-rotation chain from the pinned root to it (each step: commitment + new
+      // root's signature). Anything else is refused; a stolen root cannot produce that chain.
       const pinned = JSON.parse(readFileSync(pinnedPath, "utf8")) as OkpJwk;
-      if (pinned.x !== vk.rootPublicKey.x) throw new Error("venue root key changed; refusing to re-pin without an operator decision");
       this.venueRoot = pinned;
+      this.venueKeys = makeResolver(pinned, { rootLog: vk.rootLog ?? [] });
+      if (pinned.x !== vk.rootPublicKey.x && !this.venueKeys.rootTrusted(vk.rootPublicKey.kid ?? "")) {
+        try { await this.refreshVenueKeys(); } catch { /* refusal below */ }
+        if (!this.venueKeys.rootTrusted(vk.rootPublicKey.kid ?? "")) throw new Error("venue names a root this agent cannot reach from its pinned root by pre-rotation; refusing to re-pin");
+      }
+      this.repinIfRotated();
     } else {
+      // Trust on first use for the ROOT.
       this.venueRoot = vk.rootPublicKey;
       writeFileAtomic(pinnedPath, JSON.stringify(vk.rootPublicKey));
+      this.venueKeys = makeResolver(vk.rootPublicKey, { rootLog: vk.rootLog ?? [] });
     }
-    this.venueKeys = makeResolver(this.venueRoot);
-    if (!this.venueKeys.add(vk.cert)) throw new Error("venue operational key certificate is not signed by the pinned root");
+    if (!this.venueKeys.add(vk.cert)) throw new Error("venue operational key certificate is not signed by a trusted venue root");
     if (vk.cert.kid !== v.jwk.kid && vk.cert.publicKey.x !== v.jwk.x) throw new Error("venue agent card is not signed by its certified operational key");
     await this.refreshVenueKeys();
+  }
+
+  /** If the walk from the pinned root now ends at a newer root, pin that one (a restart then walks from it). */
+  private repinIfRotated() {
+    if (!this.venueKeys || !this.venueRoot) return;
+    const cur = this.venueKeys.currentRoot;
+    if (cur.x === this.venueRoot.x) return;
+    const from = this.venueRoot.kid?.slice(0, 12);
+    this.venueRoot = cur;
+    writeFileAtomic(join(this.config.dataDir, "venue-root.pinned.json"), JSON.stringify(cur));
+    this.audit.write({ component: this.comp.runtime, event: "venue-root-rotated", outcome: "INFO", evidence: { from, to: cur.kid?.slice(0, 12), note: "re-pinned via a pre-rotation chain from the previously pinned root" } });
   }
 
   /** Fetch the venue's published key history; accept only certificates/revocations signed by the pinned root. */
   async refreshVenueKeys(): Promise<{ kids: string[] }> {
     if (!this.venueKeys) throw new Error("venue not pinned");
     const h = await httpGet<VenueKeyHistory>(`${this.config.venueUrl}/.well-known/venue-keys.json`);
+    const rootChanged = this.venueKeys.extendRoots(h.rootLog ?? []);
     let added = 0;
     for (const c of h.certs) if (this.venueKeys.add(c)) added += 1;
     for (const r of h.revocations) this.venueKeys.revoke(r);
-    writeFileAtomic(join(this.config.dataDir, "venue-keys.cache.json"), JSON.stringify({ certs: h.certs, revocations: h.revocations }));
-    if (added) this.audit.write({ component: this.comp.runtime, event: "venue-keys-refreshed", outcome: "INFO", evidence: { kids: this.venueKeys.kids().map((k) => k.slice(0, 12)) } });
+    writeFileAtomic(join(this.config.dataDir, "venue-keys.cache.json"), JSON.stringify({ rootLog: h.rootLog, certs: h.certs, revocations: h.revocations }));
+    if (rootChanged) this.repinIfRotated();
+    if (added || rootChanged) this.audit.write({ component: this.comp.runtime, event: "venue-keys-refreshed", outcome: "INFO", evidence: { roots: this.venueKeys.rootKids().map((k) => k.slice(0, 12)), kids: this.venueKeys.kids().map((k) => k.slice(0, 12)), rootChanged } });
     return { kids: this.venueKeys.kids() };
   }
 
@@ -637,9 +658,10 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         },
         "POST /control/send-raw": async (_r: unknown, b: unknown) => ok(await this.sendRaw((b as { message: Message }).message)),
         "POST /control/reconcile": async () => ok({ resolved: await this.reconcile("control") }),
+        "POST /control/refresh-venue-keys": async () => ok({ ...(await this.refreshVenueKeys()), root: this.venueRoot?.kid, roots: this.venueKeys?.rootKids() }),
         "POST /control/rotate/prepare": async () => ok(this.rotatePrepare()),
         "POST /control/rotate/submit": async (_r: unknown, b: unknown) => ok(await this.rotateSubmit(b as Parameters<AgentRuntime<Ctx>["rotateSubmit"]>[0])),
-        "GET /control/identity": async () => ok({ agentId: this.config.agentId, kid: this.kp.kid, credentialId: this.credential?.credentialId, supersedes: this.credential?.supersedes, expiresAt: this.credential?.expiresAt, issuerKid: this.credential?.issuer.kid, venueRootKid: this.venueRoot?.kid, venueKidsKnown: this.venueKeys?.kids() ?? [] }),
+        "GET /control/identity": async () => ok({ agentId: this.config.agentId, kid: this.kp.kid, credentialId: this.credential?.credentialId, supersedes: this.credential?.supersedes, expiresAt: this.credential?.expiresAt, issuerKid: this.credential?.issuer.kid, venueRootKid: this.venueRoot?.kid, venueRootsKnown: this.venueKeys?.rootKids() ?? [], venueKidsKnown: this.venueKeys?.kids() ?? [] }),
         /** Fault injection at runtime: models a compromised agent runtime. */
         "POST /control/rogue": async (_r: unknown, b: unknown) => {
           this.config.rogue = (b as { rogue?: AgentConfig["rogue"] }).rogue;
@@ -667,7 +689,11 @@ export class AgentRuntime<Ctx extends { canary: string }> {
       } satisfies Record<string, HttpRoute>);
     }
     await startServer(this.config.port, { rpcPath: "/a2a", rpc: (m, p) => this.handleRpc(m, p), routes });
-    setInterval(() => { if (this.credential) this.reconcile().catch(() => {}); }, this.config.reconcileMs ?? 15_000).unref();
+    setInterval(() => {
+      if (!this.credential) return;
+      this.reconcile().catch(() => {});
+      this.refreshVenueKeys().catch(() => {});
+    }, this.config.reconcileMs ?? 15_000).unref();
     console.log(`[${this.config.agentId}] ${this.config.role} listening on ${this.url}${simMode ? " SIM_MODE" : ""}`);
   }
 }

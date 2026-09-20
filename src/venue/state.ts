@@ -18,7 +18,7 @@ import type { LoadSpec, Terms } from "../protocol/freight";
 import type { MandateEnvelope } from "../protocol/types";
 import type { ReasonCode } from "../protocol/reasons";
 import type { CommitmentArtifact } from "../ledger/artifact";
-import type { VenueKeyCert, VenueKeyRevocation } from "../protocol/venue-keys";
+import type { RootEvent, VenueKeyCert, VenueKeyRevocation } from "../protocol/venue-keys";
 
 export interface RegisteredAgent {
   agentId: string;
@@ -115,7 +115,14 @@ export interface KeyRotationJournal {
   cert: VenueKeyCert;
   revocation?: VenueKeyRevocation;
 }
-export type Journal = CommitJournal | VoidJournal | KeyRotationJournal;
+export interface RootRotationJournal {
+  kind: "ROOT_ROTATION";
+  commitmentId: string; // journal file name
+  writtenAt: string;
+  event: RootEvent;
+  recert?: VenueKeyCert;
+}
+export type Journal = CommitJournal | VoidJournal | KeyRotationJournal | RootRotationJournal;
 
 interface Snapshot {
   agents: Record<string, RegisteredAgent>;

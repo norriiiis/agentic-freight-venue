@@ -22,7 +22,7 @@ import { dataPart, type Message } from "../protocol/a2a";
 import { verifyMessageSignature } from "../protocol/envelope";
 import { termsHash, type AcceptPayload, type Terms } from "../protocol/freight";
 import type { Credential, CredentialStatusEntry } from "../protocol/types";
-import { makeResolver, type VenueKeyCert, type VenueKeyHistory } from "../protocol/venue-keys";
+import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyHistory } from "../protocol/venue-keys";
 import type { ReasonCode } from "../protocol/reasons";
 
 export interface GuaranteeSummary {
@@ -50,7 +50,7 @@ export interface CommitmentArtifact {
    * root-signed certificates for every venue kid this artifact references
    * (attestation keys and credential issuer keys).
    */
-  venue: { venueId: string; rootPublicKey: OkpJwk; certs: VenueKeyCert[] };
+  venue: { venueId: string; rootPublicKey: OkpJwk; rootLog?: RootEvent[]; certs: VenueKeyCert[] };
   terms: Terms;
   termsHash: string;
   acceptances: { broker: Message; carrier: Message };
@@ -122,12 +122,16 @@ export interface ArtifactVerification {
  * agent-key compromises; without them, a compromise declared after signing is
  * invisible offline. Every check is reported, not just the first failure.
  */
-export function verifyArtifact(a: CommitmentArtifact, opts: { pinnedRootKey?: OkpJwk; keyHistory?: Pick<VenueKeyHistory, "certs" | "revocations">; statusList?: CredentialStatusEntry[]; now?: Date } = {}): ArtifactVerification {
+export function verifyArtifact(a: CommitmentArtifact, opts: { pinnedRootKey?: OkpJwk; keyHistory?: Partial<Pick<VenueKeyHistory, "certs" | "revocations" | "rootLog">>; statusList?: CredentialStatusEntry[]; now?: Date } = {}): ArtifactVerification {
   const checks: ArtifactCheck[] = [];
   const push = (name: string, ok: boolean, detail?: string) => checks.push({ name, ok, detail });
   const root = opts.pinnedRootKey ?? a.venue.rootPublicKey;
-  if (opts.pinnedRootKey) push("venue.root.pinned-matches-embedded", opts.pinnedRootKey.x === a.venue.rootPublicKey.x, "embedded root differs from pinned root");
-  const resolver = makeResolver(root, { certs: [...a.venue.certs, ...(opts.keyHistory?.certs ?? [])], revocations: opts.keyHistory?.revocations ?? [] });
+  // The pinned root may be older than the one the artifact names; the root log (embedded and/or supplied) must walk from it.
+  const resolver = makeResolver(root, { certs: [...a.venue.certs, ...(opts.keyHistory?.certs ?? [])], revocations: opts.keyHistory?.revocations ?? [], rootLog: [...(a.venue.rootLog ?? []), ...(opts.keyHistory?.rootLog ?? [])] });
+  if (opts.pinnedRootKey) {
+    const embeddedKid = a.venue.rootPublicKey.kid ?? "";
+    push("venue.root.pinned-reaches-embedded", opts.pinnedRootKey.x === a.venue.rootPublicKey.x || resolver.rootTrusted(embeddedKid), `embedded root ${embeddedKid.slice(0, 12)}… is not the pinned root and no pre-rotation chain from the pinned root reaches it`);
+  }
   push("venue.certs.signed-by-root", a.venue.certs.length > 0 && a.venue.certs.every((c) => resolver.cert(c.kid) !== undefined), `${resolver.kids().length}/${a.venue.certs.length} embedded certificates verify against the root`);
 
   // 1. Attestations: valid signature by a certified key, trusted at signing time. At least one must pass both.
@@ -183,7 +187,7 @@ export function verifyArtifact(a: CommitmentArtifact, opts: { pinnedRootKey?: Ok
 
   const failed = checks.filter((c) => !c.ok);
   const structural = failed.some((c) => /\.signature$|terms\.hash|-match$/.test(c.name) && !c.name.startsWith("venue.attestation["));
-  const venueKeyProblem = failed.some((c) => c.name === "venue.attestation.any-trusted" || c.name.endsWith("issuer-trusted-at-issuance") || c.name === "venue.certs.signed-by-root" || c.name === "venue.root.pinned-matches-embedded");
+  const venueKeyProblem = failed.some((c) => c.name === "venue.attestation.any-trusted" || c.name.endsWith("issuer-trusted-at-issuance") || c.name === "venue.certs.signed-by-root" || c.name === "venue.root.pinned-reaches-embedded");
   const agentKeyProblem = failed.some((c) => c.name.endsWith("credential.trusted-at-signing"));
   const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
   return {

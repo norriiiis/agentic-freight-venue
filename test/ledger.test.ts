@@ -188,3 +188,83 @@ describe("venue key hierarchy", () => {
     expect(v.ok, JSON.stringify(v.checks.filter((c) => !c.ok))).toBe(true);
   });
 });
+
+import { rootCommitment, signRootEvent, walkRootLog } from "../src/protocol/venue-keys";
+import { Ledger as Ledger2 } from "../src/ledger/chain";
+
+describe("root pre-rotation", () => {
+  function ceremony() {
+    const r0 = generateKeyPair();
+    const r1 = generateKeyPair();
+    const r2 = generateKeyPair();
+    const e0 = signRootEvent(r0, { seq: 0, nextRootCommitment: rootCommitment(r1.publicJwk), at: new Date(Date.now() - 5000).toISOString(), reason: "ESTABLISHMENT" });
+    return { r0, r1, r2, e0 };
+  }
+
+  it("a rotation is accepted only if the revealed root matches the prior commitment and signs the event itself", () => {
+    const { r0, r1, r2, e0 } = ceremony();
+    const good = signRootEvent(r1, { seq: 1, previousRootKid: r0.kid, nextRootCommitment: rootCommitment(r2.publicJwk), at: new Date().toISOString(), reason: "ROTATION" }, r0);
+    const walk = walkRootLog(r0.publicJwk, [e0, good])!;
+    expect(walk.current.kid).toBe(r1.kid);
+    expect([...walk.roots.keys()]).toEqual([r0.kid, r1.kid]);
+    // thief with r0 rotates to their own key, countersigned by r0: commitment mismatch → rejected
+    const thief = generateKeyPair();
+    const bad = signRootEvent(thief, { seq: 1, previousRootKid: r0.kid, nextRootCommitment: rootCommitment(generateKeyPair().publicJwk), at: new Date().toISOString(), reason: "ROTATION" }, r0);
+    const w2 = walkRootLog(r0.publicJwk, [e0, bad])!;
+    expect(w2.current.kid).toBe(r0.kid);
+    expect(w2.rejected[0]?.why).toMatch(/pre-committed/);
+    // the right key but signed by someone else → rejected
+    const forged = { ...good, signature: bad.signature };
+    expect(walkRootLog(r0.publicJwk, [e0, forged])!.current.kid).toBe(r0.kid);
+    // a verifier that pinned r1 directly walks from there
+    expect(walkRootLog(r1.publicJwk, [e0, good])!.current.kid).toBe(r1.kid);
+  });
+
+  it("resolver: certificates by a root declared compromised after their signing stay trusted; those signed after do not; a re-certification restores a genuine key's whole tenure", () => {
+    const { r0, r1, r2, e0 } = ceremony();
+    const op = generateKeyPair();
+    const certByR0 = signCert(r0, op.publicJwk, 0, "INITIAL", new Date(Date.now() - 4000));
+    const rot1 = signRootEvent(r1, { seq: 1, previousRootKid: r0.kid, nextRootCommitment: rootCommitment(r2.publicJwk), at: new Date(Date.now() - 3000).toISOString(), reason: "ROTATION" }, r0);
+    const T = new Date(Date.now() - 2000).toISOString();
+    const thief = generateKeyPair();
+    const thiefCert = signCert(r1, thief.publicJwk, 99, "ROTATION", new Date(Date.now() - 1000)); // signed AFTER T with stolen r1
+    const genuineCertByR1 = signCert(r1, op.publicJwk, 1, "ROTATION", new Date(Date.now() - 2500)); // signed BEFORE T
+    const r3 = generateKeyPair();
+    const comp = signRootEvent(r2, { seq: 2, previousRootKid: r1.kid, nextRootCommitment: rootCommitment(r3.publicJwk), at: new Date().toISOString(), reason: "COMPROMISE", compromisedAt: T });
+    const res = makeResolver(r0.publicJwk, { rootLog: [e0, rot1, comp], certs: [certByR0, genuineCertByR1, thiefCert], revocations: [] });
+    expect(res.rootKids()).toEqual([r0.kid, r1.kid, r2.kid]);
+    expect(res.untrustedAt(thief.kid, new Date())).toMatch(/compromised before the certificate was signed/);
+    expect(res.untrustedAt(op.kid, new Date())).toBeUndefined(); // still has an R0 cert and a pre-T R1 cert
+    // a key whose ONLY cert was signed by r1 after T is dead until re-certified under r2 with its original validFrom
+    const late = generateKeyPair();
+    const lateCert = signCert(r1, late.publicJwk, 2, "ROTATION", new Date(Date.now() - 1500), new Date(Date.now() - 1500));
+    const res2 = makeResolver(r0.publicJwk, { rootLog: [e0, rot1, comp], certs: [lateCert], revocations: [] });
+    expect(res2.untrustedAt(late.kid, new Date())).toBeDefined();
+    const recert = signCert(r2, late.publicJwk, 3, "RECERTIFICATION", new Date(), new Date(Date.now() - 1500));
+    res2.add(recert);
+    expect(res2.untrustedAt(late.kid, new Date())).toBeUndefined();
+    expect(res2.untrustedAt(late.kid, new Date(Date.now() - 1400))).toBeUndefined(); // whole tenure
+  });
+
+  it("ledger: GENESIS + ROOT_ROTATION let a chain verify from the founding root after the root changed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "fv-root-"));
+    const { r0, r1, r2, e0 } = ceremony();
+    const op = generateKeyPair();
+    const cert0 = signCert(r0, op.publicJwk, 0, "INITIAL", new Date(Date.now() - 4000));
+    const l = new Ledger2(join(dir, "ledger.jsonl"), op, cert0, e0);
+    l.append("COMMITMENT", { commitmentId: "a" });
+    const rot = signRootEvent(r1, { seq: 1, previousRootKid: r0.kid, nextRootCommitment: rootCommitment(r2.publicJwk), at: new Date().toISOString(), reason: "ROTATION" }, r0);
+    l.append("ROOT_ROTATION", { rootEvent: rot, recert: null });
+    // a new operational key certified by the NEW root
+    const op2 = generateKeyPair();
+    const cert1 = signCert(r1, op2.publicJwk, 1, "ROTATION");
+    l.append("KEY_ROTATION", { previousKid: op.kid, cert: cert1, revocation: null }, op2);
+    const l2 = new Ledger2(join(dir, "ledger.jsonl"), op2);
+    l2.append("COMMITMENT", { commitmentId: "b" });
+    const v = verifyChain(l2.all(), { rootPublicKey: r0.publicJwk });
+    expect(v.ok, v.error).toBe(true);
+    expect(v.rootsSeen).toEqual([r0.kid, r1.kid]);
+    expect(verifyChain(l2.all(), { rootPublicKey: r1.publicJwk }).ok).toBe(true); // pinned the later root: fine too
+    expect(verifyChain(l2.all(), { rootPublicKey: generateKeyPair().publicJwk }).ok).toBe(false);
+  });
+});

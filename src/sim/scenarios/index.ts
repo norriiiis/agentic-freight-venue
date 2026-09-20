@@ -15,6 +15,7 @@ import { venueCrashRecovery } from "./venue-crash-recovery";
 import { venueCrashNotification } from "./venue-crash-notification";
 import { keyRotation } from "./key-rotation";
 import { venueKeyRotation } from "./venue-key-rotation";
+import { rootKeyRotation } from "./root-key-rotation";
 
-export const SCENARIOS: Scenario[] = [happyPath, insuranceLapsed, spoofedCarrier, doubleBrokering, brokerOverCeiling, exposureMidNegotiation, nonConvergence, revokedPrePickup, replayAndTamper, multiTender, negotiationTimeout, promptInjection, venueCrashRecovery, venueCrashNotification, keyRotation, venueKeyRotation];
+export const SCENARIOS: Scenario[] = [happyPath, insuranceLapsed, spoofedCarrier, doubleBrokering, brokerOverCeiling, exposureMidNegotiation, nonConvergence, revokedPrePickup, replayAndTamper, multiTender, negotiationTimeout, promptInjection, venueCrashRecovery, venueCrashNotification, keyRotation, venueKeyRotation, rootKeyRotation];
 export const ADVERSARIAL = SCENARIOS.filter((s) => s.id !== "happy-path");

@@ -35,7 +35,7 @@ async function runScenario(sc: Scenario, index: number): Promise<{ res: Scenario
   console.log(`  ${sc.summary}\n`);
   try {
     const res = await sc.run({ h, say: (l) => { notes.push(l); console.log(`  ▸ ${l}`); } });
-    const wire = renderWire(await h.venue.messages(), ROLES, ["happy-path", "non-convergence", "exposure-mid-negotiation", "insurance-lapsed", "negotiation-timeout", "key-rotation", "venue-key-rotation"].includes(sc.id) ? res.taskId : undefined);
+    const wire = renderWire(await h.venue.messages(), ROLES, ["happy-path", "non-convergence", "exposure-mid-negotiation", "insurance-lapsed", "negotiation-timeout", "key-rotation", "venue-key-rotation", "root-key-rotation"].includes(sc.id) ? res.taskId : undefined);
     if (wire.length) {
       console.log("\n  wire (venue log):");
       for (const l of wire) console.log(l);

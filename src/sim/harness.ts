@@ -12,7 +12,7 @@ import { exportPrivateJwk, generateKeyPair, signJws, type KeyPair, type OkpJwk }
 import type { Credential, CredentialStatusEntry, RotationAuthorization, RotationClaims, RotationReason } from "../protocol/types";
 import { buildAgentCard } from "../agentkit/runtime";
 import { importKeyPair as importKp } from "../protocol/crypto";
-import { signCert, signRevocation, type VenueKeyCert, type VenueKeyHistory, type VenueKeyRevocation } from "../protocol/venue-keys";
+import { rootCommitment, signCert, signRevocation, signRootEvent, type RootEvent, type VenueKeyCert, type VenueKeyHistory, type VenueKeyRevocation } from "../protocol/venue-keys";
 import { rpcCall } from "../protocol/rpc";
 import type { AgentConfig } from "../agentkit/types";
 import type { Mandate, MandateLimits } from "../mandate/types";
@@ -68,7 +68,8 @@ export class AgentHandle {
   tender(load: LoadSpec, to: { agentId: string }) { return httpPost<{ taskId?: string; task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown }; localRefusal?: boolean }>(`${this.url}/control/tender`, { load, to }); }
   send(data: NegotiationPayload, taskId?: string, contextId?: string) { return httpPost<{ task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown } }>(`${this.url}/control/send`, { data, taskId, contextId }); }
   reconcile() { return httpPost<{ resolved: string[] }>(`${this.url}/control/reconcile`, {}); }
-  identity() { return httpGet<{ agentId: string; kid: string; credentialId?: string; supersedes?: string; expiresAt?: string; issuerKid?: string; venueRootKid?: string; venueKidsKnown: string[] }>(`${this.url}/control/identity`); }
+  identity() { return httpGet<{ agentId: string; kid: string; credentialId?: string; supersedes?: string; expiresAt?: string; issuerKid?: string; venueRootKid?: string; venueRootsKnown: string[]; venueKidsKnown: string[] }>(`${this.url}/control/identity`); }
+  refreshVenueKeys() { return httpPost<{ kids: string[]; root?: string; roots?: string[] }>(`${this.url}/control/refresh-venue-keys`, {}); }
   rotatePrepare() { return httpPost<{ credentialId: string; newKid: string; newPublicKey: OkpJwk }>(`${this.url}/control/rotate/prepare`, {}); }
   rotateSubmit(input: { authorization: RotationAuthorization | { kind: "CURRENT_KEY_ONLY" }; claims?: RotationClaims; reason: RotationReason; compromisedAt?: string }) {
     return httpPost<{ ok: true; credential: Credential; superseded: CredentialStatusEntry } | { ok: false; reasonCode: string; evidence: unknown }>(`${this.url}/control/rotate/submit`, input);
@@ -136,8 +137,49 @@ export class VenueHandle {
   publicKey() { return httpGet<Record<string, unknown>>(`${this.url}/admin/public-key`); }
   credentialStatus() { return httpGet<CredentialStatusEntry[]>(`${this.url}/admin/credential-status`); }
   venueKeys() { return httpGet<VenueKeyHistory>(`${this.url}/.well-known/venue-keys.json`); }
-  /** The OPERATOR's root key. The venue process wrote it once and never reads it back; the harness is the operator's HSM. */
+  /** The OPERATOR's current root key. The venue process wrote it once and never reads it back; the harness is the operator's HSM. */
   operatorRoot(): KeyPair { return importKp(JSON.parse(readFileSync(join(this.dir, "venue-root.jwk.json"), "utf8"))); }
+  /** The PRE-COMMITTED next root, held even more offline. Only its hash is known to the venue process. */
+  operatorNextRoot(): KeyPair { return importKp(JSON.parse(readFileSync(join(this.dir, "venue-root-next.jwk.json"), "utf8"))); }
+  /**
+   * Root rotation ceremony: reveal the pre-committed root, commit to a fresh next one, sign the event with the
+   * new root (countersigned by the old one when it is still trusted), and re-certify the venue's genuine
+   * operational key under the new root on a compromise. Then rotate the operator's own custody files.
+   */
+  async rotateRoot(reason: "ROTATION" | "COMPROMISE", compromisedAt?: string) {
+    const old = this.operatorRoot();
+    const next = this.operatorNextRoot();
+    const afterNext = generateKeyPair();
+    const cur = (await this.venueKeys()).rootLog.sort((a, b) => b.seq - a.seq)[0]!;
+    const event = signRootEvent(next, { seq: cur.seq + 1, previousRootKid: cur.rootKid, nextRootCommitment: rootCommitment(afterNext.publicJwk), at: new Date().toISOString(), reason, compromisedAt }, reason === "ROTATION" ? old : undefined);
+    let recert: VenueKeyCert | undefined;
+    if (reason === "COMPROMISE") {
+      const h = await this.venueKeys();
+      const activeKid = (await httpGet<{ kid: string }>(`${this.url}/health`)).kid;
+      const original = h.certs.filter((c) => c.kid === activeKid).sort((a, b) => a.seq - b.seq)[0]!;
+      recert = signCert(next, original.publicKey, Math.max(...h.certs.map((c) => c.seq)) + 1, "RECERTIFICATION", new Date(), new Date(original.validFrom));
+    }
+    const res = await rpcCall<{ previousRootKid: string; rootKid: string; seq: number; recertified?: string }>(`${this.url}/a2a`, "venue/root-rotation/commit", { event, recert });
+    if (!res.error) {
+      writeFileSync(join(this.dir, "venue-root.jwk.json"), JSON.stringify(exportPrivateJwk(next)));
+      writeFileSync(join(this.dir, "venue-root-next.jwk.json"), JSON.stringify(exportPrivateJwk(afterNext)));
+    }
+    return res;
+  }
+  /** A thief holding the CURRENT root tries to rotate to a key of their own, countersigned by the stolen root. */
+  async rotateRootUnauthorized() {
+    const stolen = this.operatorRoot();
+    const thief = generateKeyPair();
+    const cur = (await this.venueKeys()).rootLog.sort((a, b) => b.seq - a.seq)[0]!;
+    const event: RootEvent = signRootEvent(thief, { seq: cur.seq + 1, previousRootKid: cur.rootKid, nextRootCommitment: rootCommitment(generateKeyPair().publicJwk), at: new Date().toISOString(), reason: "ROTATION" }, stolen);
+    return rpcCall(`${this.url}/a2a`, "venue/root-rotation/commit", { event });
+  }
+  /** A thief holding the current root certifies an operational key of their own (off-venue). Returns the key and its certificate. */
+  certifyThiefOperationalKey(): { kp: KeyPair; cert: VenueKeyCert } {
+    const stolen = this.operatorRoot();
+    const kp = generateKeyPair();
+    return { kp, cert: signCert(stolen, kp.publicJwk, 99, "ROTATION") };
+  }
   /** Operator-driven venue key rotation: prepare (root-signed request) → certify the pending key with the root → commit. */
   async rotateVenueKey(reason: "ROTATION" | "COMPROMISE", compromisedAt?: string) {
     const root = this.operatorRoot();

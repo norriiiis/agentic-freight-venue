@@ -53,6 +53,7 @@ export const REASONS = {
 
   // venue key hierarchy
   VENUE_KEY_UNTRUSTED: "A venue signature is by a key that is not certified by the venue root, or was declared compromised at that time and not re-signed",
+  ROOT_ROTATION_UNAUTHORIZED: "Root rotation must reveal the successor the previous root pre-committed to, signed by that successor; the current root's signature cannot authorize a different successor",
   VENUE_KEY_ROTATION_UNAUTHORIZED: "Venue key rotation must carry a certificate (and, for compromise, a revocation) signed by the venue root; the venue process cannot certify its own successor",
 
   // underwriting

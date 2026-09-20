@@ -11,7 +11,7 @@ import { dirname } from "node:path";
 import { appendDurable } from "../protocol/fsatomic";
 import { canonicalize, sha256Hex } from "../protocol/canonical";
 import { importPublicKey, jwsHeader, signJws, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
-import { makeResolver, type VenueKeyCert, type VenueKeyRevocation } from "../protocol/venue-keys";
+import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyRevocation } from "../protocol/venue-keys";
 
 /**
  * COMMITMENT and VOID each carry their guarantee effect (attach / release) in
@@ -19,7 +19,8 @@ import { makeResolver, type VenueKeyCert, type VenueKeyRevocation } from "../pro
  * window in which the ledger says "committed" but not whether it is guaranteed.
  */
 export type LedgerEntryType =
-  | "GENESIS"        // carries the first operational key certificate
+  | "GENESIS"        // carries the root establishment event and the first operational key certificate
+  | "ROOT_ROTATION"  // carries a root event (pre-rotation): the new root's authority is the previous root's commitment
   | "COMMITMENT"
   | "VOID"
   | "KEY_ROTATION"   // carries the successor's root-signed certificate (+ revocation of the predecessor); signed by the SUCCESSOR
@@ -46,13 +47,13 @@ export class Ledger {
   private entries: LedgerEntry[] = [];
   private readonly signer: () => KeyPair;
   /** `signer` may change over time (key rotation); pass a function, or a KeyPair for a fixed key. */
-  constructor(private readonly path: string, signer: KeyPair | (() => KeyPair), genesisCert?: VenueKeyCert) {
+  constructor(private readonly path: string, signer: KeyPair | (() => KeyPair), genesisCert?: VenueKeyCert, rootEvent?: RootEvent) {
     this.signer = typeof signer === "function" ? signer : () => signer;
     mkdirSync(dirname(path), { recursive: true });
     if (existsSync(path)) {
       this.entries = readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
     }
-    if (this.entries.length === 0) this.append("GENESIS", { venueKid: this.signer().kid, cert: genesisCert });
+    if (this.entries.length === 0) this.append("GENESIS", { venueKid: this.signer().kid, cert: genesisCert, rootEvent });
   }
   get head(): LedgerEntry {
     return this.entries[this.entries.length - 1]!;
@@ -88,17 +89,20 @@ export interface ChainVerification {
   /** Entries whose signature is by a key that was compromised at that time and not later resealed. */
   untrustedSeqs?: number[];
   keysSeen?: string[];
+  rootsSeen?: string[];
 }
 
 /**
  * Verify a chain. Two trust modes:
  *   - a single venue public key (legacy / single-key deployments)
- *   - `{ rootPublicKey }`: walk the chain from the root. GENESIS and KEY_ROTATION
- *     entries carry root-signed certificates; each entry's signature is checked
- *     against the certificate for the kid in its JWS header; a KEY_ROTATION entry
- *     is signed by the successor it introduces. Entries signed by a key after its
- *     declared compromise are untrusted unless a later RESEAL (by a trusted key)
- *     covers them.
+ *   - `{ rootPublicKey }`: walk the chain from a pinned root — ANY root the
+ *     verifier pinned, founding or later. GENESIS and ROOT_ROTATION entries carry
+ *     root events (pre-rotation proves each successor); GENESIS and KEY_ROTATION
+ *     carry root-signed operational certificates; each entry's signature is
+ *     checked against the certificate for the kid in its JWS header; a
+ *     KEY_ROTATION entry is signed by the successor it introduces. Entries
+ *     signed by a key after its declared compromise are untrusted unless a
+ *     later RESEAL (by a trusted key) covers them.
  */
 export type ChainTrust = OkpJwk | { rootPublicKey: OkpJwk; revocations?: VenueKeyRevocation[] };
 function isRootTrust(t: ChainTrust): t is { rootPublicKey: OkpJwk; revocations?: VenueKeyRevocation[] } {
@@ -109,9 +113,16 @@ export function verifyChain(entries: LedgerEntry[], trust: ChainTrust): ChainVer
   let prev = GENESIS_HASH;
   const n = entries.length;
   if (isRootTrust(trust)) {
-    // Pass 1: collect every root-signed certificate and revocation the chain carries. Their validity comes from
-    // the root, not from their position, and a revocation may appear AFTER the entries it casts doubt on.
-    const resolver = makeResolver(trust.rootPublicKey, { certs: [], revocations: trust.revocations ?? [] });
+    // Pass 1: collect root events first (they extend which roots are trusted), then every root-signed certificate
+    // and revocation the chain carries. Their validity comes from the roots, not from their position, and a
+    // revocation may appear AFTER the entries it casts doubt on.
+    const resolver = makeResolver(trust.rootPublicKey, { certs: [], revocations: trust.revocations ?? [], rootLog: [] });
+    const rootEvents: RootEvent[] = [];
+    for (const e of entries) {
+      const pl = e.payload as { rootEvent?: RootEvent };
+      if ((e.type === "GENESIS" || e.type === "ROOT_ROTATION") && pl.rootEvent) rootEvents.push(pl.rootEvent);
+    }
+    resolver.extendRoots(rootEvents);
     for (const e of entries) {
       const pl = e.payload as { cert?: VenueKeyCert; revocation?: VenueKeyRevocation | null };
       if ((e.type === "GENESIS" || e.type === "KEY_ROTATION") && pl.cert && !resolver.add(pl.cert)) {
@@ -140,7 +151,7 @@ export function verifyChain(entries: LedgerEntry[], trust: ChainTrust): ChainVer
       prev = e.hash;
     }
     const untrustedSeqs = [...untrusted].filter((x) => !resealed.has(x));
-    return { ok: untrustedSeqs.length === 0, entries: n, untrustedSeqs, keysSeen: resolver.kids(), error: untrustedSeqs.length ? `entries ${untrustedSeqs.join(",")} signed by a compromised key and not resealed` : undefined };
+    return { ok: untrustedSeqs.length === 0, entries: n, untrustedSeqs, keysSeen: resolver.kids(), rootsSeen: resolver.rootKids(), error: untrustedSeqs.length ? `entries ${untrustedSeqs.join(",")} signed by a compromised key and not resealed` : undefined };
   }
   const pub = importPublicKey(trust as OkpJwk);
   for (const e of entries) {

@@ -15,7 +15,7 @@ import { A2A_PROTOCOL_VERSION, FREIGHT_EXTENSION_URI, RPC_ERR, TERMINAL_STATES, 
 import { canonicalize, hashObject } from "../protocol/canonical";
 import { importPublicKey, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import { VenueKeyRing } from "./keyring";
-import { verifyCert, verifyRevocation, type VenueKeyCert, type VenueKeyRevocation } from "../protocol/venue-keys";
+import { verifyCert, verifyRevocation, verifyRootEventSelf, rootCommitment, type RootEvent, type VenueKeyCert, type VenueKeyRevocation } from "../protocol/venue-keys";
 import { buildMessage, venueSignMessage, type SignedMeta, type VenueAttachment } from "../protocol/envelope";
 import { loadFingerprint, termsHash, textDigest, validateNegotiationPayload, type AcceptPayload, type CounterPayload, type NegotiationPayload, type RejectPayload, type TenderPayload, type Terms } from "../protocol/freight";
 import { REASONS, type ReasonCode } from "../protocol/reasons";
@@ -33,7 +33,7 @@ import { Ledger, type LedgerEntry } from "../ledger/chain";
 import { artifactHash, buildArtifact, reattestArtifact, type CommitmentArtifact } from "../ledger/artifact";
 import { UnderwritingEngine } from "../underwriting/engine";
 import { DEFAULT_PARAMS, type RiskInputs, type UnderwritingParams } from "../underwriting/types";
-import { VenueState, type CommitJournal, type CommitmentRecord, type KeyRotationJournal, type NegotiationTask, type Offer, type RegisteredAgent, type VoidJournal } from "./state";
+import { VenueState, type CommitJournal, type CommitmentRecord, type KeyRotationJournal, type NegotiationTask, type Offer, type RegisteredAgent, type RootRotationJournal, type VoidJournal } from "./state";
 import { GUARANTEE_SCOPE } from "../underwriting/types";
 import { guaranteeWouldHavePaid } from "./guarantee-outcome";
 
@@ -75,7 +75,7 @@ export class VenueService {
     this.url = `http://127.0.0.1:${config.port}`;
     this.registry = new MockRegistry(config.registryPath);
     this.issuer = new CredentialIssuer(config.venueId, () => this.keys.signer(), this.registry, new StubVettingProvider(this.registry), config.dataDir);
-    this.ledger = new Ledger(join(config.dataDir, "ledger.jsonl"), () => this.keys.signer(), this.keys.currentCert());
+    this.ledger = new Ledger(join(config.dataDir, "ledger.jsonl"), () => this.keys.signer(), this.keys.currentCert(), this.keys.currentRootEvent());
     this.underwriting = new UnderwritingEngine(config.dataDir, { ...DEFAULT_PARAMS, ...config.underwriting });
     this.audit = new AuditLog(join(config.dataDir, "audit.jsonl"));
     this.state = new VenueState(config.dataDir);
@@ -111,7 +111,7 @@ export class VenueService {
           { id: "onboard", name: "Onboard agent", description: "Bind an agent key to a registry entity and issue a credential", tags: ["identity"] },
           { id: "negotiate", name: "Route negotiation", description: "Route tender/counter/accept between credentialed agents", tags: ["negotiation"] },
         ],
-        metadata: { venueId: this.config.venueId, issuerKid: this.kp.kid, venueKeys: { rootPublicKey: this.keys.rootPublicKey, cert: this.keys.currentCert() } },
+        metadata: { venueId: this.config.venueId, issuerKid: this.kp.kid, venueKeys: { rootPublicKey: this.keys.rootPublicKey, rootLog: this.keys.history().rootLog, cert: this.keys.currentCert() } },
       },
       this.kp,
     );
@@ -205,14 +205,51 @@ export class VenueService {
     return voided;
   }
 
-  /** Certificates for the given venue kids (deduplicated). */
+  /** Every certificate for the given venue kids (a key may hold an original and a re-certification). */
   private certsFor(kids: string[]): VenueKeyCert[] {
     const out: VenueKeyCert[] = [];
-    for (const k of new Set(kids)) {
-      const c = this.keys.certFor(k);
-      if (c) out.push(c);
-    }
+    for (const k of new Set(kids)) for (const c of this.keys.certsFor(k)) if (!out.some((x) => x.rootSignature === c.rootSignature)) out.push(c);
     return out;
+  }
+
+  // ------------------------------------------------------------ root rotation
+  //
+  // Pre-rotation: the operator reveals the root it committed to at the last
+  // ceremony, signs the event with it, and commits to the next. The venue
+  // process verifies the commitment and the self-signature; nothing the
+  // CURRENT root signs can authorize a different successor, so a stolen root
+  // cannot rotate. On COMPROMISE the operator also re-certifies the venue's
+  // genuine operational key under the new root (original validFrom), so its
+  // whole tenure stays trusted while any key the thief certified does not.
+
+  async rootRotationCommit(params: { event: RootEvent; recert?: VenueKeyCert }) {
+    const cur = this.keys.currentRootEvent();
+    const e = params.event;
+    const refuse = (error: string, extra: Record<string, unknown> = {}) => {
+      this.audit.write({ component: "venue.identity", event: "root-rotation", outcome: "REFUSED", reasonCode: "ROOT_ROTATION_UNAUTHORIZED", evidence: { error, currentRootKid: cur.rootKid, presentedRootKid: e.rootKid, ...extra } });
+      throw new Refusal("ROOT_ROTATION_UNAUTHORIZED", "venue.identity", { error, currentRootKid: cur.rootKid, presentedRootKid: e.rootKid, ...extra });
+    };
+    if (e.rootKid === cur.rootKid) return { previousRootKid: cur.previousRootKid ?? cur.rootKid, rootKid: cur.rootKid, seq: cur.seq, alreadyInstalled: true };
+    if (e.previousRootKid !== cur.rootKid) return refuse("event does not link to the current root");
+    if (e.seq !== cur.seq + 1) return refuse("event sequence is not the next one", { expectedSeq: cur.seq + 1 });
+    if (rootCommitment(e.rootPublicKey) !== cur.nextRootCommitment) return refuse("new root does not match the pre-committed successor; the current root's signature cannot substitute for it", { presentedCommitment: rootCommitment(e.rootPublicKey), expectedCommitment: cur.nextRootCommitment, previousRootCountersigned: !!e.previousRootSignature });
+    if (!verifyRootEventSelf(e)) return refuse("event is not signed by the new root");
+    if (e.reason === "COMPROMISE" && !e.compromisedAt) return refuse("COMPROMISE requires compromisedAt");
+    if (params.recert && (params.recert.kid !== this.kp.kid || !verifyCert(params.recert, e.rootPublicKey))) return refuse("re-certification must name the active operational key and be signed by the new root");
+    const journal: RootRotationJournal = { kind: "ROOT_ROTATION", commitmentId: `rootrot_${e.rootKid.slice(0, 16)}`, writtenAt: new Date().toISOString(), event: e, recert: params.recert };
+    this.state.writeJournal(journal);
+    const entry = this.ledger.append("ROOT_ROTATION", { rootEvent: e, recert: params.recert ?? null, reason: e.reason });
+    this.crashIf("after-root-rotation-append");
+    return this.applyRootRotation(journal, entry, "live");
+  }
+
+  private async applyRootRotation(j: RootRotationJournal, entry: LedgerEntry, mode: "live" | "recovery") {
+    const r = this.keys.installRoot(j.event, j.recert); // idempotent by root kid
+    this.state.persist();
+    this.state.deleteJournal(j.commitmentId);
+    this.audit.writeOnce(`root-rotation:${j.event.rootKid}`, { component: "venue.identity", event: "root-rotation", outcome: "ALLOWED", evidence: { reason: j.event.reason, previousRootKid: r.previousRootKid, newRootKid: j.event.rootKid, seq: j.event.seq, compromisedAt: j.event.compromisedAt, recertifiedOperationalKey: r.recertified, ledgerSeq: entry.seq, previousRootCountersigned: !!j.event.previousRootSignature, mode } });
+    await this.flushOutbox();
+    return { previousRootKid: r.previousRootKid, rootKid: j.event.rootKid, seq: j.event.seq, recertified: r.recertified, alreadyInstalled: false };
   }
 
   // ------------------------------------------------------ venue key rotation
@@ -233,8 +270,8 @@ export class VenueService {
   }
 
   async keyRotationCommit(params: { cert: VenueKeyCert; revocation?: VenueKeyRevocation }) {
-    if (!verifyCert(params.cert, this.keys.rootPublicKey)) throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: "certificate not signed by the venue root", certKid: params.cert.kid, rootKid: this.keys.rootPublicKey.kid });
-    if (params.revocation && !verifyRevocation(params.revocation, this.keys.rootPublicKey)) throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: "revocation not signed by the venue root" });
+    if (!verifyCert(params.cert, this.keys.rootPublicKey)) throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: "certificate not signed by the current venue root", certKid: params.cert.kid, rootKid: this.keys.rootPublicKey.kid });
+    if (params.revocation && !verifyRevocation(params.revocation, this.keys.rootPublicKey)) throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: "revocation not signed by the current venue root" });
     if (params.revocation && params.revocation.kid !== this.kp.kid) throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: "revocation does not name the active key", active: this.kp.kid, named: params.revocation.kid });
     const pending = this.keys.pendingSigner();
     if (!pending || pending.kid !== params.cert.kid) throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: "certificate does not name the pending key", pendingKid: pending?.kid, certKid: params.cert.kid });
@@ -313,6 +350,8 @@ export class VenueService {
           return this.keyRotationPrepare(params as { authorization: string });
         case "venue/key-rotation/commit":
           return await this.keyRotationCommit(params as { cert: VenueKeyCert; revocation?: VenueKeyRevocation });
+        case "venue/root-rotation/commit":
+          return await this.rootRotationCommit(params as { event: RootEvent; recert?: VenueKeyCert });
         case "message/send": {
           const m = (params as { message: Message }).message;
           return await this.ingest(m);
@@ -723,7 +762,7 @@ export class VenueService {
     const head = this.ledger.head;
     const artifact = buildArtifact(
       {
-        venue: { venueId: this.config.venueId, rootPublicKey: this.keys.rootPublicKey, certs: this.certsFor([this.kp.kid, brokerCred.issuer.kid, carrierCred.issuer.kid]) },
+        venue: { venueId: this.config.venueId, rootPublicKey: this.keys.rootPublicKey, rootLog: this.keys.history().rootLog, certs: this.certsFor([this.kp.kid, brokerCred.issuer.kid, carrierCred.issuer.kid]) },
         terms,
         termsHash: termsHash(terms),
         acceptances: { broker: t.acceptances[t.brokerAgentId]!, carrier: t.acceptances[t.carrierAgentId]! },
@@ -838,6 +877,17 @@ export class VenueService {
     const aborted: string[] = [];
     const retried: string[] = [];
     for (const j of this.state.readJournals()) {
+      if (j.kind === "ROOT_ROTATION") {
+        const onLedger = this.ledger.find((e) => e.type === "ROOT_ROTATION" && (e.payload as { rootEvent?: RootEvent }).rootEvent?.rootKid === j.event.rootKid);
+        if (onLedger) {
+          await this.applyRootRotation(j, onLedger, "recovery");
+          applied.push(j.commitmentId);
+        } else {
+          this.state.deleteJournal(j.commitmentId);
+          aborted.push(j.commitmentId);
+        }
+        continue;
+      }
       if (j.kind === "KEY_ROTATION") {
         const onLedger = this.ledger.find((e) => e.type === "KEY_ROTATION" && (e.payload as { cert?: VenueKeyCert }).cert?.kid === j.cert.kid);
         if (onLedger) {
