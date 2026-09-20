@@ -10,6 +10,7 @@ import type { KeyPair, OkpJwk } from "./crypto";
 import { entryHash, type LedgerEntryLike } from "./ledger-hash";
 import { rpcCall } from "./rpc";
 import { makeEquivocationProof, signReceipt, verifyEquivocationProof, verifyReceipt, type EquivocationProof, type LedgerHead, type WitnessReceipt } from "./witness";
+import { noticeHash, type BrokenPromiseProof, type InclusionPromise, type PendingNotice, type StatusNotice } from "./inclusion";
 
 export interface WitnessPeer {
   witnessId: string;
@@ -21,14 +22,22 @@ export interface WitnessCoreState {
   lastCosigned?: LedgerHead;
   receipts: WitnessReceipt[];
   seen: Record<string, string>;
+  /** noticeHash -> seq, for every entry carrying a noticeHash this witness verified. */
+  noticesSeen: Record<string, number>;
   forks: { at: string; expected: LedgerHead; observed: LedgerHead; why: string }[];
   equivocations: EquivocationProof[];
   halted?: { at: string; reason: string };
   peerReceipts: Record<string, WitnessReceipt>;
+  /** Inclusion promises lodged with this witness, awaiting the promised entry. */
+  watching: InclusionPromise[];
+  /** Notices the venue never acknowledged, lodged here; published as PENDING until an entry appears. */
+  pending: PendingNotice[];
+  broken: BrokenPromiseProof[];
+  resolved: { noticeHash: string; seq: number; at: string }[];
 }
 
 export function emptyWitnessState(): WitnessCoreState {
-  return { receipts: [], seen: {}, forks: [], equivocations: [], peerReceipts: {} };
+  return { receipts: [], seen: {}, noticesSeen: {}, forks: [], equivocations: [], peerReceipts: {}, watching: [], pending: [], broken: [], resolved: [] };
 }
 
 export interface WitnessCoreDeps {
@@ -69,6 +78,7 @@ export class WitnessCore {
     const last = s.lastCosigned;
     if (last && head.seq === last.seq && head.hash === last.hash) return { skipped: "head unchanged" };
     const verified: Record<string, string> = {};
+    const noticesVerified: Record<string, number> = {};
     let why: string | undefined;
     if (head.seq < (last?.seq ?? -1)) why = `head went backwards: cosigned seq ${last!.seq}, venue now reports seq ${head.seq}`;
     else {
@@ -80,10 +90,12 @@ export class WitnessCore {
       else {
         let prev = last ? last.hash : undefined;
         for (const e of entries) {
-          if (e.seq === from && !last) { if (entryHash(e) !== e.hash) { why = "genesis hash mismatch"; break; } verified[e.seq] = e.hash; prev = e.hash; continue; }
+          const nh = (e.payload as { noticeHash?: string } | undefined)?.noticeHash;
+          if (e.seq === from && !last) { if (entryHash(e) !== e.hash) { why = "genesis hash mismatch"; break; } verified[e.seq] = e.hash; if (nh) noticesVerified[nh] = e.seq; prev = e.hash; continue; }
           if (e.seq === from) { prev = e.hash; continue; }
           if (e.prevHash !== prev || entryHash(e) !== e.hash) { why = `chain broken at seq ${e.seq}`; break; }
           verified[e.seq] = e.hash;
+          if (nh) noticesVerified[nh] = e.seq;
           prev = e.hash;
         }
         if (!why && prev !== head.hash) why = `served entries do not reach the reported head`;
@@ -103,11 +115,80 @@ export class WitnessCore {
       return { skipped: `venue refused receipt: ${res.error.message}` };
     }
     Object.assign(s.seen, verified, { [head.seq]: head.hash });
+    Object.assign(s.noticesSeen, noticesVerified);
     s.lastCosigned = { seq: head.seq, hash: head.hash, ts: head.ts };
     s.receipts.push(receipt);
     this.d.persist();
     this.d.log("cosign", "ALLOWED", { seq: head.seq, hash: head.hash.slice(0, 12), at: receipt.at });
+    this.checkWatched(receipt);
     return { receipt };
+  }
+
+  // ---------------------------------------------------------- inclusion
+
+  /** A source lodges a venue-signed promise, or a notice the venue never acknowledged. */
+  watch(item: { promise: InclusionPromise } | { notice: StatusNotice; submissionOutcome: string }): { watching: number; pending: number } {
+    const s = this.d.state();
+    if ("promise" in item) {
+      if (!s.watching.some((p) => p.noticeHash === item.promise.noticeHash)) s.watching.push(item.promise);
+      this.d.log("watch", "INFO", { noticeId: item.promise.noticeId, includeBy: item.promise.includeBy });
+    } else {
+      const h = noticeHash(item.notice);
+      if (!s.pending.some((p) => noticeHash(p.notice) === h)) s.pending.push({ notice: item.notice, lodgedAt: new Date().toISOString(), lodgedWith: this.d.witnessId, submissionOutcome: item.submissionOutcome });
+      this.d.log("watch", "INFO", { noticeId: item.notice.noticeId, pending: true, submissionOutcome: item.submissionOutcome });
+    }
+    this.d.persist();
+    // Anything already on the chain resolves immediately.
+    const r = this.latestReceipt();
+    if (r) this.checkWatched(r);
+    return { watching: s.watching.length, pending: s.pending.length };
+  }
+
+  /**
+   * After each cosign: promised entries that appeared are resolved; promises
+   * past their deadline with nothing on the verified chain are BROKEN — proof
+   * is the promise plus this witness's receipt for a head past the deadline.
+   */
+  private checkWatched(headReceipt: WitnessReceipt) {
+    const s = this.d.state();
+    const now = new Date();
+    for (const p of [...s.watching]) {
+      const seq = s.noticesSeen[p.noticeHash];
+      if (seq !== undefined) {
+        s.watching = s.watching.filter((x) => x !== p);
+        s.resolved.push({ noticeHash: p.noticeHash, seq, at: now.toISOString() });
+        this.d.log("inclusion", "ALLOWED", { noticeId: p.noticeId, seq, promisedBy: p.includeBy });
+        continue;
+      }
+      if (now > new Date(p.includeBy) && new Date(headReceipt.at) > new Date(p.includeBy)) {
+        s.watching = s.watching.filter((x) => x !== p);
+        const proof: BrokenPromiseProof = { promise: p, headReceipt, checkedAt: now.toISOString(), detectedBy: this.d.witnessId };
+        s.broken.push(proof);
+        if (!s.halted) s.halted = { at: now.toISOString(), reason: `inclusion promise ${p.noticeId} broken: promised by ${p.includeBy}, absent at seq ${headReceipt.seq} (${headReceipt.at})` };
+        this.d.log("inclusion", "REFUSED", { noticeId: p.noticeId, promisedBy: p.includeBy, headSeq: headReceipt.seq, headAt: headReceipt.at, halted: true }, "INCLUSION_PROMISE_BROKEN");
+        for (const peer of this.d.peers()) fetch(`${peer.url}/broken`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ proof }) }).catch(() => {});
+      }
+    }
+    for (const pn of [...s.pending]) {
+      const h = noticeHash(pn.notice);
+      const seq = s.noticesSeen[h];
+      if (seq !== undefined) {
+        s.pending = s.pending.filter((x) => x !== pn);
+        s.resolved.push({ noticeHash: h, seq, at: now.toISOString() });
+        this.d.log("inclusion", "ALLOWED", { noticeId: pn.notice.noticeId, seq, wasPending: true });
+      }
+    }
+    this.d.persist();
+  }
+
+  receiveBroken(proof: BrokenPromiseProof): boolean {
+    const s = this.d.state();
+    if (s.broken.some((b) => b.promise.noticeHash === proof.promise.noticeHash)) return true;
+    s.broken.push(proof);
+    if (!s.halted) s.halted = { at: new Date().toISOString(), reason: `peer ${proof.detectedBy} proved inclusion promise ${proof.promise.noticeId} broken` };
+    this.d.persist();
+    this.d.log("inclusion", "REFUSED", { received: true, from: proof.detectedBy, noticeId: proof.promise.noticeId, halted: true }, "INCLUSION_PROMISE_BROKEN");
+    return true;
   }
 
   /** SIM fault for a malicious witness: sign whatever head it is handed, without verifying anything. */

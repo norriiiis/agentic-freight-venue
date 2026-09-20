@@ -6,6 +6,7 @@
 import { startServer } from "../protocol/rpc";
 import { WitnessService, type WitnessPeer } from "./service";
 import type { EquivocationProof, WitnessReceipt } from "../protocol/witness";
+import type { BrokenPromiseProof, InclusionPromise, StatusNotice } from "../protocol/inclusion";
 
 const peers = process.env.WITNESS_PEERS ? JSON.parse(process.env.WITNESS_PEERS) : [];
 const w = new WitnessService(process.env.WITNESS_ID ?? "witness-1", process.env.WITNESS_DATA_DIR ?? ".data/witness", process.env.WITNESS_VENUE_URL ?? "http://127.0.0.1:4100", peers);
@@ -32,6 +33,12 @@ startServer(port, {
     "POST /sign": async (_r, b) => { const { venueId, head } = b as { venueId: string; head: { seq: number; hash: string; ts: string } }; return ok({ receipt: w.signBlindly(venueId, head) ?? null }); },
     "POST /gossip": async (_r, b) => ok({ proof: w.receiveGossip((b as { receipt: WitnessReceipt }).receipt) ?? null }),
     "POST /equivocation": async (_r, b) => ok({ accepted: w.receiveProof((b as { proof: EquivocationProof }).proof) }),
+    /** A source lodges an inclusion promise to watch, or a notice the venue never acknowledged. */
+    "POST /watch": async (_r, b) => ok(w.watch(b as { promise: InclusionPromise } | { notice: StatusNotice; submissionOutcome: string })),
+    "GET /pending": async () => ok(w.pending()),
+    "GET /broken": async () => ok(w.broken()),
+    "GET /resolved": async () => ok(w.resolved()),
+    "POST /broken": async (_r, b) => ok({ accepted: w.receiveBroken((b as { proof: BrokenPromiseProof }).proof) }),
   },
 }).then(() => {
   console.log(`[${w.witnessId}] witnessing ${w.venueUrl} every ${pollMs}ms, gossiping with ${peers.length} peer(s) (kid ${w.kp.kid.slice(0, 12)}…) on http://127.0.0.1:${port}`);

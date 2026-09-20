@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { exportPrivateJwk, generateKeyPair, importKeyPair, type KeyPair } from "../protocol/crypto";
 import { writeFileAtomic } from "../protocol/fsatomic";
 import type { EquivocationProof, LedgerHead, WitnessReceipt } from "../protocol/witness";
+import type { BrokenPromiseProof, InclusionPromise, StatusNotice } from "../protocol/inclusion";
 import { WitnessCore, emptyWitnessState, type WitnessCoreState, type WitnessPeer } from "../protocol/witness-core";
 import { AuditLog, type Component } from "../protocol/audit";
 
@@ -47,7 +48,7 @@ export class WitnessService {
     for (const p of peers) if (!this.peers.some((x) => x.witnessId === p.witnessId)) this.peers.push(p);
   }
   status() {
-    return { witnessId: this.witnessId, publicKey: this.kp.publicJwk, lastCosigned: this.state.lastCosigned ?? null, receipts: this.state.receipts.length, forks: this.state.forks.length, equivocations: this.state.equivocations.length, halted: this.state.halted ?? null, peers: this.peers.map((p) => p.witnessId), colluding: this.signAnything };
+    return { witnessId: this.witnessId, publicKey: this.kp.publicJwk, lastCosigned: this.state.lastCosigned ?? null, receipts: this.state.receipts.length, forks: this.state.forks.length, equivocations: this.state.equivocations.length, halted: this.state.halted ?? null, peers: this.peers.map((p) => p.witnessId), colluding: this.signAnything, watching: this.state.watching.length, pending: this.state.pending.length, broken: this.state.broken.length };
   }
   receipts(): WitnessReceipt[] { return [...this.state.receipts]; }
   latestReceipt(): WitnessReceipt | undefined { return this.core.latestReceipt(); }
@@ -59,4 +60,9 @@ export class WitnessService {
   receiveGossip(r: WitnessReceipt) { return this.core.receiveGossip(r); }
   receiveProof(p: EquivocationProof) { return this.core.receiveProof(p); }
   signBlindly(venueId: string, head: LedgerHead) { return this.core.signBlindly(venueId, head); }
+  watch(item: { promise: InclusionPromise } | { notice: StatusNotice; submissionOutcome: string }) { return this.core.watch(item); }
+  receiveBroken(p: BrokenPromiseProof) { return this.core.receiveBroken(p); }
+  pending() { return [...this.state.pending]; }
+  broken() { return [...this.state.broken]; }
+  resolved() { return [...this.state.resolved]; }
 }

@@ -16,6 +16,7 @@ import { canonicalize, hashObject } from "../protocol/canonical";
 import { importPublicKey, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import { VenueKeyRing } from "./keyring";
 import { verifyReceipt, type LedgerHead, type WitnessKey, type WitnessReceipt, type Witnessed } from "../protocol/witness";
+import { noticeHash, noticeSummary, signPromise, verifyNotice, type InclusionPromise, type StatusNotice } from "../protocol/inclusion";
 import type { CredentialStatusEntry } from "../protocol/types";
 import { signJws } from "../protocol/crypto";
 import { verifyCert, verifyRevocation, verifyRootEventSelf, rootCommitment, type RootEvent, type VenueKeyCert, type VenueKeyRevocation } from "../protocol/venue-keys";
@@ -54,6 +55,10 @@ export interface VenueConfig {
   underwriting?: Partial<UnderwritingParams>;
   /** Independent witnesses whose receipts are accepted. Configured by the operator; a witness key is never minted by the venue. */
   witnesses?: WitnessKey[];
+  /** Sources whose signed status notices are accepted (registry feed, insurers). Principals may always notify about their own agents. */
+  noticeSources?: { sourceId: string; publicKey: OkpJwk }[];
+  /** The venue's maximum recording delay: every inclusion promise commits to this. */
+  inclusionDelayMs: number;
 }
 
 export class Refusal extends Error {
@@ -85,6 +90,7 @@ export class VenueService {
     this.audit = new AuditLog(join(config.dataDir, "audit.jsonl"));
     this.state = new VenueState(config.dataDir);
     for (const w of config.witnesses ?? []) this.registerWitness(w);
+    for (const src of config.noticeSources ?? []) this.registerNoticeSource(src);
   }
 
   // ------------------------------------------------------- witnessed heads
@@ -154,7 +160,7 @@ export class VenueService {
 
   /** The credential status list: every CREDENTIAL_STATUS entry on the ledger up to the head, plus the witnessed head, signed by the venue. */
   publishedStatusList(requester?: string): Witnessed & { entries: CredentialStatusEntry[]; kid: string; signature: string } {
-    const body = { ...this.witnessedEnvelope(requester), entries: this.ledgerViewFor(requester).filter((e) => e.type === "CREDENTIAL_STATUS").map((e) => (e.payload as { status: CredentialStatusEntry }).status) };
+    const body = { ...this.witnessedEnvelope(requester), entries: this.ledgerViewFor(requester).filter((e) => e.type === "CREDENTIAL_STATUS" && (e.payload as { status: CredentialStatusEntry | null }).status).map((e) => (e.payload as { status: CredentialStatusEntry }).status) };
     return { ...body, kid: this.kp.kid, signature: signJws(body, this.kp, { typ: "credential-status+jws" }, true) };
   }
 
@@ -165,9 +171,72 @@ export class VenueService {
   }
 
   /** Record a credential status change on the ledger (idempotent by credentialId + status + at). */
-  private recordCredentialStatus(st: CredentialStatusEntry): LedgerEntry {
+  private recordCredentialStatus(st: CredentialStatusEntry, provenance?: { noticeHash: string; sourceId: string; noticeId: string }): LedgerEntry {
     const existing = this.ledger.find((e) => e.type === "CREDENTIAL_STATUS" && (e.payload as { status: CredentialStatusEntry }).status.credentialId === st.credentialId && (e.payload as { status: CredentialStatusEntry }).status.status === st.status && (e.payload as { status: CredentialStatusEntry }).status.at === st.at);
-    return existing ?? this.ledger.append("CREDENTIAL_STATUS", { status: st });
+    return existing ?? this.ledger.append("CREDENTIAL_STATUS", { status: st, ...(provenance ?? {}) });
+  }
+
+  // ---------------------------------------------------- status notices
+  //
+  // A status change arrives as a SOURCE-signed notice (registry feed, insurer,
+  // or the principal of the affected agent). The venue answers, synchronously
+  // and before anything else, with a signed inclusion promise; then it
+  // records. It cannot acknowledge and forget without leaving evidence.
+
+  registerNoticeSource(src: { sourceId: string; publicKey: OkpJwk }) {
+    if (!this.state.noticeSources.some((x) => x.sourceId === src.sourceId)) {
+      this.state.noticeSources.push(src);
+      this.state.persist();
+      this.audit.write({ component: "venue.identity", event: "notice-source-registered", outcome: "INFO", evidence: { sourceId: src.sourceId, kid: src.publicKey.kid } });
+    }
+  }
+
+  private noticeSourceKeys(n: StatusNotice): OkpJwk[] {
+    const registered = this.state.noticeSources.find((x) => x.sourceId === n.sourceId);
+    if (registered) return [registered.publicKey];
+    // A principal may notify about its own agent: its key is the one registered in the agent's mandate envelope.
+    const agentId = n.subject.agentId ?? (n.subject.credentialId ? this.state.agentByCredential(n.subject.credentialId)?.agentId : undefined);
+    const env = agentId ? this.state.agents.get(agentId)?.envelope : undefined;
+    return env && n.sourceId === `principal:${agentId}` ? [env.principalPublicKey] : [];
+  }
+
+  async submitNotice(params: { notice: StatusNotice }): Promise<{ promise: InclusionPromise; recorded: boolean }> {
+    const n = params.notice;
+    const keys = this.noticeSourceKeys(n);
+    if (keys.length === 0 || !keys.some((k) => verifyNotice(n, k))) {
+      this.audit.write({ component: "venue.identity", event: "notice", outcome: "REFUSED", reasonCode: "NOTICE_SOURCE_UNKNOWN", evidence: { sourceId: n.sourceId, noticeId: n.noticeId } });
+      throw new Refusal("NOTICE_SOURCE_UNKNOWN", "venue.identity", { sourceId: n.sourceId, noticeId: n.noticeId });
+    }
+    if (this.simFault?.dropNotices) {
+      // SIM: the venue that will not acknowledge. The source gets a transport-level failure and no promise.
+      this.audit.write({ component: "sim", event: "notice-dropped", outcome: "INFO", evidence: { noticeId: n.noticeId, summary: noticeSummary(n) } });
+      throw new Error("service unavailable");
+    }
+    // 1. The promise, before anything can go wrong.
+    const promise = signPromise(this.kp, this.config.venueId, n, this.config.inclusionDelayMs);
+    this.audit.write({ component: "venue.identity", event: "notice", outcome: "ALLOWED", evidence: { noticeId: n.noticeId, summary: noticeSummary(n), promisedBy: promise.includeBy, noticeHash: promise.noticeHash.slice(0, 12) } });
+    if (this.simFault?.suppressNotices) {
+      // SIM: acknowledged, then forgotten.
+      this.audit.write({ component: "sim", event: "notice-suppressed", outcome: "INFO", evidence: { noticeId: n.noticeId, promisedBy: promise.includeBy } });
+      return { promise, recorded: false };
+    }
+    this.applyNotice(n);
+    return { promise, recorded: true };
+  }
+
+  /** Record what a notice asserts, with its provenance. Idempotent by notice hash. */
+  private applyNotice(n: StatusNotice) {
+    const h = noticeHash(n);
+    if (this.ledger.find((e) => (e.payload as { noticeHash?: string }).noticeHash === h)) return;
+    const targets: string[] = [];
+    if (n.subject.credentialId) targets.push(n.subject.credentialId);
+    else if (n.subject.agentId) { const r = this.state.agents.get(n.subject.agentId); if (r) targets.push(r.credentialId); }
+    else if (n.subject.usdot) for (const c of this.issuer.credentialsFor(n.subject.usdot)) if (!this.issuer.status(c.credentialId)) targets.push(c.credentialId);
+    for (const id of targets) {
+      const st = this.issuer.revoke(id, `${n.assertion}: ${n.reason}`, { noticeId: n.noticeId, sourceId: n.sourceId, effectiveAt: n.effectiveAt }, new Date());
+      if (st) this.recordCredentialStatus(st, { noticeHash: h, sourceId: n.sourceId, noticeId: n.noticeId });
+    }
+    if (targets.length === 0) this.ledger.append("CREDENTIAL_STATUS", { status: null, noticeHash: h, sourceId: n.sourceId, noticeId: n.noticeId, note: "notice recorded; no live credential matched" });
   }
 
   /** Revoke an agent credential: issuer record + ledger entry. */
@@ -456,6 +525,8 @@ export class VenueService {
           return await this.rootRotationCommit(params as { event: RootEvent; recert?: VenueKeyCert });
         case "venue/witness":
           return this.acceptWitnessReceipt((params as { receipt: WitnessReceipt }).receipt);
+        case "venue/notice":
+          return await this.submitNotice(params as { notice: StatusNotice });
         case "message/send": {
           const m = (params as { message: Message }).message;
           return await this.ingest(m);
@@ -1064,7 +1135,7 @@ export class VenueService {
   }
 
   /** SIM-ONLY fault injection: die at a named point inside a commit. Never present in a deployed venue. */
-  simFault?: { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number } };
+  simFault?: { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number }; suppressNotices?: boolean; dropNotices?: boolean };
   /** SIM-ONLY: receipts the fooled witness gave for heads of the fork view — the venue's second book. */
   private forkReceipts: Record<string, WitnessReceipt[]> = {};
 

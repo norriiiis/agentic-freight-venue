@@ -14,6 +14,7 @@ import { buildAgentCard } from "../agentkit/runtime";
 import { importKeyPair as importKp } from "../protocol/crypto";
 import { rootCommitment, signCert, signRevocation, signRootEvent, type RootEvent, type VenueKeyCert, type VenueKeyHistory, type VenueKeyRevocation } from "../protocol/venue-keys";
 import type { EquivocationProof, LedgerHead, WitnessReceipt, Witnessed } from "../protocol/witness";
+import { signNotice, type BrokenPromiseProof, type InclusionPromise, type PendingNotice, type StatusNotice } from "../protocol/inclusion";
 import type { CredentialStatusEntry as CSE } from "../protocol/types";
 import { rpcCall } from "../protocol/rpc";
 import type { AgentConfig } from "../agentkit/types";
@@ -149,6 +150,19 @@ export class VenueHandle {
   /** The status list as the venue shows it to a particular requester (SIM: the equivocation fault keys on this id). */
   async statusListAs(requester: string) { return (await (await fetch(`${this.url}/.well-known/credential-status.json`, { headers: { "x-witness-id": requester } })).json()) as Witnessed & { entries: CSE[] }; }
   async venueKeysAs(requester: string) { return (await (await fetch(`${this.url}/.well-known/venue-keys.json`, { headers: { "x-witness-id": requester } })).json()) as VenueKeyHistory & Witnessed; }
+  registerNoticeSource(sourceId: string, publicKey: OkpJwk) { return httpPost<{ ok: boolean }>(`${this.url}/admin/notice-sources`, { sourceId, publicKey }); }
+  /** Submit a source-signed status notice; returns the venue's inclusion promise, or the failure the source saw. */
+  async submitNotice(notice: StatusNotice): Promise<{ promise?: InclusionPromise; recorded?: boolean; failure?: string }> {
+    try {
+      const res = await rpcCall<{ promise: InclusionPromise; recorded: boolean }>(`${this.url}/a2a`, "venue/notice", { notice });
+      if (res.error) return { failure: `${res.error.message}${(res.error.data as { reasonCode?: string } | undefined)?.reasonCode ? ` (${(res.error.data as { reasonCode: string }).reasonCode})` : ""}` };
+      return res.result!;
+    } catch (e) {
+      return { failure: `transport: ${String(e).slice(0, 60)}` };
+    }
+  }
+  /** Notice faults: acknowledge-then-suppress, or refuse to acknowledge at all. */
+  noticeFault(f: { suppressNotices?: boolean; dropNotices?: boolean } | null) { return httpPost<{ ok: boolean }>(`${this.url}/admin/fault`, f ?? {}); }
   /** Equivocation fault: show these requesters a chain that shares history up to `fromSeq` and then omits every CREDENTIAL_STATUS entry. */
   equivocate(witnessIds: string | string[], fromSeq: number) { return httpPost<{ ok: boolean }>(`${this.url}/admin/fault`, { equivocate: { witnessIds: Array.isArray(witnessIds) ? witnessIds : [witnessIds], fromSeq } }); }
   ledgerHead() { return httpGet<LedgerHead & { venueId: string }>(`${this.url}/.well-known/ledger-head.json`); }
@@ -248,6 +262,10 @@ export class WitnessHandle {
   async addPeers(peers: WitnessHandle[]) { return httpPost<{ peers: string[] }>(`${this.url}/peers`, { peers: await Promise.all(peers.map(async (p) => ({ witnessId: p.witnessId, url: p.url, publicKey: (await p.status()).publicKey }))) }); }
   latest() { return httpGet<WitnessReceipt | null>(`${this.url}/latest`); }
   equivocations() { return httpGet<EquivocationProof[]>(`${this.url}/equivocations`); }
+  watch(item: { promise: InclusionPromise } | { notice: StatusNotice; submissionOutcome: string }) { return httpPost<{ watching: number; pending: number }>(`${this.url}/watch`, item); }
+  pending() { return httpGet<PendingNotice[]>(`${this.url}/pending`); }
+  broken() { return httpGet<BrokenPromiseProof[]>(`${this.url}/broken`); }
+  resolved() { return httpGet<{ noticeHash: string; seq: number; at: string }[]>(`${this.url}/resolved`); }
   /** SIM: make this witness collude — sign any head it is handed. */
   collude(on = true) { return httpPost<{ colluding: boolean }>(`${this.url}/fault`, { signAnything: on }); }
   signBlindly(venueId: string, head: LedgerHead) { return httpPost<{ receipt: WitnessReceipt | null }>(`${this.url}/sign`, { venueId, head }); }
@@ -259,7 +277,7 @@ export class WitnessHandle {
 export interface HarnessOptions {
   workspace: string;
   quiet?: boolean;
-  venue?: { maxRounds?: number; replyTimeoutMs?: number; sweepMs?: number; outboxMaxAttempts?: number; underwriting?: Record<string, unknown> };
+  venue?: { maxRounds?: number; replyTimeoutMs?: number; sweepMs?: number; outboxMaxAttempts?: number; inclusionDelayMs?: number; underwriting?: Record<string, unknown> };
 }
 
 export class Harness {
@@ -286,6 +304,7 @@ export class Harness {
       VENUE_REPLY_TIMEOUT_MS: String(this.opts.venue?.replyTimeoutMs ?? 120_000),
       VENUE_SWEEP_MS: String(this.opts.venue?.sweepMs ?? 5_000),
       VENUE_OUTBOX_MAX_ATTEMPTS: String(this.opts.venue?.outboxMaxAttempts ?? 40),
+      VENUE_INCLUSION_DELAY_MS: String(this.opts.venue?.inclusionDelayMs ?? 60_000),
       VENUE_UW_PARAMS: this.opts.venue?.underwriting ? JSON.stringify(this.opts.venue.underwriting) : "",
       SIM_MODE: "1",
     };
@@ -339,6 +358,13 @@ export class Harness {
     const h2 = new AgentHandle(handle.spec, handle.dir, handle.url, proc, handle.principal, handle.mandate);
     this.agents.set(handle.spec.agentId, h2);
     return h2;
+  }
+
+  /** A status-notice SOURCE (the registry feed, an insurer): its own key, registered with the venue by the operator. */
+  async startNoticeSource(sourceId: string): Promise<{ sourceId: string; kp: KeyPair; sign: (fields: Parameters<typeof signNotice>[2]) => StatusNotice }> {
+    const kp = generateKeyPair();
+    await this.venue.registerNoticeSource(sourceId, kp.publicJwk);
+    return { sourceId, kp, sign: (fields) => signNotice(kp, sourceId, fields) };
   }
 
   /**

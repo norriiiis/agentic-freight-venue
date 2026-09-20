@@ -23,7 +23,8 @@ import { verifyMessageSignature } from "../protocol/envelope";
 import { termsHash, type AcceptPayload, type Terms } from "../protocol/freight";
 import type { Credential, CredentialStatusEntry } from "../protocol/types";
 import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyHistory } from "../protocol/venue-keys";
-import { verifyEquivocationProof, witnessedAsOf, type EquivocationProof, type WitnessKey, type Witnessed } from "../protocol/witness";
+import { verifyEquivocationProof, verifyReceipt, witnessedAsOf, type EquivocationProof, type WitnessKey, type Witnessed } from "../protocol/witness";
+import { findInclusion, verifyNotice, verifyPromise, type BrokenPromiseProof, type InclusionPromise, type PendingNotice } from "../protocol/inclusion";
 import { verifyChain, type LedgerEntry } from "./chain";
 import type { ReasonCode } from "../protocol/reasons";
 
@@ -158,11 +159,16 @@ export type KeyHistoryInput = Partial<Pick<VenueKeyHistory, "certs" | "revocatio
  * see partyWitnessKeys), the verifier itself, its insurer. A venue that
  * controls k witnesses defeats "any k"; it cannot conjure a named one.
  * `equivocationProofs` are witness-signed proofs of a split view; any valid
- * one for this venue voids everything.
+ * one for this venue voids everything. `brokenPromises` likewise: the venue
+ * promised to record a notice and a witnessed chain past the deadline lacks
+ * it. `inclusionPromises` the verifier holds itself are checked against the
+ * ledger. `pendingNotices` are source-signed notices a pinned witness holds
+ * that the venue never acknowledged: not proof of anything, but status is
+ * uncertain until they appear (NOTICE_PENDING).
  */
 export function verifyArtifact(
   a: CommitmentArtifact,
-  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; minWitnesses?: number; requiredWitnesses?: string[]; equivocationProofs?: EquivocationProof[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
+  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; minWitnesses?: number; requiredWitnesses?: string[]; equivocationProofs?: EquivocationProof[]; inclusionPromises?: InclusionPromise[]; brokenPromises?: BrokenPromiseProof[]; pendingNotices?: PendingNotice[]; noticeSources?: WitnessKey[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
 ): ArtifactVerification {
   const checks: ArtifactCheck[] = [];
   const push = (name: string, ok: boolean, detail?: string) => checks.push({ name, ok, detail });
@@ -170,6 +176,13 @@ export function verifyArtifact(
   const statusPub = opts.statusList && !Array.isArray(opts.statusList) ? opts.statusList : undefined;
   const keysPub = opts.keyHistory;
   const witnessed: ArtifactVerification["witnessed"] = opts.witnessKeys ? { by: [] } : undefined;
+  const root = opts.pinnedRootKey ?? a.venue.rootPublicKey;
+  // The pinned root may be older than the one the artifact names; the root log (embedded and/or supplied) must walk from it.
+  const resolver = makeResolver(root, { certs: [...a.venue.certs, ...(opts.keyHistory?.certs ?? [])], revocations: opts.keyHistory?.revocations ?? [], rootLog: [...(a.venue.rootLog ?? []), ...(opts.keyHistory?.rootLog ?? [])] });
+  if (opts.pinnedRootKey) {
+    const embeddedKid = a.venue.rootPublicKey.kid ?? "";
+    push("venue.root.pinned-reaches-embedded", opts.pinnedRootKey.x === a.venue.rootPublicKey.x || resolver.rootTrusted(embeddedKid), `embedded root ${embeddedKid.slice(0, 12)}… is not the pinned root and no pre-rotation chain from the pinned root reaches it`);
+  }
   if (opts.witnessKeys) {
     const asOf = opts.asOf ?? opts.now ?? new Date();
     const tolerance = opts.maxStalenessMs ?? 15 * 60_000;
@@ -195,7 +208,7 @@ export function verifyArtifact(
         const at = opts.ledger.find((e) => e.seq === w.head!.seq);
         const headOk = !!at && at.hash === w.head.hash;
         if (label === "status" && statusEntries) {
-          const onLedger = opts.ledger.filter((e) => e.type === "CREDENTIAL_STATUS" && e.seq <= w.head!.seq).map((e) => (e.payload as { status: CredentialStatusEntry }).status);
+          const onLedger = opts.ledger.filter((e) => e.type === "CREDENTIAL_STATUS" && e.seq <= w.head!.seq && (e.payload as { status: CredentialStatusEntry | null }).status).map((e) => (e.payload as { status: CredentialStatusEntry }).status);
           const missing = onLedger.filter((x) => !statusEntries.some((y) => y.credentialId === x.credentialId && y.status === x.status && y.at === x.at));
           push("status.complete-to-witnessed-head", chain.ok && headOk && missing.length === 0, !chain.ok ? `ledger: ${chain.error}` : !headOk ? "witnessed head is not in the supplied ledger" : missing.length ? `${missing.length} status entr${missing.length === 1 ? "y" : "ies"} on the ledger before the witnessed head are missing from the list` : `${onLedger.length} status entries, all present`);
         } else if (label === "keys") {
@@ -205,13 +218,23 @@ export function verifyArtifact(
     };
     judge("status", statusPub);
     judge("keys", keysPub);
-  }
-  const root = opts.pinnedRootKey ?? a.venue.rootPublicKey;
-  // The pinned root may be older than the one the artifact names; the root log (embedded and/or supplied) must walk from it.
-  const resolver = makeResolver(root, { certs: [...a.venue.certs, ...(opts.keyHistory?.certs ?? [])], revocations: opts.keyHistory?.revocations ?? [], rootLog: [...(a.venue.rootLog ?? []), ...(opts.keyHistory?.rootLog ?? [])] });
-  if (opts.pinnedRootKey) {
-    const embeddedKid = a.venue.rootPublicKey.kid ?? "";
-    push("venue.root.pinned-reaches-embedded", opts.pinnedRootKey.x === a.venue.rootPublicKey.x || resolver.rootTrusted(embeddedKid), `embedded root ${embeddedKid.slice(0, 12)}… is not the pinned root and no pre-rotation chain from the pinned root reaches it`);
+
+    // ---- inclusion: promises the venue made, and notices it never answered
+    const venueKeyFor = (kid: string) => resolver.key(kid);
+    const broken = (opts.brokenPromises ?? []).filter((b) => b.promise.venueId === a.venue.venueId && verifyPromise(b.promise, venueKeyFor) && opts.witnessKeys!.some((w) => w.witnessId === b.headReceipt.witnessId && verifyReceipt(b.headReceipt, w.publicKey)) && new Date(b.headReceipt.at) > new Date(b.promise.includeBy) && (!opts.ledger || !findInclusion(b.promise, opts.ledger.filter((e) => e.seq <= b.headReceipt.seq))));
+    if (opts.brokenPromises) push("venue.honours-inclusion-promises", broken.length === 0, broken.length ? `${broken.length} promise(s) broken: ${broken.map((b) => `${b.promise.noticeId} promised by ${b.promise.includeBy}, absent at seq ${b.headReceipt.seq} (${b.headReceipt.witnessId}, ${b.headReceipt.at})`).join("; ")}` : "");
+    if (opts.inclusionPromises && opts.ledger) {
+      const w = statusPub ? witnessedAsOf({ venueId: statusPub.venueId!, witnessed: statusPub.witnessed ?? null }, opts.witnessKeys!, { minWitnesses: k, required: opts.requiredWitnesses }) : undefined;
+      const upTo = w?.head?.seq ?? Number.MAX_SAFE_INTEGER;
+      for (const p of opts.inclusionPromises) {
+        if (p.venueId !== a.venue.venueId || !verifyPromise(p, venueKeyFor)) { push(`inclusion[${p.noticeId}].promise-valid`, false, "promise not signed by a certified venue key"); continue; }
+        const entry = findInclusion(p, opts.ledger.filter((e) => e.seq <= upTo));
+        const deadlinePassed = !!w?.at && w.at > new Date(p.includeBy);
+        push(`inclusion[${p.noticeId}]`, !!entry || !deadlinePassed, entry ? `recorded at seq ${entry.seq}` : deadlinePassed ? `promised by ${p.includeBy}; witnessed chain to seq ${upTo} at ${w!.at!.toISOString()} does not contain it` : `not yet recorded; deadline ${p.includeBy} not passed as of the witnessed time`);
+      }
+    }
+    const pending = (opts.pendingNotices ?? []).filter((pn) => opts.noticeSources?.some((src) => src.witnessId === pn.notice.sourceId && verifyNotice(pn.notice, src.publicKey)) && (!opts.ledger || !opts.ledger.some((e) => (e.payload as { noticeHash?: string }).noticeHash === hashObject(pn.notice))));
+    if (opts.pendingNotices) push("status.no-pending-notices", pending.length === 0, pending.length ? `${pending.length} source-signed notice(s) lodged with ${[...new Set(pending.map((p) => p.lodgedWith))].join(", ")} that the venue never acknowledged: ${pending.map((p) => `${p.notice.assertion} ${p.notice.subject.credentialId ?? p.notice.subject.usdot ?? p.notice.subject.agentId} (${p.submissionOutcome})`).join("; ")}` : "");
   }
   push("venue.certs.signed-by-root", a.venue.certs.length > 0 && a.venue.certs.every((c) => resolver.cert(c.kid) !== undefined), `${resolver.kids().length}/${a.venue.certs.length} embedded certificates verify against the root`);
 
@@ -268,12 +291,14 @@ export function verifyArtifact(
 
   const failed = checks.filter((c) => !c.ok);
   const equivocated = failed.some((c) => c.name === "venue.no-equivocation");
-  const quorumOnly = !equivocated && failed.length > 0 && failed.every((c) => /\.(witnessed|witness-quorum|fresh-as-of|complete-to-witnessed-head)$/.test(c.name)) && failed.some((c) => c.name.endsWith(".witness-quorum"));
-  const freshnessOnly = failed.length > 0 && failed.every((c) => /\.(witnessed|fresh-as-of|complete-to-witnessed-head)$/.test(c.name));
+  const promiseBroken = failed.some((c) => c.name === "venue.honours-inclusion-promises" || (c.name.startsWith("inclusion[") && !c.name.endsWith(".promise-valid")));
+  const noticePending = !equivocated && !promiseBroken && failed.length > 0 && failed.every((c) => c.name === "status.no-pending-notices" || /\.(witnessed|witness-quorum|fresh-as-of|complete-to-witnessed-head)$/.test(c.name)) && failed.some((c) => c.name === "status.no-pending-notices");
+  const quorumOnly = !equivocated && !promiseBroken && !noticePending && failed.length > 0 && failed.every((c) => /\.(witnessed|witness-quorum|fresh-as-of|complete-to-witnessed-head)$/.test(c.name)) && failed.some((c) => c.name.endsWith(".witness-quorum"));
+  const freshnessOnly = !noticePending && failed.length > 0 && failed.every((c) => /\.(witnessed|fresh-as-of|complete-to-witnessed-head)$/.test(c.name));
   const structural = failed.some((c) => /\.signature$|terms\.hash|-match$/.test(c.name) && !c.name.startsWith("venue.attestation["));
   const venueKeyProblem = failed.some((c) => c.name === "venue.attestation.any-trusted" || c.name.endsWith("issuer-trusted-at-issuance") || c.name === "venue.certs.signed-by-root" || c.name === "venue.root.pinned-reaches-embedded");
   const agentKeyProblem = failed.some((c) => c.name.endsWith("credential.trusted-at-signing"));
-  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : equivocated ? "VENUE_EQUIVOCATION" : quorumOnly ? "WITNESS_QUORUM_NOT_MET" : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
+  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : equivocated ? "VENUE_EQUIVOCATION" : promiseBroken ? "INCLUSION_PROMISE_BROKEN" : noticePending ? "NOTICE_PENDING" : quorumOnly ? "WITNESS_QUORUM_NOT_MET" : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
   return {
     ok: failed.length === 0,
     reasonCode,

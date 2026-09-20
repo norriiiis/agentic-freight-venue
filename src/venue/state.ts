@@ -20,6 +20,7 @@ import type { ReasonCode } from "../protocol/reasons";
 import type { CommitmentArtifact } from "../ledger/artifact";
 import type { RootEvent, VenueKeyCert, VenueKeyRevocation } from "../protocol/venue-keys";
 import type { WitnessKey, WitnessReceipt } from "../protocol/witness";
+import type { OkpJwk } from "../protocol/crypto";
 
 export interface RegisteredAgent {
   agentId: string;
@@ -138,6 +139,8 @@ interface Snapshot {
   witnesses: WitnessKey[];
   /** Receipts by ledger head hash. */
   witnessReceipts: Record<string, WitnessReceipt[]>;
+  /** Sources whose signed status notices are accepted. */
+  noticeSources: { sourceId: string; publicKey: OkpJwk }[];
 }
 
 export class VenueState {
@@ -150,6 +153,7 @@ export class VenueState {
   lastAliveAt?: string;
   witnesses: WitnessKey[] = [];
   witnessReceipts: Record<string, WitnessReceipt[]> = {};
+  noticeSources: { sourceId: string; publicKey: OkpJwk }[] = [];
   private readonly dir: string;
   private readonly journalDir: string;
 
@@ -175,11 +179,12 @@ export class VenueState {
     this.lastAliveAt = s.lastAliveAt;
     this.witnesses = s.witnesses ?? [];
     this.witnessReceipts = s.witnessReceipts ?? {};
+    this.noticeSources = s.noticeSources ?? [];
   }
   /** One atomic write. Either the whole new state is on disk or none of it. Doubles as a heartbeat. */
   persist() {
     this.lastAliveAt = new Date().toISOString();
-    const s: Snapshot = { agents: Object.fromEntries(this.agents), tasks: Object.fromEntries(this.tasks), commitments: Object.fromEntries(this.commitments), nonces: Object.fromEntries(this.nonces), outbox: this.outbox, deadLetter: this.deadLetter, lastAliveAt: this.lastAliveAt, witnesses: this.witnesses, witnessReceipts: this.witnessReceipts };
+    const s: Snapshot = { agents: Object.fromEntries(this.agents), tasks: Object.fromEntries(this.tasks), commitments: Object.fromEntries(this.commitments), nonces: Object.fromEntries(this.nonces), outbox: this.outbox, deadLetter: this.deadLetter, lastAliveAt: this.lastAliveAt, witnesses: this.witnesses, witnessReceipts: this.witnessReceipts, noticeSources: this.noticeSources };
     writeFileAtomic(this.file("snapshot.json"), JSON.stringify(s));
   }
 

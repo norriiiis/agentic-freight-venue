@@ -14,6 +14,7 @@
 import { startServer, type HttpRoute } from "../protocol/rpc";
 import { VenueService } from "./service";
 import type { WitnessKey } from "../protocol/witness";
+import type { OkpJwk } from "../protocol/crypto";
 
 const config = {
   venueId: process.env.VENUE_ID ?? "venue-local",
@@ -26,6 +27,8 @@ const config = {
   outboxMaxAttempts: Number(process.env.VENUE_OUTBOX_MAX_ATTEMPTS ?? 40),
   underwriting: process.env.VENUE_UW_PARAMS ? JSON.parse(process.env.VENUE_UW_PARAMS) : undefined,
   witnesses: process.env.VENUE_WITNESSES ? JSON.parse(process.env.VENUE_WITNESSES) : undefined,
+  noticeSources: process.env.VENUE_NOTICE_SOURCES ? JSON.parse(process.env.VENUE_NOTICE_SOURCES) : undefined,
+  inclusionDelayMs: Number(process.env.VENUE_INCLUSION_DELAY_MS ?? 60_000),
 };
 const venue = new VenueService(config);
 const simMode = process.env.SIM_MODE === "1";
@@ -84,9 +87,9 @@ if (simMode) {
     },
     /** Crash the venue process at a named point inside the next commit (after-journal | after-ledger-append | after-apply). */
     "POST /admin/fault": async (_r, b) => {
-      const { crashAt, holdOutbox, equivocate } = b as { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number } };
-      venue.simFault = crashAt || holdOutbox || equivocate ? { crashAt: crashAt || undefined, holdOutbox: !!holdOutbox, equivocate } : undefined;
-      venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null, holdOutbox: !!holdOutbox, equivocate: equivocate ?? null } });
+      const { crashAt, holdOutbox, equivocate, suppressNotices, dropNotices } = b as { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number }; suppressNotices?: boolean; dropNotices?: boolean };
+      venue.simFault = crashAt || holdOutbox || equivocate || suppressNotices || dropNotices ? { crashAt: crashAt || undefined, holdOutbox: !!holdOutbox, equivocate, suppressNotices: !!suppressNotices, dropNotices: !!dropNotices } : undefined;
+      venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null, holdOutbox: !!holdOutbox, equivocate: equivocate ?? null, suppressNotices: !!suppressNotices, dropNotices: !!dropNotices } });
       return ok({ ok: true, fault: venue.simFault ?? null });
     },
     "POST /admin/flush-outbox": async () => { await venue.flushOutbox(); return ok({ pending: venue.state.outbox.length, deadLetter: venue.state.deadLetter.length }); },
@@ -109,6 +112,7 @@ if (simMode) {
     "GET /admin/public-key": async () => ok(venue.kp.publicJwk),
     "GET /admin/venue-keys": async () => ok(venue.keys.history()),
     "POST /admin/witnesses": async (_r, b) => { venue.registerWitness(b as WitnessKey); return ok({ ok: true, witnesses: venue.state.witnesses.map((w) => w.witnessId) }); },
+    "POST /admin/notice-sources": async (_r, b) => { venue.registerNoticeSource(b as { sourceId: string; publicKey: OkpJwk }); return ok({ ok: true, sources: venue.state.noticeSources.map((s) => s.sourceId) }); },
     /** Rollback fault: a compromised venue rewriting its own history. Drops every ledger entry after `seq`. */
     "POST /admin/ledger/truncate": async (_r, b) => {
       const { seq } = b as { seq: number };
