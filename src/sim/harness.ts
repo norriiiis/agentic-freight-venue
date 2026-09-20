@@ -13,7 +13,7 @@ import type { Credential, CredentialStatusEntry, RotationAuthorization, Rotation
 import { buildAgentCard } from "../agentkit/runtime";
 import { importKeyPair as importKp } from "../protocol/crypto";
 import { rootCommitment, signCert, signRevocation, signRootEvent, type RootEvent, type VenueKeyCert, type VenueKeyHistory, type VenueKeyRevocation } from "../protocol/venue-keys";
-import type { LedgerHead, WitnessReceipt, Witnessed } from "../protocol/witness";
+import type { EquivocationProof, LedgerHead, WitnessReceipt, Witnessed } from "../protocol/witness";
 import type { CredentialStatusEntry as CSE } from "../protocol/types";
 import { rpcCall } from "../protocol/rpc";
 import type { AgentConfig } from "../agentkit/types";
@@ -140,6 +140,11 @@ export class VenueHandle {
   credentialStatus() { return httpGet<CredentialStatusEntry[]>(`${this.url}/admin/credential-status`); }
   venueKeys() { return httpGet<VenueKeyHistory & Witnessed>(`${this.url}/.well-known/venue-keys.json`); }
   statusList() { return httpGet<Witnessed & { entries: CSE[] }>(`${this.url}/.well-known/credential-status.json`); }
+  /** The status list as the venue shows it to a particular requester (SIM: the equivocation fault keys on this id). */
+  async statusListAs(requester: string) { return (await (await fetch(`${this.url}/.well-known/credential-status.json`, { headers: { "x-witness-id": requester } })).json()) as Witnessed & { entries: CSE[] }; }
+  async venueKeysAs(requester: string) { return (await (await fetch(`${this.url}/.well-known/venue-keys.json`, { headers: { "x-witness-id": requester } })).json()) as VenueKeyHistory & Witnessed; }
+  /** Equivocation fault: show `witnessId` a chain that shares history up to `fromSeq` and then omits every CREDENTIAL_STATUS entry. */
+  equivocate(witnessId: string, fromSeq: number) { return httpPost<{ ok: boolean }>(`${this.url}/admin/fault`, { equivocate: { witnessId, fromSeq } }); }
   ledgerHead() { return httpGet<LedgerHead & { venueId: string }>(`${this.url}/.well-known/ledger-head.json`); }
   registerWitness(w: { witnessId: string; publicKey: OkpJwk }) { return httpPost<{ ok: boolean }>(`${this.url}/admin/witnesses`, w); }
   /** Rollback fault: drop every ledger entry after `seq` (a compromised venue rewriting its history). */
@@ -231,8 +236,12 @@ export class VenueHandle {
 
 export class WitnessHandle {
   constructor(readonly witnessId: string, readonly dir: string, readonly url: string, readonly proc: ChildProcess) {}
-  status() { return httpGet<{ witnessId: string; publicKey: OkpJwk; lastCosigned: LedgerHead | null; receipts: number; forks: number }>(`${this.url}/health`); }
-  poll() { return httpPost<{ receipt?: WitnessReceipt; skipped?: string; fork?: string }>(`${this.url}/poll`, {}); }
+  status() { return httpGet<{ witnessId: string; publicKey: OkpJwk; lastCosigned: LedgerHead | null; receipts: number; forks: number; equivocations: number; halted: { at: string; reason: string } | null; peers: string[] }>(`${this.url}/health`); }
+  poll() { return httpPost<{ receipt?: WitnessReceipt; skipped?: string; fork?: string; halted?: string }>(`${this.url}/poll`, {}); }
+  gossip() { return httpPost<{ checked: string[]; proofs: EquivocationProof[]; unreachable: string[] }>(`${this.url}/gossip-now`, {}); }
+  async addPeers(peers: WitnessHandle[]) { return httpPost<{ peers: string[] }>(`${this.url}/peers`, { peers: await Promise.all(peers.map(async (p) => ({ witnessId: p.witnessId, url: p.url, publicKey: (await p.status()).publicKey }))) }); }
+  latest() { return httpGet<WitnessReceipt | null>(`${this.url}/latest`); }
+  equivocations() { return httpGet<EquivocationProof[]>(`${this.url}/equivocations`); }
   receipts() { return httpGet<WitnessReceipt[]>(`${this.url}/receipts`); }
   forks() { return httpGet<{ at: string; expected: LedgerHead; observed: LedgerHead; why: string }[]>(`${this.url}/forks`); }
   publicKeyPath() { return join(this.dir, "witness-public.jwk.json"); }
@@ -323,12 +332,17 @@ export class Harness {
     return h2;
   }
 
-  /** Start an independent witness process and register its key with the venue (in production: operator configuration). */
-  async startWitness(witnessId = "witness-1", pollMs = 400): Promise<WitnessHandle> {
+  /**
+   * Start an independent witness process and register its key with the venue (in production: operator
+   * configuration). `peers` are other witnesses it gossips with — their ids, URLs and keys are distributed out
+   * of band, exactly like CT monitor keys; neither the venue nor the peers can add themselves.
+   */
+  async startWitness(witnessId = "witness-1", pollMs = 400, peers: WitnessHandle[] = []): Promise<WitnessHandle> {
     const dir = join(this.opts.workspace, witnessId);
     mkdirSync(dir, { recursive: true });
     const port = await freePort();
-    const proc = spawnTs("src/witness/server.ts", { WITNESS_ID: witnessId, WITNESS_DATA_DIR: dir, WITNESS_PORT: String(port), WITNESS_VENUE_URL: this.venue.url, WITNESS_POLL_MS: String(pollMs) }, witnessId.padEnd(7).slice(0, 7), !!this.opts.quiet);
+    const peerSpecs = await Promise.all(peers.map(async (p) => ({ witnessId: p.witnessId, url: p.url, publicKey: (await p.status()).publicKey })));
+    const proc = spawnTs("src/witness/server.ts", { WITNESS_ID: witnessId, WITNESS_DATA_DIR: dir, WITNESS_PORT: String(port), WITNESS_VENUE_URL: this.venue.url, WITNESS_POLL_MS: String(pollMs), WITNESS_PEERS: JSON.stringify(peerSpecs) }, witnessId.padEnd(7).slice(0, 7), !!this.opts.quiet);
     this.procs.push(proc);
     const url = `http://127.0.0.1:${port}`;
     await waitForHealth(`${url}/health`);

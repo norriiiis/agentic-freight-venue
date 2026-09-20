@@ -52,6 +52,8 @@ export const REASONS = {
   CHAIN_BROKEN: "Ledger hash chain is inconsistent",
   LEDGER_FORK_DETECTED: "The venue's ledger head does not extend the head this witness previously cosigned (rollback or fork)",
   STATUS_NOT_WITNESSED: "The published status list / key history carries no head cosigned by a pinned independent witness",
+  VENUE_EQUIVOCATION: "Two witnesses hold validly signed receipts for the same ledger position with different hashes: the venue showed different ledgers to different parties; nothing it publishes can be trusted",
+  WITNESS_QUORUM_NOT_MET: "Fewer pinned witnesses cosigned the published head than the verifier requires",
   STATUS_STALE: "The published list is witnessed only up to a time earlier than the moment being judged; later revocations or compromises would be invisible",
 
   // venue key hierarchy

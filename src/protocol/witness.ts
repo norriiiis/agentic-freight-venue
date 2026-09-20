@@ -59,16 +59,54 @@ export interface Witnessed {
 }
 
 /**
- * From a publication and a set of pinned witness keys: the latest witness time
- * up to which the publication is known to be complete, and which witnesses
- * vouched. Receipts by unknown or mismatching keys are ignored.
+ * Proof that a venue showed two different ledgers: two receipts, each validly
+ * signed by a witness, for the SAME seq of the SAME venue with DIFFERENT
+ * hashes. Self-contained — verifying it needs only the witnesses' keys, not
+ * the venue's cooperation. A verifier holding one trusts nothing that venue
+ * publishes.
  */
-export function witnessedAsOf(pub: Pick<Witnessed, "witnessed" | "venueId">, witnessKeys: WitnessKey[]): { at?: Date; by: string[]; head?: LedgerHead } {
-  if (!pub.witnessed) return { by: [] };
+export interface EquivocationProof {
+  venueId: string;
+  seq: number;
+  receipts: [WitnessReceipt, WitnessReceipt];
+  detectedBy: string;
+  at: string;
+}
+
+export function makeEquivocationProof(a: WitnessReceipt, b: WitnessReceipt, detectedBy: string): EquivocationProof | undefined {
+  if (a.venueId !== b.venueId || a.seq !== b.seq || a.hash === b.hash) return undefined;
+  return { venueId: a.venueId, seq: a.seq, receipts: [a, b], detectedBy, at: new Date().toISOString() };
+}
+
+/** Both receipts verify against pinned keys (distinct witnesses or the same one contradicting itself), same venue and seq, different hashes. */
+export function verifyEquivocationProof(p: EquivocationProof, witnessKeys: WitnessKey[]): boolean {
+  const [a, b] = p.receipts;
+  if (a.venueId !== p.venueId || b.venueId !== p.venueId || a.seq !== p.seq || b.seq !== p.seq || a.hash === b.hash) return false;
+  const ka = witnessKeys.find((w) => w.witnessId === a.witnessId);
+  const kb = witnessKeys.find((w) => w.witnessId === b.witnessId);
+  return !!ka && !!kb && verifyReceipt(a, ka.publicKey) && verifyReceipt(b, kb.publicKey);
+}
+
+/**
+ * From a publication and a set of pinned witness keys: which pinned witnesses
+ * cosigned the witnessed head, and the time up to which the publication is
+ * known complete. With `minWitnesses` = k, that time is the k-th latest
+ * receipt time — at least k independent witnesses vouch for it — and `quorum`
+ * says whether k was reached. Receipts by unknown or mismatching keys are
+ * ignored.
+ */
+export function witnessedAsOf(pub: Pick<Witnessed, "witnessed" | "venueId">, witnessKeys: WitnessKey[], minWitnesses = 1): { at?: Date; by: string[]; head?: LedgerHead; quorum: boolean } {
+  if (!pub.witnessed) return { by: [], quorum: false };
   const good = pub.witnessed.receipts.filter((r) => {
     const k = witnessKeys.find((w) => w.witnessId === r.witnessId);
     return !!k && r.venueId === pub.venueId && r.seq === pub.witnessed!.head.seq && r.hash === pub.witnessed!.head.hash && verifyReceipt(r, k.publicKey);
   });
-  if (good.length === 0) return { by: [] };
-  return { at: new Date(Math.max(...good.map((r) => new Date(r.at).getTime()))), by: good.map((r) => r.witnessId), head: pub.witnessed.head };
+  // one receipt per witness: its latest
+  const latestBy = new Map<string, WitnessReceipt>();
+  for (const r of good) if (!latestBy.has(r.witnessId) || new Date(r.at) > new Date(latestBy.get(r.witnessId)!.at)) latestBy.set(r.witnessId, r);
+  const times = [...latestBy.values()].map((r) => new Date(r.at).getTime()).sort((x, y) => y - x);
+  const k = Math.max(1, minWitnesses);
+  if (times.length === 0) return { by: [], quorum: false, head: pub.witnessed.head };
+  const quorum = times.length >= k;
+  return { at: quorum ? new Date(times[k - 1]!) : undefined, by: [...latestBy.keys()], head: pub.witnessed.head, quorum };
 }

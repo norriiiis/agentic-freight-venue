@@ -83,3 +83,47 @@ describe("artifact freshness with pinned witnesses", () => {
     expect(verifyArtifact(a, { pinnedRootKey: root.publicJwk, statusList: { venueId: "v", asOf: "x", head, witnessed: { head, receipts: [signReceipt(other, "w1", "v", head)] }, entries: [] }, witnessKeys: wk })).toMatchObject({ ok: false, reasonCode: "STATUS_NOT_WITNESSED" });
   });
 });
+
+import { makeEquivocationProof, verifyEquivocationProof } from "../src/protocol/witness";
+
+describe("equivocation proofs and witness quorum", () => {
+  const w1 = generateKeyPair();
+  const w2 = generateKeyPair();
+  const keys = [{ witnessId: "w1", publicKey: w1.publicJwk }, { witnessId: "w2", publicKey: w2.publicJwk }];
+  const h1 = { seq: 5, hash: "1".repeat(64), ts: "" };
+  const h2 = { seq: 5, hash: "2".repeat(64), ts: "" };
+
+  it("a proof is two validly signed receipts, same venue and seq, different hashes — and nothing else", () => {
+    const r1 = signReceipt(w1, "w1", "v", h1);
+    const r2 = signReceipt(w2, "w2", "v", h2);
+    const p = makeEquivocationProof(r1, r2, "w1")!;
+    expect(p.seq).toBe(5);
+    expect(verifyEquivocationProof(p, keys)).toBe(true);
+    expect(verifyEquivocationProof(p, [keys[0]!])).toBe(false);                       // w2 not pinned
+    expect(makeEquivocationProof(r1, signReceipt(w2, "w2", "v", h1), "w1")).toBeUndefined(); // same hash: agreement, not proof
+    expect(makeEquivocationProof(r1, signReceipt(w2, "w2", "v", { ...h2, seq: 6 }), "w1")).toBeUndefined(); // different seq
+    expect(makeEquivocationProof(r1, signReceipt(w2, "w2", "other-venue", h2), "w1")).toBeUndefined();
+    const forged = { ...p, receipts: [r1, { ...r2, hash: "3".repeat(64) }] as [typeof r1, typeof r2] };
+    expect(verifyEquivocationProof(forged, keys)).toBe(false);
+    // a single witness contradicting itself is also a proof
+    const self = makeEquivocationProof(r1, signReceipt(w1, "w1", "v", h2), "w2")!;
+    expect(verifyEquivocationProof(self, keys)).toBe(true);
+  });
+
+  it("quorum: the witnessed time is the k-th latest receipt; fewer than k pinned witnesses on the head is no quorum", () => {
+    const head = { seq: 9, hash: "9".repeat(64), ts: "" };
+    const r1 = signReceipt(w1, "w1", "v", head, new Date("2026-09-20T12:00:10.000Z"));
+    const r2 = signReceipt(w2, "w2", "v", head, new Date("2026-09-20T12:00:03.000Z"));
+    const pub = { venueId: "v", witnessed: { head, receipts: [r1, r2] } };
+    const one = witnessedAsOf(pub, keys, 1);
+    expect(one.quorum).toBe(true);
+    expect(one.at?.toISOString()).toBe("2026-09-20T12:00:10.000Z");
+    const two = witnessedAsOf(pub, keys, 2);
+    expect(two.quorum).toBe(true);
+    expect(two.at?.toISOString()).toBe("2026-09-20T12:00:03.000Z"); // at least 2 vouch for this time
+    const onlyW2 = witnessedAsOf({ venueId: "v", witnessed: { head, receipts: [r2] } }, keys, 2);
+    expect(onlyW2.quorum).toBe(false);
+    expect(onlyW2.at).toBeUndefined();
+    expect(onlyW2.by).toEqual(["w2"]);
+  });
+});

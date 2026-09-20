@@ -36,22 +36,24 @@ setInterval(() => {
 }, sweepMs).unref();
 
 const ok = (body: unknown) => ({ status: 200, body });
+/** Who is asking (SIM: witnesses send x-witness-id so the equivocation fault can target one; a real venue would fingerprint by IP). */
+const requester = (req: { headers: Record<string, string | string[] | undefined> }) => (simMode ? (Array.isArray(req.headers["x-witness-id"]) ? req.headers["x-witness-id"][0] : req.headers["x-witness-id"]) : undefined);
 const routes: Record<string, HttpRoute> = {
   "GET /health": async () => ok({ ok: true, venueId: config.venueId, kid: venue.kp.kid, rootKid: venue.keys.rootPublicKey.kid }),
   /** Published venue key history: root log + every root-signed certificate and revocation, with the witnessed ledger head. Pin a root; verify the rest. */
-  "GET /.well-known/venue-keys.json": async () => ok(venue.publishedKeyHistory()),
+  "GET /.well-known/venue-keys.json": async (req) => ok(venue.publishedKeyHistory(requester(req))),
   /** The current ledger head, for witnesses. */
-  "GET /.well-known/ledger-head.json": async () => ok(venue.ledgerHead()),
+  "GET /.well-known/ledger-head.json": async (req) => ok(venue.ledgerHead(requester(req))),
   /** The ledger is public and auditable. `?from=seq` for a witness checking that a new head extends the last one it cosigned. */
   "GET /ledger.jsonl": async (req) => {
     const u = new URL(req.url ?? "/", "http://localhost");
     const from = Number(u.searchParams.get("from") ?? 0);
-    return ok(venue.ledger.slice(Number.isFinite(from) ? from : 0));
+    return ok(venue.ledgerViewFor(requester(req)).filter((e) => e.seq >= (Number.isFinite(from) ? from : 0)));
   },
   "GET /.well-known/agent-card.json": async () => ok(venue.agentCard()),
   /** Published credential status list (revocations + supersessions): what an offline verifier needs to judge old signatures. */
   /** Published credential status list: a projection of the ledger's CREDENTIAL_STATUS entries at a head, with the witnessed head. */
-  "GET /.well-known/credential-status.json": async () => ok(venue.publishedStatusList()),
+  "GET /.well-known/credential-status.json": async (req) => ok(venue.publishedStatusList(requester(req))),
 };
 
 if (simMode) {
@@ -82,9 +84,9 @@ if (simMode) {
     },
     /** Crash the venue process at a named point inside the next commit (after-journal | after-ledger-append | after-apply). */
     "POST /admin/fault": async (_r, b) => {
-      const { crashAt, holdOutbox } = b as { crashAt?: string; holdOutbox?: boolean };
-      venue.simFault = crashAt || holdOutbox ? { crashAt: crashAt || undefined, holdOutbox: !!holdOutbox } : undefined;
-      venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null, holdOutbox: !!holdOutbox } });
+      const { crashAt, holdOutbox, equivocate } = b as { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessId: string; fromSeq: number } };
+      venue.simFault = crashAt || holdOutbox || equivocate ? { crashAt: crashAt || undefined, holdOutbox: !!holdOutbox, equivocate } : undefined;
+      venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null, holdOutbox: !!holdOutbox, equivocate: equivocate ?? null } });
       return ok({ ok: true, fault: venue.simFault ?? null });
     },
     "POST /admin/flush-outbox": async () => { await venue.flushOutbox(); return ok({ pending: venue.state.outbox.length, deadLetter: venue.state.deadLetter.length }); },

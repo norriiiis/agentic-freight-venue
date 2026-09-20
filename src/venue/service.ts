@@ -102,8 +102,8 @@ export class VenueService {
     }
   }
 
-  ledgerHead(): LedgerHead & { venueId: string } {
-    const h = this.ledger.head;
+  ledgerHead(requester?: string): LedgerHead & { venueId: string } {
+    const h = this.ledgerViewFor(requester).at(-1)!;
     return { venueId: this.config.venueId, seq: h.seq, hash: h.hash, ts: h.ts };
   }
 
@@ -113,7 +113,14 @@ export class VenueService {
     if (!w) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "unknown witness", witnessId: r.witnessId });
     if (r.venueId !== this.config.venueId || !verifyReceipt(r, w.publicKey)) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "witness receipt does not verify", witnessId: r.witnessId });
     const e = this.ledger.find((x) => x.seq === r.seq);
-    if (!e || e.hash !== r.hash) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "receipt names a head this ledger does not have", seq: r.seq, hash: r.hash.slice(0, 12) });
+    if (!e || e.hash !== r.hash) {
+      // SIM equivocation fault: the receipt may name a head of the fork shown to this witness — keep it in the second book.
+      const forkHead = this.isForkedFor(r.witnessId) ? this.ledgerViewFor(r.witnessId).find((x) => x.seq === r.seq) : undefined;
+      if (!forkHead || forkHead.hash !== r.hash) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "receipt names a head this ledger does not have", seq: r.seq, hash: r.hash.slice(0, 12) });
+      (this.forkReceipts[r.hash] ??= []).push(r);
+      this.audit.write({ component: "sim", event: "equivocation-fault", outcome: "INFO", evidence: { witnessId: r.witnessId, seq: r.seq, forkHash: r.hash.slice(0, 12), realHash: e?.hash.slice(0, 12) } });
+      return { ok: true, seq: r.seq };
+    }
     const list = (this.state.witnessReceipts[r.hash] ??= []);
     if (!list.some((x) => x.witnessId === r.witnessId && x.at === r.at)) list.push(r);
     this.state.persist();
@@ -121,29 +128,30 @@ export class VenueService {
     return { ok: true, seq: r.seq };
   }
 
-  /** The highest head in the CURRENT ledger that a witness has cosigned. After a rollback this is the last surviving one — the tell. */
-  latestWitnessedHead(): Witnessed["witnessed"] {
-    for (const e of [...this.ledger.all()].sort((a, b) => b.seq - a.seq)) {
-      const rs = this.state.witnessReceipts[e.hash];
-      if (rs && rs.length) return { head: { seq: e.seq, hash: e.hash, ts: e.ts }, receipts: rs };
+  /** The highest head in the CURRENT ledger (as seen by the requester) that a witness has cosigned. After a rollback this is the last surviving one — the tell. */
+  latestWitnessedHead(requester?: string): Witnessed["witnessed"] {
+    const forked = this.isForkedFor(requester);
+    for (const e of [...this.ledgerViewFor(requester)].sort((a, b) => b.seq - a.seq)) {
+      const rs = [...(this.state.witnessReceipts[e.hash] ?? []), ...(forked ? this.forkReceipts[e.hash] ?? [] : [])];
+      if (rs.length) return { head: { seq: e.seq, hash: e.hash, ts: e.ts }, receipts: rs };
     }
     return null;
   }
 
-  private witnessedEnvelope(): Witnessed {
-    const h = this.ledger.head;
-    return { venueId: this.config.venueId, asOf: new Date().toISOString(), head: { seq: h.seq, hash: h.hash, ts: h.ts }, witnessed: this.latestWitnessedHead() };
+  private witnessedEnvelope(requester?: string): Witnessed {
+    const h = this.ledgerViewFor(requester).at(-1)!;
+    return { venueId: this.config.venueId, asOf: new Date().toISOString(), head: { seq: h.seq, hash: h.hash, ts: h.ts }, witnessed: this.latestWitnessedHead(requester) };
   }
 
   /** The credential status list: every CREDENTIAL_STATUS entry on the ledger up to the head, plus the witnessed head, signed by the venue. */
-  publishedStatusList(): Witnessed & { entries: CredentialStatusEntry[]; kid: string; signature: string } {
-    const body = { ...this.witnessedEnvelope(), entries: this.ledger.all().filter((e) => e.type === "CREDENTIAL_STATUS").map((e) => (e.payload as { status: CredentialStatusEntry }).status) };
+  publishedStatusList(requester?: string): Witnessed & { entries: CredentialStatusEntry[]; kid: string; signature: string } {
+    const body = { ...this.witnessedEnvelope(requester), entries: this.ledgerViewFor(requester).filter((e) => e.type === "CREDENTIAL_STATUS").map((e) => (e.payload as { status: CredentialStatusEntry }).status) };
     return { ...body, kid: this.kp.kid, signature: signJws(body, this.kp, { typ: "credential-status+jws" }, true) };
   }
 
   /** The key history with the witnessed head, signed by the venue. */
-  publishedKeyHistory() {
-    const body = { ...this.witnessedEnvelope(), ...this.keys.history() };
+  publishedKeyHistory(requester?: string) {
+    const body = { ...this.witnessedEnvelope(requester), ...this.keys.history() };
     return { ...body, kid: this.kp.kid, signature: signJws(body, this.kp, { typ: "venue-keys+jws" }, true) };
   }
 
@@ -1047,7 +1055,20 @@ export class VenueService {
   }
 
   /** SIM-ONLY fault injection: die at a named point inside a commit. Never present in a deployed venue. */
-  simFault?: { crashAt?: string; holdOutbox?: boolean };
+  simFault?: { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessId: string; fromSeq: number } };
+  /** SIM-ONLY: receipts the fooled witness gave for heads of the fork view — the venue's second book. */
+  private forkReceipts: Record<string, WitnessReceipt[]> = {};
+
+  /** The ledger as seen by a given requester: the real chain, or (under the equivocation fault) the fork shown to one witness. */
+  ledgerViewFor(requester?: string): LedgerEntry[] {
+    const f = this.simFault?.equivocate;
+    if (f && requester && requester === f.witnessId) return this.ledger.forkView(f.fromSeq, (e) => e.type === "CREDENTIAL_STATUS");
+    return this.ledger.all();
+  }
+  private isForkedFor(requester?: string): boolean {
+    const f = this.simFault?.equivocate;
+    return !!f && !!requester && requester === f.witnessId;
+  }
   private crashIf(point: string) {
     if (process.env.SIM_MODE === "1" && this.simFault?.crashAt === point) {
       this.audit.write({ component: "sim", event: "crash", outcome: "INFO", evidence: { crashAt: point } });

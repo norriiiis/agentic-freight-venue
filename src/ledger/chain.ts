@@ -78,6 +78,26 @@ export class Ledger {
   slice(fromSeq: number): LedgerEntry[] {
     return this.entries.filter((e) => e.seq >= fromSeq);
   }
+  /**
+   * SIM-ONLY: an alternate chain that shares history up to `fromSeq` and then re-signs the later entries
+   * with `exclude`d ones removed. Models a venue keeping two books to show different parties. Deterministic
+   * for a given real chain (Ed25519 signatures are deterministic), so it looks like a stable ledger to whoever
+   * is shown it.
+   */
+  forkView(fromSeq: number, exclude: (e: LedgerEntry) => boolean): LedgerEntry[] {
+    const out: LedgerEntry[] = this.entries.filter((e) => e.seq <= fromSeq);
+    let prev = out.at(-1)?.hash ?? GENESIS_HASH;
+    let seq = (out.at(-1)?.seq ?? -1) + 1;
+    for (const e of this.entries.filter((x) => x.seq > fromSeq && !exclude(x))) {
+      const partial = { seq, ts: e.ts, type: e.type, payload: e.payload, prevHash: prev };
+      const hash = entryHash(partial);
+      const venueSig = signJws({ hash }, this.signer(), { typ: "ledger-entry+jws" }, true);
+      out.push({ ...partial, hash, venueSig });
+      prev = hash;
+      seq += 1;
+    }
+    return out;
+  }
   /** SIM-ONLY: rewrite history by dropping every entry after `seq`. Models a compromised venue rolling back its log. */
   truncate(seq: number) {
     this.entries = this.entries.filter((e) => e.seq <= seq);

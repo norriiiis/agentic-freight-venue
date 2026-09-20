@@ -10,6 +10,8 @@
  *                a pinned witness cosigned their head, and must be fresh as of --as-of (default: now) or the verdict is
  *                STATUS_STALE. --max-staleness-ms (default 900000 = 15 min) is the tolerance when judging "now"; use 0
  *                with a past --as-of for a strict answer. Without witness keys the lists' own asOf is the venue's word.
+ * --min-witnesses N      require N distinct pinned witnesses on the SAME head (default 1; use ≥2 against split views)
+ * --equivocation-proof f a witness-signed proof file (repeatable); any valid one for this venue voids its publications
  * Without the two lists the signatures still verify; a compromise declared after signing is invisible offline.
  * Uses nothing from the venue process. Exit code 0 iff the artifact verifies.
  */
@@ -41,7 +43,9 @@ const witnessKeys = opts("--witness-key").map((spec, i) => {
 const ledgerEntries = opt("--ledger") ? readFileSync(opt("--ledger")!, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as LedgerEntry) : undefined;
 const asOf = opt("--as-of") ? new Date(opt("--as-of")!) : undefined;
 const maxStalenessMs = opt("--max-staleness-ms") ? Number(opt("--max-staleness-ms")) : undefined;
-const res = verifyArtifact(artifact, { pinnedRootKey: pinned, keyHistory, statusList: statusList as never, witnessKeys: witnessKeys.length ? witnessKeys : undefined, asOf, maxStalenessMs, ledger: ledgerEntries });
+const minWitnesses = opt("--min-witnesses") ? Number(opt("--min-witnesses")) : undefined;
+const equivocationProofs = opts("--equivocation-proof").flatMap((f) => { const j = JSON.parse(readFileSync(f, "utf8")); return Array.isArray(j) ? j : [j]; });
+const res = verifyArtifact(artifact, { pinnedRootKey: pinned, keyHistory, statusList: statusList as never, witnessKeys: witnessKeys.length ? witnessKeys : undefined, minWitnesses, equivocationProofs: equivocationProofs.length ? equivocationProofs : undefined, asOf, maxStalenessMs, ledger: ledgerEntries });
 
 console.log(`Commitment ${artifact.commitmentId}`);
 console.log(`  load      ${res.summary.loadRef}`);
@@ -68,5 +72,5 @@ if (ledgerPath) {
   if (!chain.ok || !included) process.exit(1);
 }
 console.log("");
-console.log(res.ok ? "VERIFIED: both parties signed these exact terms." : res.reasonCode === "STATUS_STALE" || res.reasonCode === "STATUS_NOT_WITNESSED" ? `SIGNATURES GENUINE, STATUS UNCERTAIN: ${res.reasonCode} — a revocation or compromise after the witnessed time would be invisible; fetch a fresher list` : `NOT VERIFIED: ${res.reasonCode}`);
+console.log(res.ok ? "VERIFIED: both parties signed these exact terms." : res.reasonCode === "VENUE_EQUIVOCATION" ? "NOT VERIFIED: VENUE_EQUIVOCATION — witnesses hold proof this venue showed different ledgers to different parties; do not rely on anything it publishes" : res.reasonCode === "STATUS_STALE" || res.reasonCode === "STATUS_NOT_WITNESSED" || res.reasonCode === "WITNESS_QUORUM_NOT_MET" ? `SIGNATURES GENUINE, STATUS UNCERTAIN: ${res.reasonCode} — a revocation or compromise after the witnessed time would be invisible; fetch a fresher, better-witnessed list` : `NOT VERIFIED: ${res.reasonCode}`);
 process.exit(res.ok ? 0 : 1);

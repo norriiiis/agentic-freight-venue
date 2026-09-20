@@ -23,7 +23,7 @@ import { verifyMessageSignature } from "../protocol/envelope";
 import { termsHash, type AcceptPayload, type Terms } from "../protocol/freight";
 import type { Credential, CredentialStatusEntry } from "../protocol/types";
 import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyHistory } from "../protocol/venue-keys";
-import { witnessedAsOf, type WitnessKey, type Witnessed } from "../protocol/witness";
+import { verifyEquivocationProof, witnessedAsOf, type EquivocationProof, type WitnessKey, type Witnessed } from "../protocol/witness";
 import { verifyChain, type LedgerEntry } from "./chain";
 import type { ReasonCode } from "../protocol/reasons";
 
@@ -139,10 +139,14 @@ export type KeyHistoryInput = Partial<Pick<VenueKeyHistory, "certs" | "revocatio
  * now); a witness receipt is always in the past, so judging "now" needs a
  * tolerance (default 15 minutes) and judging a past moment can be strict (0).
  * With the ledger too, it checks the list is complete up to that witnessed head.
+ * `minWitnesses` (default 1) is the quorum: that many distinct pinned witnesses
+ * must have cosigned the SAME head — a venue showing different ledgers to
+ * different witnesses cannot assemble one. `equivocationProofs` are witness-
+ * signed proofs that it did; any valid one for this venue voids everything.
  */
 export function verifyArtifact(
   a: CommitmentArtifact,
-  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
+  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; minWitnesses?: number; equivocationProofs?: EquivocationProof[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
 ): ArtifactVerification {
   const checks: ArtifactCheck[] = [];
   const push = (name: string, ok: boolean, detail?: string) => checks.push({ name, ok, detail });
@@ -154,11 +158,16 @@ export function verifyArtifact(
     const asOf = opts.asOf ?? opts.now ?? new Date();
     const tolerance = opts.maxStalenessMs ?? 15 * 60_000;
     const needed = new Date(asOf.getTime() - tolerance);
+    const k = Math.max(1, opts.minWitnesses ?? 1);
+    const proofs = (opts.equivocationProofs ?? []).filter((p) => p.venueId === a.venue.venueId && verifyEquivocationProof(p, opts.witnessKeys!));
+    if (opts.equivocationProofs) push("venue.no-equivocation", proofs.length === 0, proofs.length ? `${proofs.length} witness-signed proof(s) that this venue showed different ledgers (seq ${proofs.map((p) => p.seq).join(", ")}): nothing it publishes is trustworthy` : "");
     const judge = (label: "status" | "keys", pub: Partial<Witnessed> | undefined) => {
       if (!pub) return;
       if (!pub.venueId || pub.witnessed === undefined) { push(`${label}.witnessed`, false, "publication carries no witnessed head (pre-witness format or stripped)"); return; }
-      const w = witnessedAsOf({ venueId: pub.venueId, witnessed: pub.witnessed }, opts.witnessKeys!);
-      push(`${label}.witnessed`, !!w.at, w.at ? `head seq ${w.head!.seq} cosigned by ${w.by.join(", ")} at ${w.at.toISOString()}` : "no receipt by a pinned witness");
+      const w = witnessedAsOf({ venueId: pub.venueId, witnessed: pub.witnessed }, opts.witnessKeys!, k);
+      push(`${label}.witnessed`, w.by.length > 0, w.by.length ? `head seq ${w.head!.seq} cosigned by ${w.by.join(", ")}` : "no receipt by a pinned witness");
+      if (k > 1 || w.by.length) push(`${label}.witness-quorum`, w.quorum, w.quorum ? `${w.by.length} of ${k} required pinned witnesses cosigned the same head` : `only ${w.by.length} pinned witness(es) cosigned this head; ${k} required — a venue showing different ledgers to different witnesses cannot assemble a quorum on one head`);
+      if (!w.at) return;
       if (w.at) {
         push(`${label}.fresh-as-of`, w.at >= needed, w.at >= needed ? `witnessed ${w.at.toISOString()}, judging ${asOf.toISOString()}${tolerance ? ` (tolerance ${tolerance}ms)` : " (strict)"}` : `witnessed only until ${w.at.toISOString()}; nothing after that is known — asked about ${asOf.toISOString()}${tolerance ? ` with ${tolerance}ms tolerance` : " (strict)"}`);
         if (label === "status") witnessed!.statusAsOf = w.at.toISOString();
@@ -242,11 +251,13 @@ export function verifyArtifact(
   }
 
   const failed = checks.filter((c) => !c.ok);
+  const equivocated = failed.some((c) => c.name === "venue.no-equivocation");
+  const quorumOnly = !equivocated && failed.length > 0 && failed.every((c) => /\.(witnessed|witness-quorum|fresh-as-of|complete-to-witnessed-head)$/.test(c.name)) && failed.some((c) => c.name.endsWith(".witness-quorum"));
   const freshnessOnly = failed.length > 0 && failed.every((c) => /\.(witnessed|fresh-as-of|complete-to-witnessed-head)$/.test(c.name));
   const structural = failed.some((c) => /\.signature$|terms\.hash|-match$/.test(c.name) && !c.name.startsWith("venue.attestation["));
   const venueKeyProblem = failed.some((c) => c.name === "venue.attestation.any-trusted" || c.name.endsWith("issuer-trusted-at-issuance") || c.name === "venue.certs.signed-by-root" || c.name === "venue.root.pinned-reaches-embedded");
   const agentKeyProblem = failed.some((c) => c.name.endsWith("credential.trusted-at-signing"));
-  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
+  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : equivocated ? "VENUE_EQUIVOCATION" : quorumOnly ? "WITNESS_QUORUM_NOT_MET" : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
   return {
     ok: failed.length === 0,
     reasonCode,
