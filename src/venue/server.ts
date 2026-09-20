@@ -84,7 +84,7 @@ if (simMode) {
     },
     /** Crash the venue process at a named point inside the next commit (after-journal | after-ledger-append | after-apply). */
     "POST /admin/fault": async (_r, b) => {
-      const { crashAt, holdOutbox, equivocate } = b as { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessId: string; fromSeq: number } };
+      const { crashAt, holdOutbox, equivocate } = b as { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number } };
       venue.simFault = crashAt || holdOutbox || equivocate ? { crashAt: crashAt || undefined, holdOutbox: !!holdOutbox, equivocate } : undefined;
       venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null, holdOutbox: !!holdOutbox, equivocate: equivocate ?? null } });
       return ok({ ok: true, fault: venue.simFault ?? null });

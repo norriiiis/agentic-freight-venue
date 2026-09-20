@@ -268,3 +268,15 @@ describe("root pre-rotation", () => {
     expect(verifyChain(l2.all(), { rootPublicKey: generateKeyPair().publicJwk }).ok).toBe(false);
   });
 });
+
+import { partyWitnessKeys } from "../src/ledger/artifact";
+
+describe("party witness keys", () => {
+  it("come straight from the artifact's credentials — the keys each party transacted with", () => {
+    const { artifact, b, c } = makeArtifact();
+    const keys = partyWitnessKeys(artifact);
+    expect(keys.map((k) => k.witnessId)).toEqual(["broker-1", "carrier-1"]);
+    expect(keys[0]!.publicKey.x).toBe(b.publicJwk.x);
+    expect(keys[1]!.publicKey.x).toBe(c.publicJwk.x);
+  });
+});

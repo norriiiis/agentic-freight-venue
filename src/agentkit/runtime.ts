@@ -21,6 +21,7 @@ import { AuditLog, type Component } from "../protocol/audit";
 import { httpGet, rpcCall, RpcRefusal, startServer, type HttpRoute } from "../protocol/rpc";
 import type { Credential, CredentialStatusEntry, MandateEnvelope, RotationAuthorization, RotationClaims, RotationReason } from "../protocol/types";
 import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyHistory, type VenueKeyResolver } from "../protocol/venue-keys";
+import { WitnessCore, emptyWitnessState, type WitnessCoreState, type WitnessPeer } from "../protocol/witness-core";
 import { evaluateMandate } from "../mandate/engine";
 import { ExposureBook } from "../mandate/exposure";
 import { verifyMandate } from "../mandate/sign";
@@ -44,6 +45,14 @@ export class AgentRuntime<Ctx extends { canary: string }> {
   }
   private tasks = new Map<string, LocalTask>();
   private readonly comp: { mandate: Component; strategy: Component; runtime: Component };
+  /**
+   * PARTY WITNESSING. This agent is a witness of its own transactions: it verifies the venue's chain like any
+   * witness, signs receipts with its own credential-bound key, and gossips with the independent witnesses its
+   * principal chose. The venue cannot control this witness, and the counterparty already trusts its key.
+   */
+  private witnessState: WitnessCoreState = emptyWitnessState();
+  private witnessPeers: WitnessPeer[] = [];
+  private partyWitness!: WitnessCore;
   readonly url: string;
 
   constructor(readonly config: AgentConfig, readonly strategy: Strategy<Ctx>) {
@@ -73,6 +82,27 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     this.url = `http://127.0.0.1:${config.port}`;
     const r = config.role;
     this.comp = { mandate: `agent.${r}.mandate`, strategy: `agent.${r}.strategy`, runtime: `agent.${r}.runtime` };
+    const self = this;
+    const wsPath = join(config.dataDir, "party-witness-state.json");
+    if (existsSync(wsPath)) this.witnessState = { ...emptyWitnessState(), ...JSON.parse(readFileSync(wsPath, "utf8")) };
+    this.witnessPeers = [...(config.witnessPeers ?? [])];
+    this.partyWitness = new WitnessCore({
+      witnessId: config.agentId,
+      get kp() { return self.kp; },
+      venueUrl: config.venueUrl,
+      peers: () => this.witnessPeers,
+      state: () => this.witnessState,
+      persist: () => writeFileAtomic(wsPath, JSON.stringify(this.witnessState, null, 2)),
+      log: (event, outcome, evidence, reasonCode) => this.audit.write({ component: this.comp.runtime, event: `party-witness:${event}`, outcome, evidence, reasonCode: reasonCode as never }),
+    });
+  }
+
+  /** Witness the venue's current head (verify it extends what this agent last cosigned; sign; submit), then gossip with the principal's chosen witnesses. */
+  async witnessNow(): Promise<{ poll: Awaited<ReturnType<WitnessCore["poll"]>>; gossip: Awaited<ReturnType<WitnessCore["gossip"]>> }> {
+    // The witness signs with whatever key this agent holds NOW (rotation-safe: receipts name the kid via the JWS header).
+    const poll = await this.partyWitness.poll();
+    const gossip = await this.partyWitness.gossip();
+    return { poll, gossip };
   }
 
   private persistTasks() {
@@ -513,6 +543,8 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         const cpUsdot = this.config.role === "broker" ? art.terms.carrierEntity.usdot : art.terms.brokerEntity.usdot;
         this.exposure.add(cpUsdot, art.terms.rateUsd, art.terms.pickup.windowStart.slice(0, 10), data.commitmentId);
         this.audit.write({ component: this.comp.runtime, event: "committed", outcome: "ALLOWED", taskId, evidence: { commitmentId: data.commitmentId, rateUsd: art.terms.rateUsd, guarantee: data.guarantee ? { guaranteeId: data.guarantee.guaranteeId, premiumUsd: data.guarantee.premiumUsd } : null, artifactSavedTo: `commitments/${data.commitmentId}.json` } });
+        // A party witnesses the head its commitment landed on, and gossips.
+        this.witnessNow().catch(() => {});
         break;
       }
       case "REFUSED": {
@@ -658,6 +690,12 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         },
         "POST /control/send-raw": async (_r: unknown, b: unknown) => ok(await this.sendRaw((b as { message: Message }).message)),
         "POST /control/reconcile": async () => ok({ resolved: await this.reconcile("control") }),
+        "POST /control/witness/now": async () => ok(await this.witnessNow()),
+        "GET /control/witness/status": async () => ok({ witnessId: this.config.agentId, lastCosigned: this.witnessState.lastCosigned ?? null, receipts: this.witnessState.receipts.length, forks: this.witnessState.forks.length, equivocations: this.witnessState.equivocations.length, halted: this.witnessState.halted ?? null, peers: this.witnessPeers.map((p) => p.witnessId) }),
+        "GET /control/witness/receipts": async () => ok(this.witnessState.receipts),
+        "GET /control/witness/receipt-for": async (req: { url?: string }) => { const seq = Number(new URL(req.url ?? "/", "http://localhost").searchParams.get("seq")); return ok(Number.isInteger(seq) ? this.partyWitness.receiptFor(seq) ?? null : null); },
+        "GET /control/witness/equivocations": async () => ok(this.witnessState.equivocations),
+        "POST /control/witness/peers": async (_r: unknown, b: unknown) => { for (const p of (b as { peers: WitnessPeer[] }).peers) if (!this.witnessPeers.some((x) => x.witnessId === p.witnessId)) this.witnessPeers.push(p); return ok({ peers: this.witnessPeers.map((p) => p.witnessId) }); },
         "POST /control/refresh-venue-keys": async () => ok({ ...(await this.refreshVenueKeys()), root: this.venueRoot?.kid, roots: this.venueKeys?.rootKids() }),
         "POST /control/rotate/prepare": async () => ok(this.rotatePrepare()),
         "POST /control/rotate/submit": async (_r: unknown, b: unknown) => ok(await this.rotateSubmit(b as Parameters<AgentRuntime<Ctx>["rotateSubmit"]>[0])),
@@ -693,6 +731,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
       if (!this.credential) return;
       this.reconcile().catch(() => {});
       this.refreshVenueKeys().catch(() => {});
+      this.witnessNow().catch(() => {});
     }, this.config.reconcileMs ?? 15_000).unref();
     console.log(`[${this.config.agentId}] ${this.config.role} listening on ${this.url}${simMode ? " SIM_MODE" : ""}`);
   }

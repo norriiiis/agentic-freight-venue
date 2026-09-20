@@ -22,6 +22,11 @@ export interface AgentConfig {
   thinkMs?: number;
   /** How often to pull tasks/get for negotiations still OPEN locally (push is at-least-once; pull bounds the gap). Default 15s. */
   reconcileMs?: number;
+  /**
+   * Independent witnesses this agent gossips with as a witness of its own transactions. Distributed by the
+   * PRINCIPAL out of band (its insurer's, an industry body's) — never learned from the venue.
+   */
+  witnessPeers?: { witnessId: string; url: string; publicKey: OkpJwk }[];
   /** Pinned principal key: the mandate on disk must be signed by this key or the agent refuses to run. */
   principal: { name: string; publicKey: OkpJwk };
   /**

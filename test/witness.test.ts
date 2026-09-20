@@ -127,3 +127,35 @@ describe("equivocation proofs and witness quorum", () => {
     expect(onlyW2.by).toEqual(["w2"]);
   });
 });
+
+describe("named-witness policy", () => {
+  const w1 = generateKeyPair();
+  const w2 = generateKeyPair();
+  const party = generateKeyPair();
+  const keys = [{ witnessId: "w1", publicKey: w1.publicJwk }, { witnessId: "w2", publicKey: w2.publicJwk }, { witnessId: "carrier-agent", publicKey: party.publicJwk }];
+  const head = { seq: 4, hash: "4".repeat(64), ts: "" };
+
+  it("'any k' is satisfied by whoever the venue controls; 'required' names one it cannot supply", () => {
+    const r1 = signReceipt(w1, "w1", "v", head, new Date("2026-09-20T12:00:01.000Z"));
+    const r2 = signReceipt(w2, "w2", "v", head, new Date("2026-09-20T12:00:02.000Z"));
+    const pub = { venueId: "v", witnessed: { head, receipts: [r1, r2] } };
+    const anyTwo = witnessedAsOf(pub, keys, { minWitnesses: 2 });
+    expect(anyTwo.quorum).toBe(true);
+    const named = witnessedAsOf(pub, keys, { minWitnesses: 2, required: ["carrier-agent"] });
+    expect(named.quorum).toBe(false);
+    expect(named.missingRequired).toEqual(["carrier-agent"]);
+    expect(named.at).toBeUndefined();
+    const withParty = witnessedAsOf({ venueId: "v", witnessed: { head, receipts: [r1, r2, signReceipt(party, "carrier-agent", "v", head, new Date("2026-09-20T12:00:00.000Z"))] } }, keys, { minWitnesses: 2, required: ["carrier-agent"] });
+    expect(withParty.quorum).toBe(true);
+    expect(withParty.missingRequired).toEqual([]);
+    expect(withParty.at?.toISOString()).toBe("2026-09-20T12:00:01.000Z"); // 2nd latest of the three
+  });
+
+  it("a receipt for a named witness signed by the wrong key does not count", () => {
+    const impostor = generateKeyPair();
+    const fake = signReceipt(impostor, "carrier-agent", "v", head);
+    const res = witnessedAsOf({ venueId: "v", witnessed: { head, receipts: [fake] } }, keys, { required: ["carrier-agent"] });
+    expect(res.by).toEqual([]);
+    expect(res.missingRequired).toEqual(["carrier-agent"]);
+  });
+});

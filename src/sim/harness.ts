@@ -70,6 +70,12 @@ export class AgentHandle {
   tender(load: LoadSpec, to: { agentId: string }) { return httpPost<{ taskId?: string; task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown }; localRefusal?: boolean }>(`${this.url}/control/tender`, { load, to }); }
   send(data: NegotiationPayload, taskId?: string, contextId?: string) { return httpPost<{ task?: Task; refusal?: { reasonCode: string; refusedBy: string; evidence: unknown } }>(`${this.url}/control/send`, { data, taskId, contextId }); }
   reconcile() { return httpPost<{ resolved: string[] }>(`${this.url}/control/reconcile`, {}); }
+  witnessNow() { return httpPost<{ poll: { receipt?: WitnessReceipt; skipped?: string; fork?: string; halted?: string }; gossip: { checked: string[]; proofs: EquivocationProof[]; unreachable: string[] } }>(`${this.url}/control/witness/now`, {}); }
+  witnessStatus() { return httpGet<{ witnessId: string; lastCosigned: LedgerHead | null; receipts: number; forks: number; equivocations: number; halted: { at: string; reason: string } | null; peers: string[] }>(`${this.url}/control/witness/status`); }
+  witnessReceipts() { return httpGet<WitnessReceipt[]>(`${this.url}/control/witness/receipts`); }
+  witnessReceiptFor(seq: number) { return httpGet<WitnessReceipt | null>(`${this.url}/control/witness/receipt-for?seq=${seq}`); }
+  witnessEquivocations() { return httpGet<EquivocationProof[]>(`${this.url}/control/witness/equivocations`); }
+  async addWitnessPeers(peers: WitnessHandle[]) { return httpPost<{ peers: string[] }>(`${this.url}/control/witness/peers`, { peers: await Promise.all(peers.map(async (p) => ({ witnessId: p.witnessId, url: p.url, publicKey: (await p.status()).publicKey }))) }); }
   identity() { return httpGet<{ agentId: string; kid: string; credentialId?: string; supersedes?: string; expiresAt?: string; issuerKid?: string; venueRootKid?: string; venueRootsKnown: string[]; venueKidsKnown: string[] }>(`${this.url}/control/identity`); }
   refreshVenueKeys() { return httpPost<{ kids: string[]; root?: string; roots?: string[] }>(`${this.url}/control/refresh-venue-keys`, {}); }
   rotatePrepare() { return httpPost<{ credentialId: string; newKid: string; newPublicKey: OkpJwk }>(`${this.url}/control/rotate/prepare`, {}); }
@@ -143,8 +149,8 @@ export class VenueHandle {
   /** The status list as the venue shows it to a particular requester (SIM: the equivocation fault keys on this id). */
   async statusListAs(requester: string) { return (await (await fetch(`${this.url}/.well-known/credential-status.json`, { headers: { "x-witness-id": requester } })).json()) as Witnessed & { entries: CSE[] }; }
   async venueKeysAs(requester: string) { return (await (await fetch(`${this.url}/.well-known/venue-keys.json`, { headers: { "x-witness-id": requester } })).json()) as VenueKeyHistory & Witnessed; }
-  /** Equivocation fault: show `witnessId` a chain that shares history up to `fromSeq` and then omits every CREDENTIAL_STATUS entry. */
-  equivocate(witnessId: string, fromSeq: number) { return httpPost<{ ok: boolean }>(`${this.url}/admin/fault`, { equivocate: { witnessId, fromSeq } }); }
+  /** Equivocation fault: show these requesters a chain that shares history up to `fromSeq` and then omits every CREDENTIAL_STATUS entry. */
+  equivocate(witnessIds: string | string[], fromSeq: number) { return httpPost<{ ok: boolean }>(`${this.url}/admin/fault`, { equivocate: { witnessIds: Array.isArray(witnessIds) ? witnessIds : [witnessIds], fromSeq } }); }
   ledgerHead() { return httpGet<LedgerHead & { venueId: string }>(`${this.url}/.well-known/ledger-head.json`); }
   registerWitness(w: { witnessId: string; publicKey: OkpJwk }) { return httpPost<{ ok: boolean }>(`${this.url}/admin/witnesses`, w); }
   /** Rollback fault: drop every ledger entry after `seq` (a compromised venue rewriting its history). */
@@ -242,6 +248,9 @@ export class WitnessHandle {
   async addPeers(peers: WitnessHandle[]) { return httpPost<{ peers: string[] }>(`${this.url}/peers`, { peers: await Promise.all(peers.map(async (p) => ({ witnessId: p.witnessId, url: p.url, publicKey: (await p.status()).publicKey }))) }); }
   latest() { return httpGet<WitnessReceipt | null>(`${this.url}/latest`); }
   equivocations() { return httpGet<EquivocationProof[]>(`${this.url}/equivocations`); }
+  /** SIM: make this witness collude — sign any head it is handed. */
+  collude(on = true) { return httpPost<{ colluding: boolean }>(`${this.url}/fault`, { signAnything: on }); }
+  signBlindly(venueId: string, head: LedgerHead) { return httpPost<{ receipt: WitnessReceipt | null }>(`${this.url}/sign`, { venueId, head }); }
   receipts() { return httpGet<WitnessReceipt[]>(`${this.url}/receipts`); }
   forks() { return httpGet<{ at: string; expected: LedgerHead; observed: LedgerHead; why: string }[]>(`${this.url}/forks`); }
   publicKeyPath() { return join(this.dir, "witness-public.jwk.json"); }

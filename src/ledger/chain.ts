@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { appendDurable } from "../protocol/fsatomic";
 import { canonicalize, sha256Hex } from "../protocol/canonical";
+import { entryHash as protocolEntryHash } from "../protocol/ledger-hash";
 import { importPublicKey, jwsHeader, signJws, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyRevocation } from "../protocol/venue-keys";
 
@@ -41,7 +42,7 @@ export interface LedgerEntry {
 export const GENESIS_HASH = "0".repeat(64);
 
 export function entryHash(e: Omit<LedgerEntry, "hash" | "venueSig">): string {
-  return sha256Hex(canonicalize({ seq: e.seq, ts: e.ts, type: e.type, payload: e.payload, prevHash: e.prevHash }));
+  return protocolEntryHash(e);
 }
 
 export class Ledger {

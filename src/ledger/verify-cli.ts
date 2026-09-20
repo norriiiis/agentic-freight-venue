@@ -11,12 +11,16 @@
  *                STATUS_STALE. --max-staleness-ms (default 900000 = 15 min) is the tolerance when judging "now"; use 0
  *                with a past --as-of for a strict answer. Without witness keys the lists' own asOf is the venue's word.
  * --min-witnesses N      require N distinct pinned witnesses on the SAME head (default 1; use ≥2 against split views)
+ * --party-witnesses      also pin both parties' keys from the artifact itself (they witness their own transactions)
+ * --require-witness id   a witness that MUST have cosigned the head (repeatable): your counterparty, your insurer, yourself
  * --equivocation-proof f a witness-signed proof file (repeatable); any valid one for this venue voids its publications
  * Without the two lists the signatures still verify; a compromise declared after signing is invisible offline.
  * Uses nothing from the venue process. Exit code 0 iff the artifact verifies.
  */
 import { readFileSync } from "node:fs";
-import { artifactHash, verifyArtifact, type CommitmentArtifact, type KeyHistoryInput } from "./artifact";
+import { artifactHash, partyWitnessKeys, verifyArtifact, type CommitmentArtifact, type KeyHistoryInput } from "./artifact";
+import type { WitnessKey } from "../protocol/witness";
+import type { OkpJwk } from "../protocol/crypto";
 import { verifyChain, type LedgerEntry } from "./chain";
 
 const args = process.argv.slice(2);
@@ -35,17 +39,19 @@ const pinned = opt("--venue-root") ? JSON.parse(readFileSync(opt("--venue-root")
 const statusFile = opt("--status-list");
 const statusList = statusFile ? (JSON.parse(readFileSync(statusFile, "utf8")) as { entries?: unknown[] } | unknown[]) : undefined;
 const keyHistory = opt("--key-history") ? (JSON.parse(readFileSync(opt("--key-history")!, "utf8")) as KeyHistoryInput) : undefined;
-const witnessKeys = opts("--witness-key").map((spec, i) => {
+const witnessKeys: WitnessKey[] = opts("--witness-key").map((spec, i) => {
   const [file, id] = spec.split(",");
-  const key = JSON.parse(readFileSync(file!, "utf8")) as { kid?: string; witnessId?: string };
-  return { witnessId: id ?? key.witnessId ?? `witness-${i + 1}`, publicKey: key as never };
+  const key = JSON.parse(readFileSync(file!, "utf8")) as OkpJwk & { witnessId?: string };
+  return { witnessId: id ?? key.witnessId ?? `witness-${i + 1}`, publicKey: key };
 });
 const ledgerEntries = opt("--ledger") ? readFileSync(opt("--ledger")!, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as LedgerEntry) : undefined;
 const asOf = opt("--as-of") ? new Date(opt("--as-of")!) : undefined;
 const maxStalenessMs = opt("--max-staleness-ms") ? Number(opt("--max-staleness-ms")) : undefined;
 const minWitnesses = opt("--min-witnesses") ? Number(opt("--min-witnesses")) : undefined;
+if (args.includes("--party-witnesses")) witnessKeys.push(...partyWitnessKeys(artifact));
+const requiredWitnesses = opts("--require-witness");
 const equivocationProofs = opts("--equivocation-proof").flatMap((f) => { const j = JSON.parse(readFileSync(f, "utf8")); return Array.isArray(j) ? j : [j]; });
-const res = verifyArtifact(artifact, { pinnedRootKey: pinned, keyHistory, statusList: statusList as never, witnessKeys: witnessKeys.length ? witnessKeys : undefined, minWitnesses, equivocationProofs: equivocationProofs.length ? equivocationProofs : undefined, asOf, maxStalenessMs, ledger: ledgerEntries });
+const res = verifyArtifact(artifact, { pinnedRootKey: pinned, keyHistory, statusList: statusList as never, witnessKeys: witnessKeys.length ? witnessKeys : undefined, minWitnesses, requiredWitnesses: requiredWitnesses.length ? requiredWitnesses : undefined, equivocationProofs: equivocationProofs.length ? equivocationProofs : undefined, asOf, maxStalenessMs, ledger: ledgerEntries });
 
 console.log(`Commitment ${artifact.commitmentId}`);
 console.log(`  load      ${res.summary.loadRef}`);

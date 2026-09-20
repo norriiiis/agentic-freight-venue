@@ -87,26 +87,35 @@ export function verifyEquivocationProof(p: EquivocationProof, witnessKeys: Witne
   return !!ka && !!kb && verifyReceipt(a, ka.publicKey) && verifyReceipt(b, kb.publicKey);
 }
 
+/** What a verifier demands of the witnesses on a head. `required` names witnesses that MUST be among them (a counterparty, an insurer, oneself). */
+export interface WitnessPolicy {
+  minWitnesses?: number;
+  required?: string[];
+}
+
 /**
  * From a publication and a set of pinned witness keys: which pinned witnesses
  * cosigned the witnessed head, and the time up to which the publication is
  * known complete. With `minWitnesses` = k, that time is the k-th latest
- * receipt time — at least k independent witnesses vouch for it — and `quorum`
- * says whether k was reached. Receipts by unknown or mismatching keys are
- * ignored.
+ * receipt time — at least k independent witnesses vouch for it. `quorum` is
+ * true only if k was reached AND every `required` witness is among them.
+ * Receipts by unknown or mismatching keys are ignored.
  */
-export function witnessedAsOf(pub: Pick<Witnessed, "witnessed" | "venueId">, witnessKeys: WitnessKey[], minWitnesses = 1): { at?: Date; by: string[]; head?: LedgerHead; quorum: boolean } {
-  if (!pub.witnessed) return { by: [], quorum: false };
+export function witnessedAsOf(pub: Pick<Witnessed, "witnessed" | "venueId">, witnessKeys: WitnessKey[], policy: number | WitnessPolicy = 1): { at?: Date; by: string[]; head?: LedgerHead; quorum: boolean; missingRequired: string[] } {
+  const pol: WitnessPolicy = typeof policy === "number" ? { minWitnesses: policy } : policy;
+  const k = Math.max(1, pol.minWitnesses ?? 1);
+  const required = pol.required ?? [];
+  if (!pub.witnessed) return { by: [], quorum: false, missingRequired: required };
   const good = pub.witnessed.receipts.filter((r) => {
-    const k = witnessKeys.find((w) => w.witnessId === r.witnessId);
-    return !!k && r.venueId === pub.venueId && r.seq === pub.witnessed!.head.seq && r.hash === pub.witnessed!.head.hash && verifyReceipt(r, k.publicKey);
+    const key = witnessKeys.find((w) => w.witnessId === r.witnessId);
+    return !!key && r.venueId === pub.venueId && r.seq === pub.witnessed!.head.seq && r.hash === pub.witnessed!.head.hash && verifyReceipt(r, key.publicKey);
   });
-  // one receipt per witness: its latest
   const latestBy = new Map<string, WitnessReceipt>();
   for (const r of good) if (!latestBy.has(r.witnessId) || new Date(r.at) > new Date(latestBy.get(r.witnessId)!.at)) latestBy.set(r.witnessId, r);
+  const by = [...latestBy.keys()];
+  const missingRequired = required.filter((id) => !latestBy.has(id));
   const times = [...latestBy.values()].map((r) => new Date(r.at).getTime()).sort((x, y) => y - x);
-  const k = Math.max(1, minWitnesses);
-  if (times.length === 0) return { by: [], quorum: false, head: pub.witnessed.head };
-  const quorum = times.length >= k;
-  return { at: quorum ? new Date(times[k - 1]!) : undefined, by: [...latestBy.keys()], head: pub.witnessed.head, quorum };
+  const quorum = times.length >= k && missingRequired.length === 0;
+  if (times.length === 0) return { by, quorum: false, head: pub.witnessed.head, missingRequired };
+  return { at: quorum ? new Date(times[Math.min(k, times.length) - 1]!) : undefined, by, head: pub.witnessed.head, quorum, missingRequired };
 }

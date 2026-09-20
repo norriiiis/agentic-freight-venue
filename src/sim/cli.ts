@@ -24,7 +24,7 @@ const json = has("--json");
 const ROOT = resolve(import.meta.dirname, "../..");
 const RUN_ROOT = join(ROOT, ".sim", new Date().toISOString().replace(/[:.]/g, "-"));
 
-const ROLES: Record<string, string> = { "witness-1": "WITNESS", "witness-2": "WITNESS2", "northline-broker-agent": "BROKER", "prairie-wind-carrier-agent": "CARRIER", "blue-mesa-carrier-agent": "CARRIER2", "spoof-carrier-agent": "SPOOFER", "quikhaul-agent": "quikhaul", venue: "venue" };
+const ROLES: Record<string, string> = { "witness-1": "WITNESS", "witness-2": "WITNESS2", "witness-3": "WITNESS3", "northline-broker-agent": "BROKER", "prairie-wind-carrier-agent": "CARRIER", "blue-mesa-carrier-agent": "CARRIER2", "spoof-carrier-agent": "SPOOFER", "quikhaul-agent": "quikhaul", venue: "venue" };
 
 async function runScenario(sc: Scenario, index: number): Promise<{ res: ScenarioResult; pass: boolean; workspace: string }> {
   const workspace = join(RUN_ROOT, sc.id);
@@ -35,7 +35,7 @@ async function runScenario(sc: Scenario, index: number): Promise<{ res: Scenario
   console.log(`  ${sc.summary}\n`);
   try {
     const res = await sc.run({ h, say: (l) => { notes.push(l); console.log(`  ▸ ${l}`); } });
-    const wire = renderWire(await h.venue.messages(), ROLES, ["happy-path", "non-convergence", "exposure-mid-negotiation", "insurance-lapsed", "negotiation-timeout", "key-rotation", "venue-key-rotation", "root-key-rotation", "status-timestamping", "witness-equivocation"].includes(sc.id) ? res.taskId : undefined);
+    const wire = renderWire(await h.venue.messages(), ROLES, ["happy-path", "non-convergence", "exposure-mid-negotiation", "insurance-lapsed", "negotiation-timeout", "key-rotation", "venue-key-rotation", "root-key-rotation", "status-timestamping", "witness-equivocation", "witness-collusion"].includes(sc.id) ? res.taskId : undefined);
     if (wire.length) {
       console.log("\n  wire (venue log):");
       for (const l of wire) console.log(l);

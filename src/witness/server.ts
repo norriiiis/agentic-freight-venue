@@ -20,11 +20,16 @@ startServer(port, {
     "GET /health": async () => ok({ ok: true, ...w.status() }),
     "GET /receipts": async () => ok(w.receipts()),
     "GET /latest": async () => ok(w.latestReceipt() ?? null),
+    /** A receipt for a position this witness verified, signed on demand — how a peer that is behind compares at a common seq. */
+    "GET /receipt-for": async (req) => { const seq = Number(new URL(req.url ?? "/", "http://localhost").searchParams.get("seq")); return ok(Number.isInteger(seq) ? w.receiptFor(seq) ?? null : null); },
     "GET /forks": async () => ok(w.forks()),
     "GET /equivocations": async () => ok(w.equivocations()),
     "POST /poll": async () => ok(await w.poll()),
     "POST /gossip-now": async () => ok(await w.gossip()),
     "POST /peers": async (_r, b) => { w.addPeers((b as { peers: WitnessPeer[] }).peers); return ok({ peers: w.peers.map((p) => p.witnessId) }); },
+    /** SIM fault: make this witness collude — it will sign any head it is handed. */
+    "POST /fault": async (_r, b) => { w.signAnything = !!(b as { signAnything?: boolean }).signAnything; return ok({ colluding: w.signAnything }); },
+    "POST /sign": async (_r, b) => { const { venueId, head } = b as { venueId: string; head: { seq: number; hash: string; ts: string } }; return ok({ receipt: w.signBlindly(venueId, head) ?? null }); },
     "POST /gossip": async (_r, b) => ok({ proof: w.receiveGossip((b as { receipt: WitnessReceipt }).receipt) ?? null }),
     "POST /equivocation": async (_r, b) => ok({ accepted: w.receiveProof((b as { proof: EquivocationProof }).proof) }),
   },

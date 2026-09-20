@@ -107,11 +107,20 @@ export class VenueService {
     return { venueId: this.config.venueId, seq: h.seq, hash: h.hash, ts: h.ts };
   }
 
-  /** Accept a witness receipt for a head that exists in this ledger, from a registered witness. */
+  /** The key a witness id signs with: a registered independent witness, or a registered AGENT (a party witnessing its own transactions) — any key in its credential lineage. */
+  private witnessKeysFor(witnessId: string): OkpJwk[] {
+    const w = this.state.witnesses.find((x) => x.witnessId === witnessId);
+    if (w) return [w.publicKey];
+    const reg = this.state.agents.get(witnessId);
+    if (!reg) return [];
+    return [reg.credentialId, ...(reg.previousCredentialIds ?? [])].map((id) => this.issuer.get(id)?.subject.publicKey).filter((k): k is OkpJwk => !!k);
+  }
+
+  /** Accept a witness receipt for a head that exists in this ledger, from a registered witness or a registered agent (party witness). */
   acceptWitnessReceipt(r: WitnessReceipt): { ok: true; seq: number } {
-    const w = this.state.witnesses.find((x) => x.witnessId === r.witnessId);
-    if (!w) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "unknown witness", witnessId: r.witnessId });
-    if (r.venueId !== this.config.venueId || !verifyReceipt(r, w.publicKey)) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "witness receipt does not verify", witnessId: r.witnessId });
+    const keys = this.witnessKeysFor(r.witnessId);
+    if (keys.length === 0) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "unknown witness", witnessId: r.witnessId });
+    if (r.venueId !== this.config.venueId || !keys.some((k) => verifyReceipt(r, k))) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "witness receipt does not verify", witnessId: r.witnessId });
     const e = this.ledger.find((x) => x.seq === r.seq);
     if (!e || e.hash !== r.hash) {
       // SIM equivocation fault: the receipt may name a head of the fork shown to this witness — keep it in the second book.
@@ -1055,19 +1064,19 @@ export class VenueService {
   }
 
   /** SIM-ONLY fault injection: die at a named point inside a commit. Never present in a deployed venue. */
-  simFault?: { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessId: string; fromSeq: number } };
+  simFault?: { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number } };
   /** SIM-ONLY: receipts the fooled witness gave for heads of the fork view — the venue's second book. */
   private forkReceipts: Record<string, WitnessReceipt[]> = {};
 
   /** The ledger as seen by a given requester: the real chain, or (under the equivocation fault) the fork shown to one witness. */
   ledgerViewFor(requester?: string): LedgerEntry[] {
     const f = this.simFault?.equivocate;
-    if (f && requester && requester === f.witnessId) return this.ledger.forkView(f.fromSeq, (e) => e.type === "CREDENTIAL_STATUS");
+    if (f && requester && f.witnessIds.includes(requester)) return this.ledger.forkView(f.fromSeq, (e) => e.type === "CREDENTIAL_STATUS");
     return this.ledger.all();
   }
   private isForkedFor(requester?: string): boolean {
     const f = this.simFault?.equivocate;
-    return !!f && !!requester && requester === f.witnessId;
+    return !!f && !!requester && f.witnessIds.includes(requester);
   }
   private crashIf(point: string) {
     if (process.env.SIM_MODE === "1" && this.simFault?.crashAt === point) {

@@ -94,6 +94,18 @@ export function buildArtifact(
   return { ...content, venueAttestations: [attest(content, venueKp)] };
 }
 
+/**
+ * The two parties as witnesses: their credential-bound keys, straight from the
+ * artifact. A verifier who is one of the parties pins the other's key because
+ * it TRANSACTED with it — no trust in the venue is needed to do so.
+ */
+export function partyWitnessKeys(a: CommitmentArtifact): WitnessKey[] {
+  return [
+    { witnessId: a.credentials.broker.subject.agentId, publicKey: a.credentials.broker.subject.publicKey },
+    { witnessId: a.credentials.carrier.subject.agentId, publicKey: a.credentials.carrier.subject.publicKey },
+  ];
+}
+
 /** Re-attest an existing artifact under a (new) venue key, optionally swapping in re-issued credentials and adding the certs a verifier will need. */
 export function reattestArtifact(a: CommitmentArtifact, venueKp: KeyPair, opts: { credentials?: CommitmentArtifact["credentials"]; addCerts?: VenueKeyCert[] } = {}): CommitmentArtifact {
   const certs = [...a.venue.certs];
@@ -141,12 +153,16 @@ export type KeyHistoryInput = Partial<Pick<VenueKeyHistory, "certs" | "revocatio
  * With the ledger too, it checks the list is complete up to that witnessed head.
  * `minWitnesses` (default 1) is the quorum: that many distinct pinned witnesses
  * must have cosigned the SAME head — a venue showing different ledgers to
- * different witnesses cannot assemble one. `equivocationProofs` are witness-
- * signed proofs that it did; any valid one for this venue voids everything.
+ * different witnesses cannot assemble one. `requiredWitnesses` names witnesses
+ * that must be among them: the counterparty (whose key is in this artifact —
+ * see partyWitnessKeys), the verifier itself, its insurer. A venue that
+ * controls k witnesses defeats "any k"; it cannot conjure a named one.
+ * `equivocationProofs` are witness-signed proofs of a split view; any valid
+ * one for this venue voids everything.
  */
 export function verifyArtifact(
   a: CommitmentArtifact,
-  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; minWitnesses?: number; equivocationProofs?: EquivocationProof[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
+  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; minWitnesses?: number; requiredWitnesses?: string[]; equivocationProofs?: EquivocationProof[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
 ): ArtifactVerification {
   const checks: ArtifactCheck[] = [];
   const push = (name: string, ok: boolean, detail?: string) => checks.push({ name, ok, detail });
@@ -164,9 +180,9 @@ export function verifyArtifact(
     const judge = (label: "status" | "keys", pub: Partial<Witnessed> | undefined) => {
       if (!pub) return;
       if (!pub.venueId || pub.witnessed === undefined) { push(`${label}.witnessed`, false, "publication carries no witnessed head (pre-witness format or stripped)"); return; }
-      const w = witnessedAsOf({ venueId: pub.venueId, witnessed: pub.witnessed }, opts.witnessKeys!, k);
+      const w = witnessedAsOf({ venueId: pub.venueId, witnessed: pub.witnessed }, opts.witnessKeys!, { minWitnesses: k, required: opts.requiredWitnesses });
       push(`${label}.witnessed`, w.by.length > 0, w.by.length ? `head seq ${w.head!.seq} cosigned by ${w.by.join(", ")}` : "no receipt by a pinned witness");
-      if (k > 1 || w.by.length) push(`${label}.witness-quorum`, w.quorum, w.quorum ? `${w.by.length} of ${k} required pinned witnesses cosigned the same head` : `only ${w.by.length} pinned witness(es) cosigned this head; ${k} required — a venue showing different ledgers to different witnesses cannot assemble a quorum on one head`);
+      if (k > 1 || w.by.length || opts.requiredWitnesses?.length) push(`${label}.witness-quorum`, w.quorum, w.quorum ? `${w.by.length} pinned witness(es) on the same head (min ${k}${opts.requiredWitnesses?.length ? `, required: ${opts.requiredWitnesses.join(", ")}` : ""})` : w.missingRequired.length ? `required witness(es) have NOT cosigned this head: ${w.missingRequired.join(", ")} — the venue cannot conjure a named witness's signature` : `only ${w.by.length} pinned witness(es) cosigned this head; ${k} required — a venue showing different ledgers to different witnesses cannot assemble a quorum on one head`);
       if (!w.at) return;
       if (w.at) {
         push(`${label}.fresh-as-of`, w.at >= needed, w.at >= needed ? `witnessed ${w.at.toISOString()}, judging ${asOf.toISOString()}${tolerance ? ` (tolerance ${tolerance}ms)` : " (strict)"}` : `witnessed only until ${w.at.toISOString()}; nothing after that is known — asked about ${asOf.toISOString()}${tolerance ? ` with ${tolerance}ms tolerance` : " (strict)"}`);
