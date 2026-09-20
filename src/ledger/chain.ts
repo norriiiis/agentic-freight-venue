@@ -6,7 +6,7 @@
  * Storage is a JSONL file — sufficient for a prototype, and the first thing
  * to replace at scale (see README).
  */
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { appendDurable } from "../protocol/fsatomic";
 import { canonicalize, sha256Hex } from "../protocol/canonical";
@@ -25,7 +25,8 @@ export type LedgerEntryType =
   | "VOID"
   | "KEY_ROTATION"   // carries the successor's root-signed certificate (+ revocation of the predecessor); signed by the SUCCESSOR
   | "RESEAL"         // after a compromise: the new key affirms a range of earlier entries as genuine
-  | "REATTESTATION"; // after a compromise: a commitment artifact re-attested under the new key
+  | "REATTESTATION"  // after a compromise: a commitment artifact re-attested under the new key
+  | "CREDENTIAL_STATUS"; // an agent credential revoked or superseded: the status list is a projection of these
 
 export interface LedgerEntry {
   seq: number;
@@ -72,6 +73,15 @@ export class Ledger {
   }
   all(): LedgerEntry[] {
     return [...this.entries];
+  }
+  /** Entries from `fromSeq` (inclusive) — what a witness fetches to check that a new head extends the last one it saw. */
+  slice(fromSeq: number): LedgerEntry[] {
+    return this.entries.filter((e) => e.seq >= fromSeq);
+  }
+  /** SIM-ONLY: rewrite history by dropping every entry after `seq`. Models a compromised venue rolling back its log. */
+  truncate(seq: number) {
+    this.entries = this.entries.filter((e) => e.seq <= seq);
+    writeFileSync(this.path, this.entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
   }
   find(pred: (e: LedgerEntry) => boolean): LedgerEntry | undefined {
     return this.entries.find(pred);

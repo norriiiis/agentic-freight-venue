@@ -21,6 +21,7 @@ export const RULES: BoundaryRule[] = [
   { scope: "agents/carrier", allowed: ["protocol", "mandate", "agentkit", "agents/carrier"] },
   { scope: "agentkit", allowed: ["protocol", "mandate", "agentkit"] },
   { scope: "venue", allowed: ["protocol", "mandate", "identity", "underwriting", "ledger", "venue"] },
+  { scope: "witness", allowed: ["protocol", "ledger", "witness"] },
   { scope: "mandate", allowed: ["protocol", "mandate"] },
   { scope: "protocol", allowed: ["protocol"] },
 ];

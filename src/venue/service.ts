@@ -15,6 +15,9 @@ import { A2A_PROTOCOL_VERSION, FREIGHT_EXTENSION_URI, RPC_ERR, TERMINAL_STATES, 
 import { canonicalize, hashObject } from "../protocol/canonical";
 import { importPublicKey, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import { VenueKeyRing } from "./keyring";
+import { verifyReceipt, type LedgerHead, type WitnessKey, type WitnessReceipt, type Witnessed } from "../protocol/witness";
+import type { CredentialStatusEntry } from "../protocol/types";
+import { signJws } from "../protocol/crypto";
 import { verifyCert, verifyRevocation, verifyRootEventSelf, rootCommitment, type RootEvent, type VenueKeyCert, type VenueKeyRevocation } from "../protocol/venue-keys";
 import { buildMessage, venueSignMessage, type SignedMeta, type VenueAttachment } from "../protocol/envelope";
 import { loadFingerprint, termsHash, textDigest, validateNegotiationPayload, type AcceptPayload, type CounterPayload, type NegotiationPayload, type RejectPayload, type TenderPayload, type Terms } from "../protocol/freight";
@@ -49,6 +52,8 @@ export interface VenueConfig {
   /** Deliveries abandoned to the dead-letter queue after this many attempts (agents can still pull via tasks/get). */
   outboxMaxAttempts: number;
   underwriting?: Partial<UnderwritingParams>;
+  /** Independent witnesses whose receipts are accepted. Configured by the operator; a witness key is never minted by the venue. */
+  witnesses?: WitnessKey[];
 }
 
 export class Refusal extends Error {
@@ -79,6 +84,85 @@ export class VenueService {
     this.underwriting = new UnderwritingEngine(config.dataDir, { ...DEFAULT_PARAMS, ...config.underwriting });
     this.audit = new AuditLog(join(config.dataDir, "audit.jsonl"));
     this.state = new VenueState(config.dataDir);
+    for (const w of config.witnesses ?? []) this.registerWitness(w);
+  }
+
+  // ------------------------------------------------------- witnessed heads
+  //
+  // The ledger is the source of truth; the published status list and key
+  // history are projections of it at a head. Independent witnesses cosign
+  // heads with their own clocks; the venue merely stores and republishes
+  // their receipts. See protocol/witness.ts.
+
+  registerWitness(w: WitnessKey) {
+    if (!this.state.witnesses.some((x) => x.witnessId === w.witnessId)) {
+      this.state.witnesses.push(w);
+      this.state.persist();
+      this.audit.write({ component: "venue.identity", event: "witness-registered", outcome: "INFO", evidence: { witnessId: w.witnessId, kid: w.publicKey.kid } });
+    }
+  }
+
+  ledgerHead(): LedgerHead & { venueId: string } {
+    const h = this.ledger.head;
+    return { venueId: this.config.venueId, seq: h.seq, hash: h.hash, ts: h.ts };
+  }
+
+  /** Accept a witness receipt for a head that exists in this ledger, from a registered witness. */
+  acceptWitnessReceipt(r: WitnessReceipt): { ok: true; seq: number } {
+    const w = this.state.witnesses.find((x) => x.witnessId === r.witnessId);
+    if (!w) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "unknown witness", witnessId: r.witnessId });
+    if (r.venueId !== this.config.venueId || !verifyReceipt(r, w.publicKey)) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "witness receipt does not verify", witnessId: r.witnessId });
+    const e = this.ledger.find((x) => x.seq === r.seq);
+    if (!e || e.hash !== r.hash) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "receipt names a head this ledger does not have", seq: r.seq, hash: r.hash.slice(0, 12) });
+    const list = (this.state.witnessReceipts[r.hash] ??= []);
+    if (!list.some((x) => x.witnessId === r.witnessId && x.at === r.at)) list.push(r);
+    this.state.persist();
+    this.audit.write({ component: "ledger", event: "witnessed", outcome: "INFO", evidence: { witnessId: r.witnessId, seq: r.seq, hash: r.hash.slice(0, 12), witnessAt: r.at } });
+    return { ok: true, seq: r.seq };
+  }
+
+  /** The highest head in the CURRENT ledger that a witness has cosigned. After a rollback this is the last surviving one — the tell. */
+  latestWitnessedHead(): Witnessed["witnessed"] {
+    for (const e of [...this.ledger.all()].sort((a, b) => b.seq - a.seq)) {
+      const rs = this.state.witnessReceipts[e.hash];
+      if (rs && rs.length) return { head: { seq: e.seq, hash: e.hash, ts: e.ts }, receipts: rs };
+    }
+    return null;
+  }
+
+  private witnessedEnvelope(): Witnessed {
+    const h = this.ledger.head;
+    return { venueId: this.config.venueId, asOf: new Date().toISOString(), head: { seq: h.seq, hash: h.hash, ts: h.ts }, witnessed: this.latestWitnessedHead() };
+  }
+
+  /** The credential status list: every CREDENTIAL_STATUS entry on the ledger up to the head, plus the witnessed head, signed by the venue. */
+  publishedStatusList(): Witnessed & { entries: CredentialStatusEntry[]; kid: string; signature: string } {
+    const body = { ...this.witnessedEnvelope(), entries: this.ledger.all().filter((e) => e.type === "CREDENTIAL_STATUS").map((e) => (e.payload as { status: CredentialStatusEntry }).status) };
+    return { ...body, kid: this.kp.kid, signature: signJws(body, this.kp, { typ: "credential-status+jws" }, true) };
+  }
+
+  /** The key history with the witnessed head, signed by the venue. */
+  publishedKeyHistory() {
+    const body = { ...this.witnessedEnvelope(), ...this.keys.history() };
+    return { ...body, kid: this.kp.kid, signature: signJws(body, this.kp, { typ: "venue-keys+jws" }, true) };
+  }
+
+  /** Record a credential status change on the ledger (idempotent by credentialId + status + at). */
+  private recordCredentialStatus(st: CredentialStatusEntry): LedgerEntry {
+    const existing = this.ledger.find((e) => e.type === "CREDENTIAL_STATUS" && (e.payload as { status: CredentialStatusEntry }).status.credentialId === st.credentialId && (e.payload as { status: CredentialStatusEntry }).status.status === st.status && (e.payload as { status: CredentialStatusEntry }).status.at === st.at);
+    return existing ?? this.ledger.append("CREDENTIAL_STATUS", { status: st });
+  }
+
+  /** Revoke an agent credential: issuer record + ledger entry. */
+  revokeCredential(agentId: string, reason: string, evidence?: Record<string, unknown>): CredentialStatusEntry | undefined {
+    const reg = this.state.agents.get(agentId);
+    if (!reg) return undefined;
+    const entry = this.issuer.revoke(reg.credentialId, reason, evidence);
+    if (entry) {
+      this.recordCredentialStatus(entry);
+      this.audit.write({ component: "venue.identity", event: "revoke", outcome: "INFO", subject: agentId, evidence: { ...entry } });
+    }
+    return entry;
   }
 
   /** The current operational signing key. Read it fresh every time; it changes on rotation. */
@@ -175,6 +259,7 @@ export class VenueService {
     reg.card = params.newCard;
     reg.rotatedAt = new Date().toISOString();
     this.state.persist();
+    this.recordCredentialStatus(res.superseded);
     this.audit.write({ component: "venue.identity", event: "rotate", outcome: "ALLOWED", subject: reg.agentId, evidence: { reason: params.claims.reason, authorizedBy: params.authorization.kind, oldCredentialId: res.superseded.credentialId, newCredentialId: res.credential.credentialId, oldKid: this.issuer.get(res.superseded.credentialId)?.subject.publicKey.kid, newKid: res.credential.subject.publicKey.kid, graceUntil: res.superseded.graceUntil, compromisedAt: res.superseded.compromisedAt } });
     let voided: string[] = [];
     if (res.superseded.compromisedAt) voided = (await this.voidUnderCompromisedKey(res.superseded.credentialId, new Date(res.superseded.compromisedAt))).map((c) => c.commitmentId);
@@ -352,6 +437,8 @@ export class VenueService {
           return await this.keyRotationCommit(params as { cert: VenueKeyCert; revocation?: VenueKeyRevocation });
         case "venue/root-rotation/commit":
           return await this.rootRotationCommit(params as { event: RootEvent; recert?: VenueKeyCert });
+        case "venue/witness":
+          return this.acceptWitnessReceipt((params as { receipt: WitnessReceipt }).receipt);
         case "message/send": {
           const m = (params as { message: Message }).message;
           return await this.ingest(m);
@@ -923,6 +1010,14 @@ export class VenueService {
       retried.push(t.task.id);
       await this.commit(t, accept.terms);
     }
+    // Every credential status the issuer holds must be on the ledger (a crash between the two leaves it off).
+    let statusesReconciled = 0;
+    for (const st of this.issuer.statusList()) {
+      const before = this.ledger.head.seq;
+      this.recordCredentialStatus(st);
+      if (this.ledger.head.seq !== before) statusesReconciled += 1;
+    }
+    if (statusesReconciled) this.audit.write({ component: "ledger", event: "recovery", outcome: "INFO", evidence: { credentialStatusesReconciled: statusesReconciled } });
     // Multi-tender losers of any ACTIVE commitment that are somehow still open (a crash between the
     // snapshot and the journal delete cannot cause this any more, but recovery must not depend on that).
     let siblingsCanceled = 0;

@@ -13,6 +13,7 @@
  */
 import { startServer, type HttpRoute } from "../protocol/rpc";
 import { VenueService } from "./service";
+import type { WitnessKey } from "../protocol/witness";
 
 const config = {
   venueId: process.env.VENUE_ID ?? "venue-local",
@@ -24,6 +25,7 @@ const config = {
   replyTimeoutMs: Number(process.env.VENUE_REPLY_TIMEOUT_MS ?? 120_000),
   outboxMaxAttempts: Number(process.env.VENUE_OUTBOX_MAX_ATTEMPTS ?? 40),
   underwriting: process.env.VENUE_UW_PARAMS ? JSON.parse(process.env.VENUE_UW_PARAMS) : undefined,
+  witnesses: process.env.VENUE_WITNESSES ? JSON.parse(process.env.VENUE_WITNESSES) : undefined,
 };
 const venue = new VenueService(config);
 const simMode = process.env.SIM_MODE === "1";
@@ -36,11 +38,20 @@ setInterval(() => {
 const ok = (body: unknown) => ({ status: 200, body });
 const routes: Record<string, HttpRoute> = {
   "GET /health": async () => ok({ ok: true, venueId: config.venueId, kid: venue.kp.kid, rootKid: venue.keys.rootPublicKey.kid }),
-  /** Published venue key history: root + every root-signed certificate and revocation. Pin the root; verify the rest. */
-  "GET /.well-known/venue-keys.json": async () => ok(venue.keys.history()),
+  /** Published venue key history: root log + every root-signed certificate and revocation, with the witnessed ledger head. Pin a root; verify the rest. */
+  "GET /.well-known/venue-keys.json": async () => ok(venue.publishedKeyHistory()),
+  /** The current ledger head, for witnesses. */
+  "GET /.well-known/ledger-head.json": async () => ok(venue.ledgerHead()),
+  /** The ledger is public and auditable. `?from=seq` for a witness checking that a new head extends the last one it cosigned. */
+  "GET /ledger.jsonl": async (req) => {
+    const u = new URL(req.url ?? "/", "http://localhost");
+    const from = Number(u.searchParams.get("from") ?? 0);
+    return ok(venue.ledger.slice(Number.isFinite(from) ? from : 0));
+  },
   "GET /.well-known/agent-card.json": async () => ok(venue.agentCard()),
   /** Published credential status list (revocations + supersessions): what an offline verifier needs to judge old signatures. */
-  "GET /.well-known/credential-status.json": async () => ok(venue.issuer.signedStatusList()),
+  /** Published credential status list: a projection of the ledger's CREDENTIAL_STATUS entries at a head, with the witnessed head. */
+  "GET /.well-known/credential-status.json": async () => ok(venue.publishedStatusList()),
 };
 
 if (simMode) {
@@ -54,10 +65,8 @@ if (simMode) {
     },
     "POST /admin/credential/revoke": async (_r, b) => {
       const { agentId, reason, evidence } = b as { agentId: string; reason: string; evidence?: Record<string, unknown> };
-      const reg = venue.state.agents.get(agentId);
-      if (!reg) return { status: 404, body: { error: "unknown agent" } };
-      const entry = venue.issuer.revoke(reg.credentialId, reason, evidence);
-      venue.audit.write({ component: "venue.identity", event: "revoke", outcome: "INFO", subject: agentId, evidence: { ...entry } });
+      const entry = venue.revokeCredential(agentId, reason, evidence);
+      if (!entry) return { status: 404, body: { error: "unknown agent" } };
       return ok({ ok: true, revocation: entry });
     },
     "POST /admin/underwriting/seed-exposure": async (_r, b) => {
@@ -97,6 +106,15 @@ if (simMode) {
     "GET /admin/guarantees": async () => ok(venue.underwriting.allGuarantees()),
     "GET /admin/public-key": async () => ok(venue.kp.publicJwk),
     "GET /admin/venue-keys": async () => ok(venue.keys.history()),
+    "POST /admin/witnesses": async (_r, b) => { venue.registerWitness(b as WitnessKey); return ok({ ok: true, witnesses: venue.state.witnesses.map((w) => w.witnessId) }); },
+    /** Rollback fault: a compromised venue rewriting its own history. Drops every ledger entry after `seq`. */
+    "POST /admin/ledger/truncate": async (_r, b) => {
+      const { seq } = b as { seq: number };
+      const before = venue.ledger.head.seq;
+      venue.ledger.truncate(seq);
+      venue.audit.write({ component: "sim", event: "ledger-rollback", outcome: "INFO", evidence: { fromSeq: before, toSeq: venue.ledger.head.seq } });
+      return ok({ ok: true, head: venue.ledgerHead(), witnessed: venue.latestWitnessedHead()?.head ?? null });
+    },
     "GET /admin/credential-status": async () => ok(venue.issuer.statusList()),
   };
   Object.assign(routes, admin);

@@ -23,6 +23,8 @@ import { verifyMessageSignature } from "../protocol/envelope";
 import { termsHash, type AcceptPayload, type Terms } from "../protocol/freight";
 import type { Credential, CredentialStatusEntry } from "../protocol/types";
 import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyHistory } from "../protocol/venue-keys";
+import { witnessedAsOf, type WitnessKey, type Witnessed } from "../protocol/witness";
+import { verifyChain, type LedgerEntry } from "./chain";
 import type { ReasonCode } from "../protocol/reasons";
 
 export interface GuaranteeSummary {
@@ -112,6 +114,8 @@ export interface ArtifactVerification {
   ok: boolean;
   reasonCode?: ReasonCode;
   checks: ArtifactCheck[];
+  /** When pinned witnesses vouch for the status list / key history: the time up to which they are known complete. */
+  witnessed?: { statusAsOf?: string; keysAsOf?: string; by: string[] };
   summary: { loadRef: string; rateUsd: number; broker: string; carrier: string; guaranteed: boolean };
 }
 
@@ -122,9 +126,61 @@ export interface ArtifactVerification {
  * agent-key compromises; without them, a compromise declared after signing is
  * invisible offline. Every check is reported, not just the first failure.
  */
-export function verifyArtifact(a: CommitmentArtifact, opts: { pinnedRootKey?: OkpJwk; keyHistory?: Partial<Pick<VenueKeyHistory, "certs" | "revocations" | "rootLog">>; statusList?: CredentialStatusEntry[]; now?: Date } = {}): ArtifactVerification {
+export type StatusListInput = CredentialStatusEntry[] | (Partial<Witnessed> & { entries: CredentialStatusEntry[] });
+export type KeyHistoryInput = Partial<Pick<VenueKeyHistory, "certs" | "revocations" | "rootLog">> & Partial<Witnessed>;
+
+/**
+ * Freshness. A status list or key history says nothing about events after the
+ * moment it was taken. With pinned WITNESS keys the verifier learns the latest
+ * time W an independent party cosigned the head the list projects, and
+ * requires W ≥ asOf − maxStalenessMs — otherwise a later revocation or
+ * compromise would be invisible and the verdict is STATUS_STALE, not "trusted".
+ * `asOf` is the moment being judged (a pickup, a claim, the commitment; default
+ * now); a witness receipt is always in the past, so judging "now" needs a
+ * tolerance (default 15 minutes) and judging a past moment can be strict (0).
+ * With the ledger too, it checks the list is complete up to that witnessed head.
+ */
+export function verifyArtifact(
+  a: CommitmentArtifact,
+  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
+): ArtifactVerification {
   const checks: ArtifactCheck[] = [];
   const push = (name: string, ok: boolean, detail?: string) => checks.push({ name, ok, detail });
+  const statusEntries: CredentialStatusEntry[] | undefined = Array.isArray(opts.statusList) ? opts.statusList : opts.statusList?.entries;
+  const statusPub = opts.statusList && !Array.isArray(opts.statusList) ? opts.statusList : undefined;
+  const keysPub = opts.keyHistory;
+  const witnessed: ArtifactVerification["witnessed"] = opts.witnessKeys ? { by: [] } : undefined;
+  if (opts.witnessKeys) {
+    const asOf = opts.asOf ?? opts.now ?? new Date();
+    const tolerance = opts.maxStalenessMs ?? 15 * 60_000;
+    const needed = new Date(asOf.getTime() - tolerance);
+    const judge = (label: "status" | "keys", pub: Partial<Witnessed> | undefined) => {
+      if (!pub) return;
+      if (!pub.venueId || pub.witnessed === undefined) { push(`${label}.witnessed`, false, "publication carries no witnessed head (pre-witness format or stripped)"); return; }
+      const w = witnessedAsOf({ venueId: pub.venueId, witnessed: pub.witnessed }, opts.witnessKeys!);
+      push(`${label}.witnessed`, !!w.at, w.at ? `head seq ${w.head!.seq} cosigned by ${w.by.join(", ")} at ${w.at.toISOString()}` : "no receipt by a pinned witness");
+      if (w.at) {
+        push(`${label}.fresh-as-of`, w.at >= needed, w.at >= needed ? `witnessed ${w.at.toISOString()}, judging ${asOf.toISOString()}${tolerance ? ` (tolerance ${tolerance}ms)` : " (strict)"}` : `witnessed only until ${w.at.toISOString()}; nothing after that is known — asked about ${asOf.toISOString()}${tolerance ? ` with ${tolerance}ms tolerance` : " (strict)"}`);
+        if (label === "status") witnessed!.statusAsOf = w.at.toISOString();
+        else witnessed!.keysAsOf = w.at.toISOString();
+        for (const b of w.by) if (!witnessed!.by.includes(b)) witnessed!.by.push(b);
+      }
+      if (opts.ledger && w.head) {
+        const chain = verifyChain(opts.ledger, { rootPublicKey: opts.pinnedRootKey ?? a.venue.rootPublicKey, revocations: keysPub?.revocations });
+        const at = opts.ledger.find((e) => e.seq === w.head!.seq);
+        const headOk = !!at && at.hash === w.head.hash;
+        if (label === "status" && statusEntries) {
+          const onLedger = opts.ledger.filter((e) => e.type === "CREDENTIAL_STATUS" && e.seq <= w.head!.seq).map((e) => (e.payload as { status: CredentialStatusEntry }).status);
+          const missing = onLedger.filter((x) => !statusEntries.some((y) => y.credentialId === x.credentialId && y.status === x.status && y.at === x.at));
+          push("status.complete-to-witnessed-head", chain.ok && headOk && missing.length === 0, !chain.ok ? `ledger: ${chain.error}` : !headOk ? "witnessed head is not in the supplied ledger" : missing.length ? `${missing.length} status entr${missing.length === 1 ? "y" : "ies"} on the ledger before the witnessed head are missing from the list` : `${onLedger.length} status entries, all present`);
+        } else if (label === "keys") {
+          push("keys.complete-to-witnessed-head", chain.ok && headOk, !chain.ok ? `ledger: ${chain.error}` : !headOk ? "witnessed head is not in the supplied ledger" : "");
+        }
+      }
+    };
+    judge("status", statusPub);
+    judge("keys", keysPub);
+  }
   const root = opts.pinnedRootKey ?? a.venue.rootPublicKey;
   // The pinned root may be older than the one the artifact names; the root log (embedded and/or supplied) must walk from it.
   const resolver = makeResolver(root, { certs: [...a.venue.certs, ...(opts.keyHistory?.certs ?? [])], revocations: opts.keyHistory?.revocations ?? [], rootLog: [...(a.venue.rootLog ?? []), ...(opts.keyHistory?.rootLog ?? [])] });
@@ -177,8 +233,8 @@ export function verifyArtifact(a: CommitmentArtifact, opts: { pinnedRootKey?: Ok
     // BEFORE the signature does — which needs the venue's published status list.
     const signedAt = new Date((msg.metadata as { ts?: string })?.ts ?? 0);
     push(`${side}.credential.valid-at-signing`, signedAt >= new Date(cred.issuedAt) && signedAt < new Date(cred.expiresAt), `signed ${signedAt.toISOString()}, valid ${cred.issuedAt}..${cred.expiresAt}`);
-    if (opts.statusList) {
-      const st = opts.statusList.find((x) => x.credentialId === cred.credentialId);
+    if (statusEntries) {
+      const st = statusEntries.find((x) => x.credentialId === cred.credentialId);
       const compromisedBefore = !!st?.compromisedAt && signedAt >= new Date(st.compromisedAt);
       const revokedBefore = st?.status === "REVOKED" && signedAt >= new Date(st.at);
       push(`${side}.credential.trusted-at-signing`, !compromisedBefore && !revokedBefore, compromisedBefore ? `key declared compromised as of ${st!.compromisedAt}, signature at ${signedAt.toISOString()}` : revokedBefore ? `revoked ${st!.at}, signature at ${signedAt.toISOString()}` : st ? `status ${st.status} (${st.reason}) after signing — does not affect this signature` : "");
@@ -186,14 +242,16 @@ export function verifyArtifact(a: CommitmentArtifact, opts: { pinnedRootKey?: Ok
   }
 
   const failed = checks.filter((c) => !c.ok);
+  const freshnessOnly = failed.length > 0 && failed.every((c) => /\.(witnessed|fresh-as-of|complete-to-witnessed-head)$/.test(c.name));
   const structural = failed.some((c) => /\.signature$|terms\.hash|-match$/.test(c.name) && !c.name.startsWith("venue.attestation["));
   const venueKeyProblem = failed.some((c) => c.name === "venue.attestation.any-trusted" || c.name.endsWith("issuer-trusted-at-issuance") || c.name === "venue.certs.signed-by-root" || c.name === "venue.root.pinned-reaches-embedded");
   const agentKeyProblem = failed.some((c) => c.name.endsWith("credential.trusted-at-signing"));
-  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
+  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
   return {
     ok: failed.length === 0,
     reasonCode,
     checks,
+    witnessed,
     summary: {
       loadRef: a.terms.loadRef,
       rateUsd: a.terms.rateUsd,

@@ -50,6 +50,9 @@ export const REASONS = {
   REPLAY_DETECTED: "Commitment record or signed message was already recorded",
   RECORD_TAMPERED: "Record content does not match its signatures or hash",
   CHAIN_BROKEN: "Ledger hash chain is inconsistent",
+  LEDGER_FORK_DETECTED: "The venue's ledger head does not extend the head this witness previously cosigned (rollback or fork)",
+  STATUS_NOT_WITNESSED: "The published status list / key history carries no head cosigned by a pinned independent witness",
+  STATUS_STALE: "The published list is witnessed only up to a time earlier than the moment being judged; later revocations or compromises would be invisible",
 
   // venue key hierarchy
   VENUE_KEY_UNTRUSTED: "A venue signature is by a key that is not certified by the venue root, or was declared compromised at that time and not re-signed",

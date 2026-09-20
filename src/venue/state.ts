@@ -19,6 +19,7 @@ import type { MandateEnvelope } from "../protocol/types";
 import type { ReasonCode } from "../protocol/reasons";
 import type { CommitmentArtifact } from "../ledger/artifact";
 import type { RootEvent, VenueKeyCert, VenueKeyRevocation } from "../protocol/venue-keys";
+import type { WitnessKey, WitnessReceipt } from "../protocol/witness";
 
 export interface RegisteredAgent {
   agentId: string;
@@ -133,6 +134,10 @@ interface Snapshot {
   deadLetter: PendingNotice[];
   /** Last moment this venue was known to be alive; recovery measures downtime from it. */
   lastAliveAt?: string;
+  /** Independent witnesses whose receipts this venue accepts (configured out of band; the venue cannot mint them). */
+  witnesses: WitnessKey[];
+  /** Receipts by ledger head hash. */
+  witnessReceipts: Record<string, WitnessReceipt[]>;
 }
 
 export class VenueState {
@@ -143,6 +148,8 @@ export class VenueState {
   outbox: PendingNotice[] = [];
   deadLetter: PendingNotice[] = [];
   lastAliveAt?: string;
+  witnesses: WitnessKey[] = [];
+  witnessReceipts: Record<string, WitnessReceipt[]> = {};
   private readonly dir: string;
   private readonly journalDir: string;
 
@@ -166,11 +173,13 @@ export class VenueState {
     this.outbox = s.outbox ?? [];
     this.deadLetter = s.deadLetter ?? [];
     this.lastAliveAt = s.lastAliveAt;
+    this.witnesses = s.witnesses ?? [];
+    this.witnessReceipts = s.witnessReceipts ?? {};
   }
   /** One atomic write. Either the whole new state is on disk or none of it. Doubles as a heartbeat. */
   persist() {
     this.lastAliveAt = new Date().toISOString();
-    const s: Snapshot = { agents: Object.fromEntries(this.agents), tasks: Object.fromEntries(this.tasks), commitments: Object.fromEntries(this.commitments), nonces: Object.fromEntries(this.nonces), outbox: this.outbox, deadLetter: this.deadLetter, lastAliveAt: this.lastAliveAt };
+    const s: Snapshot = { agents: Object.fromEntries(this.agents), tasks: Object.fromEntries(this.tasks), commitments: Object.fromEntries(this.commitments), nonces: Object.fromEntries(this.nonces), outbox: this.outbox, deadLetter: this.deadLetter, lastAliveAt: this.lastAliveAt, witnesses: this.witnesses, witnessReceipts: this.witnessReceipts };
     writeFileAtomic(this.file("snapshot.json"), JSON.stringify(s));
   }
 

@@ -20,6 +20,7 @@ export type Component =
   | "agent.carrier.mandate"
   | "agent.carrier.strategy"
   | "agent.carrier.runtime"
+  | "witness"
   | "sim";
 
 export interface AuditEntry {

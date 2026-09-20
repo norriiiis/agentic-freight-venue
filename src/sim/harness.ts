@@ -13,6 +13,8 @@ import type { Credential, CredentialStatusEntry, RotationAuthorization, Rotation
 import { buildAgentCard } from "../agentkit/runtime";
 import { importKeyPair as importKp } from "../protocol/crypto";
 import { rootCommitment, signCert, signRevocation, signRootEvent, type RootEvent, type VenueKeyCert, type VenueKeyHistory, type VenueKeyRevocation } from "../protocol/venue-keys";
+import type { LedgerHead, WitnessReceipt, Witnessed } from "../protocol/witness";
+import type { CredentialStatusEntry as CSE } from "../protocol/types";
 import { rpcCall } from "../protocol/rpc";
 import type { AgentConfig } from "../agentkit/types";
 import type { Mandate, MandateLimits } from "../mandate/types";
@@ -136,7 +138,12 @@ export class VenueHandle {
   guarantees() { return httpGet<{ guaranteeId: string; commitmentId?: string; status: string; coveredAmountUsd: number }[]>(`${this.url}/admin/guarantees`); }
   publicKey() { return httpGet<Record<string, unknown>>(`${this.url}/admin/public-key`); }
   credentialStatus() { return httpGet<CredentialStatusEntry[]>(`${this.url}/admin/credential-status`); }
-  venueKeys() { return httpGet<VenueKeyHistory>(`${this.url}/.well-known/venue-keys.json`); }
+  venueKeys() { return httpGet<VenueKeyHistory & Witnessed>(`${this.url}/.well-known/venue-keys.json`); }
+  statusList() { return httpGet<Witnessed & { entries: CSE[] }>(`${this.url}/.well-known/credential-status.json`); }
+  ledgerHead() { return httpGet<LedgerHead & { venueId: string }>(`${this.url}/.well-known/ledger-head.json`); }
+  registerWitness(w: { witnessId: string; publicKey: OkpJwk }) { return httpPost<{ ok: boolean }>(`${this.url}/admin/witnesses`, w); }
+  /** Rollback fault: drop every ledger entry after `seq` (a compromised venue rewriting its history). */
+  truncateLedger(seq: number) { return httpPost<{ head: LedgerHead; witnessed: LedgerHead | null }>(`${this.url}/admin/ledger/truncate`, { seq }); }
   /** The OPERATOR's current root key. The venue process wrote it once and never reads it back; the harness is the operator's HSM. */
   operatorRoot(): KeyPair { return importKp(JSON.parse(readFileSync(join(this.dir, "venue-root.jwk.json"), "utf8"))); }
   /** The PRE-COMMITTED next root, held even more offline. Only its hash is known to the venue process. */
@@ -222,6 +229,15 @@ export class VenueHandle {
   }
 }
 
+export class WitnessHandle {
+  constructor(readonly witnessId: string, readonly dir: string, readonly url: string, readonly proc: ChildProcess) {}
+  status() { return httpGet<{ witnessId: string; publicKey: OkpJwk; lastCosigned: LedgerHead | null; receipts: number; forks: number }>(`${this.url}/health`); }
+  poll() { return httpPost<{ receipt?: WitnessReceipt; skipped?: string; fork?: string }>(`${this.url}/poll`, {}); }
+  receipts() { return httpGet<WitnessReceipt[]>(`${this.url}/receipts`); }
+  forks() { return httpGet<{ at: string; expected: LedgerHead; observed: LedgerHead; why: string }[]>(`${this.url}/forks`); }
+  publicKeyPath() { return join(this.dir, "witness-public.jwk.json"); }
+}
+
 export interface HarnessOptions {
   workspace: string;
   quiet?: boolean;
@@ -305,6 +321,21 @@ export class Harness {
     const h2 = new AgentHandle(handle.spec, handle.dir, handle.url, proc, handle.principal, handle.mandate);
     this.agents.set(handle.spec.agentId, h2);
     return h2;
+  }
+
+  /** Start an independent witness process and register its key with the venue (in production: operator configuration). */
+  async startWitness(witnessId = "witness-1", pollMs = 400): Promise<WitnessHandle> {
+    const dir = join(this.opts.workspace, witnessId);
+    mkdirSync(dir, { recursive: true });
+    const port = await freePort();
+    const proc = spawnTs("src/witness/server.ts", { WITNESS_ID: witnessId, WITNESS_DATA_DIR: dir, WITNESS_PORT: String(port), WITNESS_VENUE_URL: this.venue.url, WITNESS_POLL_MS: String(pollMs) }, witnessId.padEnd(7).slice(0, 7), !!this.opts.quiet);
+    this.procs.push(proc);
+    const url = `http://127.0.0.1:${port}`;
+    await waitForHealth(`${url}/health`);
+    const h = new WitnessHandle(witnessId, dir, url, proc);
+    const st = await h.status();
+    await this.venue.registerWitness({ witnessId, publicKey: st.publicKey });
+    return h;
   }
 
   /** Restart the venue on the SAME data dir and port — what an operator (or supervisor) does after a crash. Recovery runs before it serves. */
