@@ -63,6 +63,20 @@
  * fooled or dishonest, and not the verifier's, who need pin nothing beyond
  * the registries. A key the registries do not list for that filer at that
  * time signs nothing the origin said (INSURER_KEY_NOT_OF_RECORD).
+ *
+ * How a filer gets INTO the directory is the last link. Two things anchor
+ * it. A filing names the filer account that submitted it (`filerId`), so
+ * "insurer of record" is the account that filed, not whoever shares its
+ * name — a same-named filer onboarded later is of record for nothing it
+ * did not file. And a filer's key is registered only against the
+ * REGULATOR's word: the insurance regulator licenses the company, and its
+ * signed attestation binds the licensed name to the key the company files
+ * under; the registry accepts nothing less at onboarding or rotation, and
+ * carries the attestation in the registration so any verifier who pins
+ * the regulator can check the root itself (FILER_UNLICENSED). The current
+ * key can revoke itself but not appoint its successor — a thief holding
+ * it gains nothing — because, as everywhere in this system, the party
+ * that uses a key does not hold the authority to replace it.
  */
 import { hashObject } from "./canonical";
 import { importPublicKey, signJws, verifyJws, type KeyPair, type OkpJwk } from "./crypto";
@@ -76,6 +90,8 @@ export interface InsuranceFiling {
   type: FilingType;
   form: FilingForm;
   insurer: string;
+  /** The registered filer account that submitted this filing — the insurer of record by identity, not by name. */
+  filerId?: string;
   policyNumber: string;
   coverageFromUsd: number;
   coverageToUsd: number;
@@ -310,11 +326,72 @@ export function attestationFreshAt(a: { asOf: string; upstreamAsOf?: string }, r
 
 // ------------------------------------------------------- filer directory
 
-/** A key an insurer files (and signs attestations) under: valid from a moment, until revoked. */
+/**
+ * The regulator's word: this licensed insurer files under this key. The
+ * regulator (a state insurance department, NAIC's company register) is the
+ * root of insurer identity in the world; here it signs what it already
+ * knows. Nothing below it but the law.
+ */
+export interface RegulatorAttestation {
+  schema: "freight-venue/regulator-attestation/v1";
+  regulatorId: string;
+  naicCode: string;
+  legalName: string;
+  /** The key the licensee files and signs under. */
+  publicKey: OkpJwk;
+  licensed: boolean;
+  asOf: string;
+  kid: string;
+  signature: string;
+}
+
+export interface RegulatorKey {
+  regulatorId: string;
+  publicKey: OkpJwk;
+}
+
+export function signRegulatorAttestation(regulator: KeyPair, regulatorId: string, fields: { naicCode: string; legalName: string; publicKey: OkpJwk; licensed?: boolean }, now = new Date()): RegulatorAttestation {
+  const unsigned: Omit<RegulatorAttestation, "signature"> = { schema: "freight-venue/regulator-attestation/v1", regulatorId, naicCode: fields.naicCode, legalName: fields.legalName, publicKey: { kty: "OKP", crv: "Ed25519", x: fields.publicKey.x, kid: fields.publicKey.kid }, licensed: fields.licensed ?? true, asOf: now.toISOString(), kid: regulator.kid };
+  return { ...unsigned, signature: signJws(unsigned, regulator, { typ: "regulator-attestation+jws" }, true) };
+}
+
+export function verifyRegulatorAttestation(a: RegulatorAttestation, key: OkpJwk): boolean {
+  if (a.schema !== "freight-venue/regulator-attestation/v1") return false;
+  const { signature, ...unsigned } = a;
+  try {
+    return verifyJws(signature, importPublicKey(key), unsigned).ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Is this filer key licensed: bound to the registration's legal name by a
+ * regulator's attestation naming this very key? With regulator keys the
+ * signature is checked; without, the registries' onboarding is trusted to
+ * have checked it, and the binding's presence and consistency are.
+ */
+export function filerKeyLicensed(key: FilerKey, legalName: string, regulatorKeys?: RegulatorKey[]): { ok: boolean; why?: string; regulatorId?: string } {
+  const lic = key.licensedBy;
+  if (!lic) return { ok: false, why: `key ${key.kid.slice(0, 12)}… carries no regulator attestation: the registry onboarded it on nobody's word` };
+  if (lic.publicKey.x !== key.publicKey.x) return { ok: false, why: `the regulator's attestation binds a different key (${lic.publicKey.kid?.slice(0, 12)}…) than the one registered`, regulatorId: lic.regulatorId };
+  if (lic.legalName !== legalName) return { ok: false, why: `the regulator licensed "${lic.legalName}", the filer registered as "${legalName}"`, regulatorId: lic.regulatorId };
+  if (!lic.licensed) return { ok: false, why: `${lic.regulatorId} attests ${lic.legalName} (NAIC ${lic.naicCode}) is NOT licensed`, regulatorId: lic.regulatorId };
+  if (regulatorKeys) {
+    const rk = regulatorKeys.find((r) => r.regulatorId === lic.regulatorId);
+    if (!rk) return { ok: false, why: `regulator ${lic.regulatorId} is not one you pin`, regulatorId: lic.regulatorId };
+    if (!verifyRegulatorAttestation(lic, rk.publicKey)) return { ok: false, why: `regulator attestation does not verify under ${lic.regulatorId}'s pinned key`, regulatorId: lic.regulatorId };
+  }
+  return { ok: true, regulatorId: lic.regulatorId };
+}
+
+/** A key an insurer files (and signs attestations) under: valid from a moment, until revoked, and licensed by a regulator. */
 export interface FilerKey {
   kid: string;
   publicKey: OkpJwk;
   validFrom: string;
+  /** The regulator's attestation binding the licensed name to this key — the basis on which the registry registered it. */
+  licensedBy?: RegulatorAttestation;
   /** From when the key is no longer the filer's (for COMPROMISE, possibly in the past: signatures after it are suspect). */
   revokedAt?: string;
   /** When the registry recorded the revocation — what a mirror synced later is accountable for. Defaults to revokedAt. */
@@ -322,10 +399,11 @@ export interface FilerKey {
   reason?: "ROTATION" | "COMPROMISE";
 }
 
-/** An insurer's registration with the registry: the name it files under and the keys it has signed under. */
+/** An insurer's registration with the registry: the name it files under, its NAIC code, and the keys it has signed under. */
 export interface InsurerRegistration {
   insurerId: string;
   legalName: string;
+  naicCode?: string;
   keys: FilerKey[];
   registeredAt: string;
 }
@@ -370,16 +448,24 @@ export function filerKeyAt(reg: InsurerRegistration | null, kid: string, at: Dat
  * show `kid` valid at `at` — unanimity, as for standing, because a
  * revocation is news that cannot be un-known. Names the dissent.
  */
-export function filerKeyOfRecord(atts: FilerAttestation[], kid: string, at: Date): { ok: boolean; key?: FilerKey; legalName?: string; why?: string; showing: string[]; dissenting: string[] } {
+export function filerKeyOfRecord(atts: FilerAttestation[], kid: string, at: Date, regulatorKeys?: RegulatorKey[]): { ok: boolean; key?: FilerKey; legalName?: string; why?: string; showing: string[]; dissenting: string[]; unlicensed?: string } {
   const showing: string[] = [];
   const dissenting: string[] = [];
   let key: FilerKey | undefined;
   let legalName: string | undefined;
+  let unlicensed: string | undefined;
   for (const a of atts) {
     const k = filerKeyAt(a.registration, kid, at);
-    if (k) { showing.push(a.registryId); key ??= k; legalName ??= a.registration!.legalName; } else dissenting.push(a.registryId);
+    if (k) {
+      showing.push(a.registryId);
+      key ??= k;
+      legalName ??= a.registration!.legalName;
+      const lic = filerKeyLicensed(k, a.registration!.legalName, regulatorKeys);
+      if (!lic.ok) unlicensed ??= `${a.registryId}: ${lic.why}`;
+    } else dissenting.push(a.registryId);
   }
   if (atts.length === 0) return { ok: false, why: "no registry word about this filer", showing, dissenting };
+  if (unlicensed && dissenting.length === 0) return { ok: false, key, legalName, why: unlicensed, showing, dissenting, unlicensed };
   if (dissenting.length) {
     const first = atts.find((a) => a.registryId === dissenting[0])!;
     const known = first.registration?.keys.find((k) => k.kid === kid);
@@ -574,7 +660,10 @@ export function insurerOfRecord(a: InsurerAttestation, records: (RegistryRecord 
   const filings = records.flatMap((r) => (r?.usdot === a.usdot ? r.insurance : [])).filter((f) => f.policyNumber === a.policyNumber);
   if (records.filter(Boolean).length === 0) return { ok: false, why: "no registry record to check the filing against", shownBy: 0 };
   if (filings.length === 0) return { ok: false, why: `policy ${a.policyNumber} is not among the filings the registry shows for ${a.usdot}`, shownBy: 0 };
-  const named = insurerName ? filings.filter((f) => f.insurer === insurerName) : filings;
+  // By identity where the filing names its filer account; by name only for filings that do not.
+  const byId = filings.filter((f) => f.filerId);
+  if (byId.length && !byId.some((f) => f.filerId === a.insurerId)) return { ok: false, why: `policy ${a.policyNumber} was filed by filer ${[...new Set(byId.map((f) => f.filerId))].join("/")}, not by ${a.insurerId}${insurerName ? ` ("${insurerName}" — a name is not an account)` : ""}`, shownBy: filings.length };
+  const named = insurerName ? filings.filter((f) => f.insurer === insurerName || f.filerId === a.insurerId) : filings;
   if (named.length === 0) return { ok: false, why: `policy ${a.policyNumber} is filed by ${[...new Set(filings.map((f) => f.insurer))].join("/")}, not by ${insurerName}`, shownBy: filings.length };
   if (named.some((f) => f.type !== a.type)) return { ok: false, why: `policy ${a.policyNumber} is filed as ${named[0]!.type}, attested as ${a.type}`, shownBy: named.length };
   return { ok: true, filing: named[0], shownBy: named.length };

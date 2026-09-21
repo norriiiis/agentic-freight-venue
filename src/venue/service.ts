@@ -27,7 +27,7 @@ import { AuditLog, type Component } from "../protocol/audit";
 import { rpcCall, RpcRefusal } from "../protocol/rpc";
 import type { Credential, MandateEnvelope, RotationAuthorization, RotationClaims } from "../protocol/types";
 import { RegistryMirror, RegistryUnavailable, type RegistrySource } from "../identity/registry-mirror";
-import { coverageAssuredThrough, filerContradictedBy, filerKeyOfRecord, filingsShownBy, hasBrokerAuthority, insuranceStatus, insurerContradictedBy, insurerOfRecord, insurerStanding, keyEventsShownBy, renewalWindow, satisfiesRenewal, verifyInsurerAttestation, type FilerAttestation, type InsurerAttestation, type RegistryAttestation } from "../protocol/registry";
+import { coverageAssuredThrough, filerContradictedBy, filerKeyOfRecord, filingsShownBy, hasBrokerAuthority, insuranceStatus, insurerContradictedBy, insurerOfRecord, insurerStanding, keyEventsShownBy, renewalWindow, satisfiesRenewal, verifyInsurerAttestation, type FilerAttestation, type InsurerAttestation, type RegistryAttestation, type RegulatorKey } from "../protocol/registry";
 import { StubVettingProvider } from "../identity/vetting";
 import { CredentialIssuer } from "../identity/issuer";
 import { liveCheck, signatureTrustedAt, verifyCredential, verifyPresentation, type LiveCheckResult } from "../identity/verifier";
@@ -65,6 +65,8 @@ export interface VenueConfig {
   noticeSources?: { sourceId: string; publicKey: OkpJwk; insurerName?: string }[];
   /** The venue's maximum recording delay: every inclusion promise commits to this. */
   inclusionDelayMs: number;
+  /** Insurance regulators the venue pins: with them it checks the regulator's signature on a filer's key itself; without, the registries' onboarding is trusted. */
+  regulators?: RegulatorKey[];
 }
 
 export class Refusal extends Error {
@@ -143,7 +145,7 @@ export class VenueService {
     const insurer = this.state.agents.get(cred.subject.agentId)?.insurerAttestation;
     // The name the insurer files under, and its key, per the registries' filer directory (mirrored at presentation).
     const filer = insurer ? this.registry.filerAttestations(insurer.insurerId) : [];
-    const keyOfRecord = insurer ? filerKeyOfRecord(filer, insurer.kid, new Date(insurer.asOf)) : undefined;
+    const keyOfRecord = insurer ? filerKeyOfRecord(filer, insurer.kid, new Date(insurer.asOf), this.config.regulators) : undefined;
     const insurerName = keyOfRecord?.legalName ?? insurer?.insurerName;
     const r = liveCheck(this.registry, cred, { ...opts, insurer: keyOfRecord && !keyOfRecord.ok ? undefined : insurer, insurerName });
     if (insurer && keyOfRecord && !keyOfRecord.ok) r.evidence.insurerKeyNotOfRecord = keyOfRecord.why;
@@ -390,8 +392,8 @@ export class VenueService {
       const proof = filerContradictedBy(x, events);
       if (proof) this.audit.writeOnce(`false-attestation:${proof.registryId}:filer:${proof.insurerId}:${proof.claimedSyncAt}`, { component: "venue.identity", event: "registry-false-attestation", outcome: "INFO", reasonCode: "REGISTRY_FALSE_ATTESTATION", subject: proof.registryId, evidence: { filer: proof.insurerId, claimedSyncAt: proof.claimedSyncAt, missing: proof.missing, kid: x.kid } });
     }
-    const k = filerKeyOfRecord(atts, kid, at);
-    if (!k.ok) return { ok: false, reasonCode: "INSURER_KEY_NOT_OF_RECORD", evidence: { insurerId, kid, at: at.toISOString(), error: k.why, registriesShowingKey: k.showing, registriesDissenting: k.dissenting, rule: atts.length > 1 ? "unanimity: any registry's word against the key blocks" : undefined }, attestations: atts };
+    const k = filerKeyOfRecord(atts, kid, at, this.config.regulators);
+    if (!k.ok) return { ok: false, reasonCode: k.unlicensed ? "FILER_UNLICENSED" : "INSURER_KEY_NOT_OF_RECORD", evidence: { insurerId, kid, at: at.toISOString(), error: k.why, registriesShowingKey: k.showing, registriesDissenting: k.dissenting, rule: atts.length > 1 ? "unanimity: any registry's word against the key blocks" : undefined }, attestations: atts };
     return { ok: true, key: k.key!.publicKey, legalName: k.legalName!, attestations: atts };
   }
 

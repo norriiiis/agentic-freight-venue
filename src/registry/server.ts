@@ -10,7 +10,18 @@
  */
 import { startServer, type HttpRoute } from "../protocol/rpc";
 import { RegistryService } from "./service";
-import type { RegistryRecord } from "../protocol/registry";
+import type { RegistryRecord, RegulatorKey } from "../protocol/registry";
+import { FilerRefusal } from "./store";
+
+/** A refusal is an outcome, not a crash: the registry says why, with a reason code, and stays up. */
+const refusable = (f: () => unknown) => {
+  try {
+    return { status: 200, body: f() };
+  } catch (e) {
+    if (e instanceof FilerRefusal) return { status: 200, body: { ok: false, reasonCode: e.reasonCode, refusedBy: "registry.onboarding", evidence: e.evidence } };
+    throw e;
+  }
+};
 
 const svc = new RegistryService(process.env.REGISTRY_ID ?? "fmcsa-li-mock", process.env.REGISTRY_DATA_DIR ?? ".data/registry", process.env.REGISTRY_STORE ?? "src/identity/fixtures/registry.json");
 const port = Number(process.env.REGISTRY_PORT ?? 4400);
@@ -38,17 +49,12 @@ if (simMode) {
       svc.store.update(usdot, patch);
       return ok({ ok: true, recordHash: svc.store.snapshotHash(usdot) });
     },
-    /** The upstream onboards a filer, or the filer rotates / revokes a key with it. */
-    "POST /admin/filers": async (_r, b) => {
-      const f = b as { insurerId: string; legalName: string; publicKey: import("../protocol/crypto").OkpJwk; kid: string; validFrom?: string };
-      svc.store.registerFiler(f);
-      return ok({ ok: true, filer: svc.store.filer(f.insurerId) });
-    },
-    "POST /admin/filers/revoke": async (_r, b) => {
-      const f = b as { insurerId: string; kid: string; revokedAt: string; reason: "ROTATION" | "COMPROMISE" };
-      svc.store.revokeFilerKey(f.insurerId, f.kid, f.revokedAt, f.reason);
-      return ok({ ok: true, filer: svc.store.filer(f.insurerId) });
-    },
+    /** The upstream pins a regulator (operator configuration at the registry — the law's binding, not a protocol's). */
+    "POST /admin/regulators": async (_r, b) => { svc.store.pinRegulator(b as RegulatorKey); return ok({ ok: true, regulators: svc.store.allRegulators().map((r) => r.regulatorId) }); },
+    /** The upstream onboards a filer on its regulator's word; the filer rotates (regulator) or revokes (itself or regulator) a key. */
+    "POST /admin/filers": async (_r, b) => refusable(() => { const f = b as Parameters<typeof svc.store.registerFiler>[0]; svc.store.registerFiler(f); return { ok: true, filer: svc.store.filer(f.insurerId) }; }),
+    "POST /admin/filers/rotate": async (_r, b) => refusable(() => { const f = b as Parameters<typeof svc.store.rotateFilerKey>[0]; svc.store.rotateFilerKey(f); return { ok: true, filer: svc.store.filer(f.insurerId) }; }),
+    "POST /admin/filers/revoke": async (_r, b) => refusable(() => { const f = b as Parameters<typeof svc.store.revokeFilerKey>[0]; svc.store.revokeFilerKey(f); return { ok: true, filer: svc.store.filer(f.insurerId) }; }),
     "POST /admin/fault": async (_r, b) => {
       const f = b as { unavailable?: boolean; freeze?: boolean; claimsCurrent?: boolean };
       if (f.unavailable !== undefined) svc.unavailable = !!f.unavailable;

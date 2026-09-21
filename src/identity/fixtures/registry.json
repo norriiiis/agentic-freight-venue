@@ -11,7 +11,7 @@
     "email": "compliance@northlinelogistics.example",
     "authorities": [{ "type": "BROKER", "status": "ACTIVE", "grantDate": "2019-03-14" }],
     "insurance": [
-      { "type": "BOND", "form": "BMC-84", "insurer": "Meridian Surety Company", "policyNumber": "SB-4471902", "coverageFromUsd": 0, "coverageToUsd": 75000, "effectiveDate": "2019-03-01" }
+      { "type": "BOND", "form": "BMC-84", "insurer": "Meridian Surety Company", "filerId": "meridian-surety", "policyNumber": "SB-4471902", "coverageFromUsd": 0, "coverageToUsd": 75000, "effectiveDate": "2019-03-01" }
     ],
     "safetyRating": "NONE",
     "powerUnits": 0,
@@ -36,8 +36,8 @@
       { "type": "CONTRACT", "status": "ACTIVE", "grantDate": "2017-06-22" }
     ],
     "insurance": [
-      { "type": "BIPD", "form": "BMC-91X", "insurer": "Great Plains Mutual Insurance Co", "policyNumber": "TRK-0092817-24", "coverageFromUsd": 0, "coverageToUsd": 1000000, "effectiveDate": "2025-07-01" },
-      { "type": "CARGO", "form": "BMC-34", "insurer": "Great Plains Mutual Insurance Co", "policyNumber": "CGO-0092817-24", "coverageFromUsd": 0, "coverageToUsd": 100000, "effectiveDate": "2025-07-01" }
+      { "type": "BIPD", "form": "BMC-91X", "insurer": "Great Plains Mutual Insurance Co", "filerId": "great-plains-mutual", "policyNumber": "TRK-0092817-24", "coverageFromUsd": 0, "coverageToUsd": 1000000, "effectiveDate": "2025-07-01" },
+      { "type": "CARGO", "form": "BMC-34", "insurer": "Great Plains Mutual Insurance Co", "filerId": "great-plains-mutual", "policyNumber": "CGO-0092817-24", "coverageFromUsd": 0, "coverageToUsd": 100000, "effectiveDate": "2025-07-01" }
     ],
     "safetyRating": "SATISFACTORY",
     "powerUnits": 42,
@@ -59,7 +59,7 @@
     "email": "ops@redlinexpress.example",
     "authorities": [{ "type": "COMMON", "status": "ACTIVE", "grantDate": "2026-05-09" }],
     "insurance": [
-      { "type": "BIPD", "form": "BMC-91", "insurer": "Coastal Commercial Auto Ins", "policyNumber": "CA-55120-26", "coverageFromUsd": 0, "coverageToUsd": 750000, "effectiveDate": "2026-05-01" }
+      { "type": "BIPD", "form": "BMC-91", "insurer": "Coastal Commercial Auto Ins", "filerId": "coastal-commercial", "policyNumber": "CA-55120-26", "coverageFromUsd": 0, "coverageToUsd": 750000, "effectiveDate": "2026-05-01" }
     ],
     "safetyRating": "NONE",
     "powerUnits": 3,
@@ -84,9 +84,9 @@
       { "type": "BROKER", "status": "ACTIVE", "grantDate": "2020-09-15" }
     ],
     "insurance": [
-      { "type": "BIPD", "form": "BMC-91X", "insurer": "Four Corners Casualty", "policyNumber": "FC-88210-25", "coverageFromUsd": 0, "coverageToUsd": 1000000, "effectiveDate": "2025-10-01" },
-      { "type": "CARGO", "form": "BMC-34", "insurer": "Four Corners Casualty", "policyNumber": "FC-88211-25", "coverageFromUsd": 0, "coverageToUsd": 250000, "effectiveDate": "2025-10-01" },
-      { "type": "BOND", "form": "BMC-84", "insurer": "Meridian Surety Company", "policyNumber": "SB-5580021", "coverageFromUsd": 0, "coverageToUsd": 75000, "effectiveDate": "2020-09-01" }
+      { "type": "BIPD", "form": "BMC-91X", "insurer": "Four Corners Casualty", "filerId": "four-corners-casualty", "policyNumber": "FC-88210-25", "coverageFromUsd": 0, "coverageToUsd": 1000000, "effectiveDate": "2025-10-01" },
+      { "type": "CARGO", "form": "BMC-34", "insurer": "Four Corners Casualty", "filerId": "four-corners-casualty", "policyNumber": "FC-88211-25", "coverageFromUsd": 0, "coverageToUsd": 250000, "effectiveDate": "2025-10-01" },
+      { "type": "BOND", "form": "BMC-84", "insurer": "Meridian Surety Company", "filerId": "meridian-surety", "policyNumber": "SB-5580021", "coverageFromUsd": 0, "coverageToUsd": 75000, "effectiveDate": "2020-09-01" }
     ],
     "safetyRating": "SATISFACTORY",
     "powerUnits": 18,

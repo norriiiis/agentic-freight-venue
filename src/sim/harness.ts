@@ -26,7 +26,7 @@ import type { AuditEntry } from "../protocol/audit";
 import type { NegotiationTask, CommitmentRecord } from "../venue/state";
 import type { LedgerEntry } from "../ledger/chain";
 import type { Message, Task } from "../protocol/a2a";
-import { signInsurerAttestation, type FilerAttestation, type InsurerAttestation, type InsurerKey, type InsurerRegistration, type RegistryAttestation, type RegistryKey, type RegistryRecord } from "../protocol/registry";
+import { signInsurerAttestation, signRegulatorAttestation, type FilerAttestation, type InsurerAttestation, type InsurerKey, type InsurerRegistration, type RegistryAttestation, type RegistryKey, type RegistryRecord, type RegulatorAttestation, type RegulatorKey } from "../protocol/registry";
 import type { LoadSpec, NegotiationPayload } from "../protocol/freight";
 import type { LocalTask } from "../agentkit/types";
 
@@ -272,9 +272,11 @@ export class RegistryHandle {
   /** The registry's signed word about a filer, as any verifier can fetch it today. */
   attestFiler(insurerId: string) { return httpGet<FilerAttestation>(`${this.url}/attest-filer?insurerId=${insurerId}`); }
   filers() { return httpGet<InsurerRegistration[]>(`${this.url}/filers`); }
-  /** SIM (the upstream onboarding a filer): register an insurer's filing name and key. */
-  registerFiler(f: { insurerId: string; legalName: string; publicKey: OkpJwk; kid: string; validFrom?: string }) { return httpPost<{ ok: boolean; filer: InsurerRegistration }>(`${this.url}/admin/filers`, f); }
-  revokeFilerKey(f: { insurerId: string; kid: string; revokedAt: string; reason: "ROTATION" | "COMPROMISE" }) { return httpPost<{ ok: boolean; filer: InsurerRegistration }>(`${this.url}/admin/filers/revoke`, f); }
+  /** SIM (the upstream): pin a regulator; onboard a filer on the regulator's word; rotate (regulator) or revoke (self / regulator) a key. */
+  pinRegulator(r: RegulatorKey) { return httpPost<{ ok: boolean }>(`${this.url}/admin/regulators`, r); }
+  registerFiler(f: { insurerId: string; legalName: string; publicKey: OkpJwk; kid: string; licensedBy?: RegulatorAttestation; validFrom?: string }) { return httpPost<FilerOutcome>(`${this.url}/admin/filers`, f); }
+  rotateFilerKey(f: { insurerId: string; publicKey: OkpJwk; kid: string; licensedBy?: RegulatorAttestation }) { return httpPost<FilerOutcome>(`${this.url}/admin/filers/rotate`, f); }
+  revokeFilerKey(f: { insurerId: string; kid: string; revokedAt: string; reason: "ROTATION" | "COMPROMISE"; authorization: { kind: "CURRENT_KEY"; jws: string } | { kind: "REGULATOR"; attestation: RegulatorAttestation } }) { return httpPost<FilerOutcome>(`${this.url}/admin/filers/revoke`, f); }
   /** SIM: the registry goes dark, or freezes — keeps signing the records it has. Honest: its sync claim stops advancing. `claimsCurrent`: it lies about its sync. */
   fault(f: { unavailable?: boolean; freeze?: boolean; claimsCurrent?: boolean }) { return httpPost<{ unavailable: boolean; frozen: boolean; claimsCurrent: boolean }>(`${this.url}/admin/fault`, f); }
 }
@@ -299,6 +301,16 @@ export class WitnessHandle {
   publicKeyPath() { return join(this.dir, "witness-public.jwk.json"); }
 }
 
+export type FilerOutcome = { ok: true; filer: InsurerRegistration } | { ok: false; reasonCode: string; refusedBy: string; evidence: Record<string, unknown> };
+
+/** The insurance regulator's desk: it licenses companies and, here, signs which key each licensee files under. */
+export interface RegulatorDesk {
+  regulatorId: string;
+  kp: KeyPair;
+  key: RegulatorKey;
+  license: (fields: { naicCode: string; legalName: string; publicKey: OkpJwk; licensed?: boolean }, now?: Date) => RegulatorAttestation;
+}
+
 export interface InsurerDesk {
   insurerId: string;
   insurerName: string;
@@ -307,6 +319,9 @@ export interface InsurerDesk {
   attest: (fields: Parameters<typeof signInsurerAttestation>[2], now?: Date) => InsurerAttestation;
   /** Sign under another key (a rotated one, or a thief's). */
   signWith: (k: KeyPair, fields: Parameters<typeof signInsurerAttestation>[2], now?: Date) => InsurerAttestation;
+  naicCode: string;
+  /** Sign a self-revocation of one of this desk's keys (with the key being revoked, or any live key). */
+  selfRevoke: (k: KeyPair, req: { kid: string; revokedAt: string; reason: "ROTATION" | "COMPROMISE" }) => { kind: "CURRENT_KEY"; jws: string };
 }
 
 export interface HarnessOptions {
@@ -441,18 +456,54 @@ export class Harness {
    * Signs coverage attestations (a COI) that the insured presents. The harness plays the insurer's signing desk, and
    * the registries' filer onboarding.
    */
-  async startInsurer(insurerId: string, insurerName = insurerId, opts: { registerWithRegistries?: boolean } = {}): Promise<InsurerDesk> {
+  async startInsurer(insurerId: string, insurerName = insurerId, opts: { registerWithRegistries?: boolean; regulator?: RegulatorDesk; naicCode?: string; licensed?: boolean } = {}): Promise<InsurerDesk> {
     const kp = generateKeyPair();
-    const desk: InsurerDesk = { insurerId, insurerName, kp, key: { insurerId, publicKey: kp.publicJwk, insurerName }, attest: (fields, now) => signInsurerAttestation(kp, insurerId, fields, now, insurerName), signWith: (k, fields, now) => signInsurerAttestation(k, insurerId, fields, now, insurerName) };
-    if (opts.registerWithRegistries !== false) await this.registerFiler({ insurerId, legalName: insurerName, publicKey: kp.publicJwk, kid: kp.kid });
+    const naicCode = opts.naicCode ?? String(10000 + [...insurerId].reduce((a, c) => a + c.charCodeAt(0), 0));
+    const desk: InsurerDesk = {
+      insurerId, insurerName, kp, naicCode,
+      key: { insurerId, publicKey: kp.publicJwk, insurerName },
+      attest: (fields, now) => signInsurerAttestation(kp, insurerId, fields, now, insurerName),
+      signWith: (k, fields, now) => signInsurerAttestation(k, insurerId, fields, now, insurerName),
+      selfRevoke: (k, req) => ({ kind: "CURRENT_KEY", jws: signJws({ action: "filer-key/revoke", insurerId, ...req }, k, { typ: "filer-revocation+jws" }, true) }),
+    };
+    if (opts.registerWithRegistries !== false) {
+      // Onboarding at the upstream needs the regulator's word that this licensed company files under this key.
+      const regulator = opts.regulator ?? (await this.regulator());
+      const licensedBy = regulator.license({ naicCode, legalName: insurerName, publicKey: kp.publicJwk, licensed: opts.licensed });
+      const outcomes = await this.registerFiler({ insurerId, legalName: insurerName, publicKey: kp.publicJwk, kid: kp.kid, licensedBy });
+      const refused = outcomes.find((o) => !o.ok);
+      if (refused && !refused.ok) throw new Error(`filer onboarding refused: ${refused.reasonCode} ${JSON.stringify(refused.evidence)}`);
+    }
     return desk;
   }
-  /** The upstream registers a filer (or a new key for one): every mirror that is still syncing reflects it. */
-  async registerFiler(f: { insurerId: string; legalName: string; publicKey: OkpJwk; kid: string; validFrom?: string }) {
-    for (const r of this.registries) await r.registerFiler(f);
+  private defaultRegulator?: RegulatorDesk;
+  /** The regulator (one per sim unless started explicitly), pinned by every registry — the one binding that is the law's. */
+  async regulator(): Promise<RegulatorDesk> {
+    if (!this.defaultRegulator) this.defaultRegulator = await this.startRegulator("naic-mock");
+    return this.defaultRegulator;
   }
-  async revokeFilerKey(f: { insurerId: string; kid: string; revokedAt: string; reason: "ROTATION" | "COMPROMISE" }) {
-    for (const r of this.registries) await r.revokeFilerKey(f);
+  async startRegulator(regulatorId: string): Promise<RegulatorDesk> {
+    const kp = generateKeyPair();
+    const desk: RegulatorDesk = { regulatorId, kp, key: { regulatorId, publicKey: kp.publicJwk }, license: (fields, now) => signRegulatorAttestation(kp, regulatorId, fields, now) };
+    for (const r of this.registries) await r.pinRegulator(desk.key);
+    if (!this.defaultRegulator) this.defaultRegulator = desk;
+    return desk;
+  }
+  /** The upstream registers a filer: every mirror that is still syncing reflects it. Returns each registry's outcome. */
+  async registerFiler(f: Parameters<RegistryHandle["registerFiler"]>[0]): Promise<FilerOutcome[]> {
+    const out: FilerOutcome[] = [];
+    for (const r of this.registries) out.push(await r.registerFiler(f));
+    return out;
+  }
+  async rotateFilerKey(f: Parameters<RegistryHandle["rotateFilerKey"]>[0]): Promise<FilerOutcome[]> {
+    const out: FilerOutcome[] = [];
+    for (const r of this.registries) out.push(await r.rotateFilerKey(f));
+    return out;
+  }
+  async revokeFilerKey(f: Parameters<RegistryHandle["revokeFilerKey"]>[0]): Promise<FilerOutcome[]> {
+    const out: FilerOutcome[] = [];
+    for (const r of this.registries) out.push(await r.revokeFilerKey(f));
+    return out;
   }
 
   /**

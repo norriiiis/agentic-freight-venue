@@ -9,6 +9,8 @@
  *   VENUE_REGISTRY_QUORUM      how many registries must answer fresh before standing can be judged (default 1);
  *                        standing itself needs every registry that answered to agree
  *   VENUE_REGISTRY_MAX_AGE_MS  freshness policy for a registry's word at every standing check (default 5 min)
+ *   VENUE_REGULATORS     JSON [{ regulatorId, publicKey }] — insurance regulators whose signature on a filer's key the
+ *                        venue checks itself (default: trust the registries' onboarding to have)
  *   VENUE_PORT           listen port (127.0.0.1)
  *   VENUE_ID             venue identifier
  *   VENUE_MAX_ROUNDS     protocol bound on negotiation rounds
@@ -36,6 +38,7 @@ const config = {
   witnesses: process.env.VENUE_WITNESSES ? JSON.parse(process.env.VENUE_WITNESSES) : undefined,
   noticeSources: process.env.VENUE_NOTICE_SOURCES ? JSON.parse(process.env.VENUE_NOTICE_SOURCES) : undefined,
   inclusionDelayMs: Number(process.env.VENUE_INCLUSION_DELAY_MS ?? 60_000),
+  regulators: process.env.VENUE_REGULATORS ? JSON.parse(process.env.VENUE_REGULATORS) : undefined,
 };
 const venue = new VenueService(config);
 const simMode = process.env.SIM_MODE === "1";
