@@ -27,7 +27,7 @@ import { AuditLog, type Component } from "../protocol/audit";
 import { rpcCall, RpcRefusal } from "../protocol/rpc";
 import type { Credential, MandateEnvelope, RotationAuthorization, RotationClaims } from "../protocol/types";
 import { RegistryMirror, RegistryUnavailable, type RegistrySource } from "../identity/registry-mirror";
-import { coverageAssuredThrough, filerContradictedBy, filerKeyOfRecord, filingsShownBy, hasBrokerAuthority, insuranceStatus, insurerContradictedBy, insurerOfRecord, insurerStanding, keyEventsShownBy, renewalWindow, satisfiesRenewal, verifyInsurerAttestation, type FilerAttestation, type InsurerAttestation, type RegistryAttestation, type RegulatorKey } from "../protocol/registry";
+import { coverageAssuredThrough, filerContradictedBy, filerKeyOfRecord, filingsShownBy, hasBrokerAuthority, insuranceStatus, insurerContradictedBy, insurerOfRecord, insurerStanding, keyEventsShownBy, renewalWindow, satisfiesRenewal, regulatorLogOfRecord, verifyInsurerAttestation, type FilerAttestation, type InsurerAttestation, type RegistryAttestation, type RegulatorKey, type RegulatorLogAttestation } from "../protocol/registry";
 import { StubVettingProvider } from "../identity/vetting";
 import { CredentialIssuer } from "../identity/issuer";
 import { liveCheck, signatureTrustedAt, verifyCredential, verifyPresentation, type LiveCheckResult } from "../identity/verifier";
@@ -145,7 +145,16 @@ export class VenueService {
     const insurer = this.state.agents.get(cred.subject.agentId)?.insurerAttestation;
     // The name the insurer files under, and its key, per the registries' filer directory (mirrored at presentation).
     const filer = insurer ? this.registry.filerAttestations(insurer.insurerId) : [];
-    const keyOfRecord = insurer ? filerKeyOfRecord(filer, insurer.kid, new Date(insurer.asOf), this.config.regulators) : undefined;
+    const regIds = filer.flatMap((a) => a.registration?.keys.map((k) => k.licensedBy?.regulatorId).filter((x): x is string => !!x) ?? []);
+    const regLogs: Record<string, RootEvent[]> = {};
+    const regKeys: RegulatorKey[] = [];
+    for (const id of new Set(regIds)) {
+      const rec = regulatorLogOfRecord(this.registry.regulatorAttestations(id));
+      if (rec.ok) regLogs[id] = rec.log!;
+      const pinned = this.config.regulators?.find((r) => r.regulatorId === id);
+      if (pinned) regKeys.push(pinned); else if (rec.ok) regKeys.push(rec.anchor!);
+    }
+    const keyOfRecord = insurer ? filerKeyOfRecord(filer, insurer.kid, new Date(insurer.asOf), regKeys.length ? regKeys : undefined, regLogs) : undefined;
     const insurerName = keyOfRecord?.legalName ?? insurer?.insurerName;
     const r = liveCheck(this.registry, cred, { ...opts, insurer: keyOfRecord && !keyOfRecord.ok ? undefined : insurer, insurerName });
     if (insurer && keyOfRecord && !keyOfRecord.ok) r.evidence.insurerKeyNotOfRecord = keyOfRecord.why;
@@ -378,23 +387,45 @@ export class VenueService {
    * mirror under the same quorum, unanimity and freshness as any record. Returns the filer attestations relied on and
    * the key valid at `at`, or why there is none.
    */
-  private async filerKey(insurerId: string, kid: string, at: Date, maxAgeMs = this.config.registryMaxAgeMs): Promise<{ ok: true; key: OkpJwk; legalName: string; attestations: FilerAttestation[] } | { ok: false; reasonCode: ReasonCode; evidence: Record<string, unknown>; attestations: FilerAttestation[] }> {
+  /**
+   * The regulators' key logs, per the registries: with a pinned regulator key the venue walks the log from it; without
+   * one it anchors on the registries' word (k of n). Returns the logs and the attestations relied on for the artifact.
+   */
+  private async regulatorLogs(regulatorIds: string[], maxAgeMs = this.config.registryMaxAgeMs): Promise<{ logs: Record<string, RootEvent[]>; keys: RegulatorKey[]; attestations: RegulatorLogAttestation[] }> {
+    const logs: Record<string, RootEvent[]> = {};
+    const keys: RegulatorKey[] = [];
+    const attestations: RegulatorLogAttestation[] = [];
+    for (const id of [...new Set(regulatorIds)]) {
+      let atts: RegulatorLogAttestation[] = [];
+      try { atts = await this.registry.refreshRegulator(id, maxAgeMs); } catch { /* no registry word: only a pinned key, alone, will do */ }
+      const rec = regulatorLogOfRecord(atts);
+      if (rec.ok) { logs[id] = rec.log!; attestations.push(...atts); }
+      const pinned = this.config.regulators?.find((r) => r.regulatorId === id);
+      if (pinned) keys.push(pinned);
+      else if (rec.ok) keys.push(rec.anchor!);
+    }
+    return { logs, keys, attestations };
+  }
+
+  private async filerKey(insurerId: string, kid: string, at: Date, maxAgeMs = this.config.registryMaxAgeMs): Promise<{ ok: true; key: OkpJwk; legalName: string; attestations: FilerAttestation[]; regulators: RegulatorLogAttestation[] } | { ok: false; reasonCode: ReasonCode; evidence: Record<string, unknown>; attestations: FilerAttestation[]; regulators: RegulatorLogAttestation[] }> {
     let atts: FilerAttestation[];
     try {
       atts = await this.registry.refreshFiler(insurerId, maxAgeMs);
     } catch (e) {
       const u = e as RegistryUnavailable;
-      return { ok: false, reasonCode: "REGISTRY_UNAVAILABLE", evidence: { insurerId, error: u.why ?? u.message, registries: u.perRegistry ?? {} }, attestations: [] };
+      return { ok: false, reasonCode: "REGISTRY_UNAVAILABLE", evidence: { insurerId, error: u.why ?? u.message, registries: u.perRegistry ?? {} }, attestations: [], regulators: [] };
     }
+    const regulatorIds = atts.flatMap((a) => a.registration?.keys.map((k) => k.licensedBy?.regulatorId).filter((x): x is string => !!x) ?? []);
+    const reg = await this.regulatorLogs(regulatorIds, maxAgeMs);
     // Accountability for the mirrors here too: a mirror claiming a sync after a revocation it does not show.
     const events = atts.flatMap(keyEventsShownBy);
     for (const x of atts) {
       const proof = filerContradictedBy(x, events);
       if (proof) this.audit.writeOnce(`false-attestation:${proof.registryId}:filer:${proof.insurerId}:${proof.claimedSyncAt}`, { component: "venue.identity", event: "registry-false-attestation", outcome: "INFO", reasonCode: "REGISTRY_FALSE_ATTESTATION", subject: proof.registryId, evidence: { filer: proof.insurerId, claimedSyncAt: proof.claimedSyncAt, missing: proof.missing, kid: x.kid } });
     }
-    const k = filerKeyOfRecord(atts, kid, at, this.config.regulators);
-    if (!k.ok) return { ok: false, reasonCode: k.unlicensed ? "FILER_UNLICENSED" : "INSURER_KEY_NOT_OF_RECORD", evidence: { insurerId, kid, at: at.toISOString(), error: k.why, registriesShowingKey: k.showing, registriesDissenting: k.dissenting, rule: atts.length > 1 ? "unanimity: any registry's word against the key blocks" : undefined }, attestations: atts };
-    return { ok: true, key: k.key!.publicKey, legalName: k.legalName!, attestations: atts };
+    const k = filerKeyOfRecord(atts, kid, at, reg.keys.length ? reg.keys : undefined, reg.logs);
+    if (!k.ok) return { ok: false, reasonCode: k.regulatorKeyUntrusted ? "REGULATOR_KEY_UNTRUSTED" : k.unlicensed ? "FILER_UNLICENSED" : "INSURER_KEY_NOT_OF_RECORD", evidence: { insurerId, kid, at: at.toISOString(), error: k.why, registriesShowingKey: k.showing, registriesDissenting: k.dissenting, regulatorAnchor: reg.keys.map((r) => ({ regulatorId: r.regulatorId, kid: r.publicKey.kid, source: this.config.regulators?.some((x) => x.regulatorId === r.regulatorId) ? "pinned by the venue operator" : "the registries' word" })), rule: atts.length > 1 ? "unanimity: any registry's word against the key blocks" : undefined }, attestations: atts, regulators: reg.attestations };
+    return { ok: true, key: k.key!.publicKey, legalName: k.legalName!, attestations: atts, regulators: reg.attestations };
   }
 
   /**
@@ -1188,6 +1219,7 @@ export class VenueService {
     // The registries' word on each insurer's key, obtained NOW: a word on file whose key the registries no longer
     // list at its signing time counts for nothing — refused if the principal requires the origin's word, else dropped.
     const filers: { broker?: FilerAttestation[]; carrier?: FilerAttestation[] } = {};
+    const regulatorWord: RegulatorLogAttestation[] = [];
     const insurance: { broker?: InsurerAttestation; carrier?: InsurerAttestation } = {};
     for (const [side, reg] of [["broker", brokerReg], ["carrier", carrierReg]] as const) {
       const att = reg.insurerAttestation;
@@ -1201,6 +1233,7 @@ export class VenueService {
         continue;
       }
       filers[side] = fk.attestations;
+      for (const r of fk.regulators) if (!regulatorWord.some((x) => x.registryId === r.registryId && x.regulatorId === r.regulatorId)) regulatorWord.push(r);
       insurance[side] = att;
     }
     // The statutory window: if the broker requires the carrier's insurer's word and the word on file falls short of
@@ -1223,7 +1256,7 @@ export class VenueService {
         acceptances: { broker: t.acceptances[t.brokerAgentId]!, carrier: t.acceptances[t.carrierAgentId]! },
         credentials: { broker: brokerCred, carrier: carrierCred },
         registry: { registries: this.registry.pinned, attestations: registryAtt, policy: { maxAgeMs: this.config.registryMaxAgeMs, quorum: this.config.registryQuorum } },
-        insurance: { ...insurance, renewal, filers },
+        insurance: { ...insurance, renewal, filers, regulators: regulatorWord.length ? regulatorWord : undefined },
         underwriting: quote.decision === "GUARANTEED" ? { decision: "GUARANTEED", riskScore: quote.assessment.probabilityOfLoss, guarantee: quote.guarantee } : { decision: "UNGUARANTEED", riskScore: quote.assessment.probabilityOfLoss, reasonCode: quote.reasonCode },
         ledger: { seq: head.seq + 1, prevHash: head.hash },
       },

@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { OkpJwk } from "../protocol/crypto";
 import { writeFileAtomic } from "../protocol/fsatomic";
-import { attestationFreshAt, verifyAttestation, verifyFilerAttestation, type FilerAttestation, type OutOfBand, type RegistryAttestation, type RegistryKey, type RegistryRecord, type RegistryView } from "../protocol/registry";
+import { attestationFreshAt, verifyAttestation, verifyFilerAttestation, verifyRegulatorLogAttestation, type FilerAttestation, type OutOfBand, type RegistryAttestation, type RegistryKey, type RegistryRecord, type RegistryView, type RegulatorLogAttestation } from "../protocol/registry";
 
 export interface RegistrySource {
   registryId: string;
@@ -42,10 +42,13 @@ interface MirrorFile {
   /** insurerId → registryId → latest verified filer attestation: who signs under which key, per the registries. */
   filers: Record<string, Record<string, FilerAttestation>>;
   reliedOnFilers: Record<string, string[]>;
+  /** regulatorId → registryId → latest verified word on the regulator's key log. */
+  regulators: Record<string, Record<string, RegulatorLogAttestation>>;
+  reliedOnRegulators: Record<string, string[]>;
 }
 
 export class RegistryMirror implements RegistryView {
-  private file: MirrorFile = { pinned: {}, attestations: {}, reliedOn: {}, outOfBand: {}, filers: {}, reliedOnFilers: {} };
+  private file: MirrorFile = { pinned: {}, attestations: {}, reliedOn: {}, outOfBand: {}, filers: {}, reliedOnFilers: {}, regulators: {}, reliedOnRegulators: {} };
   private readonly path: string;
   /** SIM fault: never refresh — serve whatever was last mirrored (a venue that read the registry once). */
   stale = false;
@@ -55,7 +58,7 @@ export class RegistryMirror implements RegistryView {
   constructor(readonly sources: RegistrySource[], dataDir: string, readonly quorum = 1, readonly skewMs = 60_000) {
     mkdirSync(dataDir, { recursive: true });
     this.path = join(dataDir, "registry-mirror.json");
-    if (existsSync(this.path)) this.file = { filers: {}, reliedOnFilers: {}, ...JSON.parse(readFileSync(this.path, "utf8")) };
+    if (existsSync(this.path)) this.file = { filers: {}, reliedOnFilers: {}, regulators: {}, reliedOnRegulators: {}, ...JSON.parse(readFileSync(this.path, "utf8")) };
   }
 
   /** The pinned registry keys, in source order. */
@@ -130,6 +133,32 @@ export class RegistryMirror implements RegistryView {
     if (!fresh.ok) return { ok: false, why: `answered asOf ${a.asOf}, ${fresh.ageMs}ms from now (max ${maxAgeMs}, skew ${this.skewMs})` };
     if (have && new Date(a.asOf) < new Date(have.asOf)) return { ok: false, why: `answered asOf ${a.asOf}, earlier than the ${have.asOf} already held` };
     return { ok: true, attestation: a };
+  }
+
+  /** The registries' word on a regulator's key log, as last relied on. */
+  regulatorAttestations(regulatorId: string): RegulatorLogAttestation[] {
+    const ids = this.file.reliedOnRegulators[regulatorId] ?? [];
+    return ids.map((id) => this.file.regulators[regulatorId]?.[id]).filter((a): a is RegulatorLogAttestation => !!a && !this.hidden.includes(a.registryId));
+  }
+
+  /** Ask every registry for the regulator's key log; same quorum and freshness. */
+  async refreshRegulator(regulatorId: string, maxAgeMs: number, now = new Date()): Promise<RegulatorLogAttestation[]> {
+    if (this.stale) {
+      const held = this.regulatorAttestations(regulatorId);
+      if (held.length === 0) throw new RegistryUnavailable(regulatorId, "nothing mirrored (stale mode)", {});
+      return held;
+    }
+    const sources = this.active();
+    const outcomes = await Promise.all(sources.map(async (src) => [src.registryId, await this.fetchSigned<RegulatorLogAttestation>(src, `/attest-regulator?regulatorId=${encodeURIComponent(regulatorId)}`, this.file.regulators[regulatorId]?.[src.registryId], (a, key) => a.regulatorId === regulatorId && verifyRegulatorLogAttestation(a, key), maxAgeMs, now)] as const));
+    const fresh: RegulatorLogAttestation[] = [];
+    const perRegistry: Record<string, string> = {};
+    for (const [id, o] of outcomes) {
+      if (o.ok) { fresh.push(o.attestation); perRegistry[id] = `ok (asOf ${o.attestation.asOf})`; (this.file.regulators[regulatorId] ??= {})[id] = o.attestation; } else perRegistry[id] = o.why;
+    }
+    if (fresh.length < Math.max(1, this.quorum)) { this.persist(); throw new RegistryUnavailable(regulatorId, `${fresh.length} of ${sources.length} registries answered fresh about regulator ${regulatorId}; quorum ${this.quorum}`, perRegistry); }
+    this.file.reliedOnRegulators[regulatorId] = fresh.map((a) => a.registryId);
+    this.persist();
+    return fresh;
   }
 
   /** The filer attestations the last refresh relied on, in source order. */

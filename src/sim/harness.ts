@@ -26,7 +26,7 @@ import type { AuditEntry } from "../protocol/audit";
 import type { NegotiationTask, CommitmentRecord } from "../venue/state";
 import type { LedgerEntry } from "../ledger/chain";
 import type { Message, Task } from "../protocol/a2a";
-import { signInsurerAttestation, signRegulatorAttestation, type FilerAttestation, type InsurerAttestation, type InsurerKey, type InsurerRegistration, type RegistryAttestation, type RegistryKey, type RegistryRecord, type RegulatorAttestation, type RegulatorKey } from "../protocol/registry";
+import { signInsurerAttestation, signRegulatorAttestation, type FilerAttestation, type InsurerAttestation, type InsurerKey, type InsurerRegistration, type RegistryAttestation, type RegistryKey, type RegistryRecord, type RegulatorAttestation, type RegulatorKey, type RegulatorLogAttestation } from "../protocol/registry";
 import type { LoadSpec, NegotiationPayload } from "../protocol/freight";
 import type { LocalTask } from "../agentkit/types";
 
@@ -272,8 +272,13 @@ export class RegistryHandle {
   /** The registry's signed word about a filer, as any verifier can fetch it today. */
   attestFiler(insurerId: string) { return httpGet<FilerAttestation>(`${this.url}/attest-filer?insurerId=${insurerId}`); }
   filers() { return httpGet<InsurerRegistration[]>(`${this.url}/filers`); }
-  /** SIM (the upstream): pin a regulator; onboard a filer on the regulator's word; rotate (regulator) or revoke (self / regulator) a key. */
-  pinRegulator(r: RegulatorKey) { return httpPost<{ ok: boolean }>(`${this.url}/admin/regulators`, r); }
+  /** SIM (the upstream): bootstrap a regulator from its establishment event, once; onboard a filer on the regulator's word; rotate (regulator) or revoke (self / regulator) a key. */
+  pinRegulator(r: { regulatorId: string; establishment: RootEvent }) { return httpPost<{ ok: boolean; reasonCode?: string; evidence?: Record<string, unknown> }>(`${this.url}/admin/regulators`, r); }
+  /** A regulator publishes a key event to this registry (no operator involved: accepted iff it extends the walk). */
+  regulatorEvent(regulatorId: string, event: RootEvent) { return httpPost<{ ok: boolean; reasonCode?: string; evidence?: Record<string, unknown>; log?: RootEvent[] }>(`${this.url}/regulators/event`, { regulatorId, event }); }
+  /** The registry's signed word about a regulator's key log, as any verifier can fetch it today. */
+  attestRegulator(regulatorId: string) { return httpGet<RegulatorLogAttestation>(`${this.url}/attest-regulator?regulatorId=${regulatorId}`); }
+  regulators() { return httpGet<RegulatorKey[]>(`${this.url}/regulators`); }
   registerFiler(f: { insurerId: string; legalName: string; publicKey: OkpJwk; kid: string; licensedBy?: RegulatorAttestation; validFrom?: string }) { return httpPost<FilerOutcome>(`${this.url}/admin/filers`, f); }
   rotateFilerKey(f: { insurerId: string; publicKey: OkpJwk; kid: string; licensedBy?: RegulatorAttestation }) { return httpPost<FilerOutcome>(`${this.url}/admin/filers/rotate`, f); }
   revokeFilerKey(f: { insurerId: string; kid: string; revokedAt: string; reason: "ROTATION" | "COMPROMISE"; authorization: { kind: "CURRENT_KEY"; jws: string } | { kind: "REGULATOR"; attestation: RegulatorAttestation } }) { return httpPost<FilerOutcome>(`${this.url}/admin/filers/revoke`, f); }
@@ -303,12 +308,26 @@ export class WitnessHandle {
 
 export type FilerOutcome = { ok: true; filer: InsurerRegistration } | { ok: false; reasonCode: string; refusedBy: string; evidence: Record<string, unknown> };
 
-/** The insurance regulator's desk: it licenses companies and, here, signs which key each licensee files under. */
+/**
+ * The insurance regulator's desk: it licenses companies and, here, signs which key each licensee files under. Its own
+ * identity is a key-event log with pre-rotation, like the venue root's: the current key, the pre-committed next key
+ * (held "offline"), and the published events. The harness plays the regulator's key ceremony.
+ */
 export interface RegulatorDesk {
   regulatorId: string;
+  /** The current signing key. */
   kp: KeyPair;
+  /** The establishment key — what a party that learned the regulator once pinned. Still resolves after rotations. */
   key: RegulatorKey;
+  establishment: RootEvent;
+  log: RootEvent[];
   license: (fields: { naicCode: string; legalName: string; publicKey: OkpJwk; licensed?: boolean }, now?: Date) => RegulatorAttestation;
+  /** Rotate to the pre-committed successor and publish the event to every registry. */
+  rotate: () => Promise<RootEvent>;
+  /** Declare the current key compromised as of a time; the pre-committed successor takes over. */
+  compromise: (compromisedAt: string) => Promise<RootEvent>;
+  /** What a thief holding the CURRENT key can attempt: a "rotation" to a key of their choosing. */
+  forgeRotation: (thief: KeyPair) => RootEvent;
 }
 
 export interface InsurerDesk {
@@ -483,9 +502,36 @@ export class Harness {
     return this.defaultRegulator;
   }
   async startRegulator(regulatorId: string): Promise<RegulatorDesk> {
-    const kp = generateKeyPair();
-    const desk: RegulatorDesk = { regulatorId, kp, key: { regulatorId, publicKey: kp.publicJwk }, license: (fields, now) => signRegulatorAttestation(kp, regulatorId, fields, now) };
-    for (const r of this.registries) await r.pinRegulator(desk.key);
+    let cur = generateKeyPair();
+    let next = generateKeyPair();
+    const establishment = signRootEvent(cur, { seq: 0, nextRootCommitment: rootCommitment(next.publicJwk), at: new Date().toISOString(), reason: "ESTABLISHMENT" });
+    const log: RootEvent[] = [establishment];
+    const registries = this.registries;
+    const publish = async (e: RootEvent) => { for (const r of registries) { const o = await r.regulatorEvent(regulatorId, e); if (!o.ok) throw new Error(`registry ${r.registryId} refused regulator event: ${o.reasonCode}`); } };
+    const desk: RegulatorDesk = {
+      regulatorId,
+      get kp() { return cur; },
+      key: { regulatorId, publicKey: establishment.rootPublicKey },
+      establishment,
+      log,
+      license: (fields, now) => signRegulatorAttestation(cur, regulatorId, fields, now),
+      rotate: async () => {
+        const after = generateKeyPair();
+        const e = signRootEvent(next, { seq: log.length, previousRootKid: cur.kid, nextRootCommitment: rootCommitment(after.publicJwk), at: new Date().toISOString(), reason: "ROTATION" }, cur);
+        log.push(e); cur = next; next = after;
+        await publish(e);
+        return e;
+      },
+      compromise: async (compromisedAt) => {
+        const after = generateKeyPair();
+        const e = signRootEvent(next, { seq: log.length, previousRootKid: cur.kid, nextRootCommitment: rootCommitment(after.publicJwk), at: new Date().toISOString(), reason: "COMPROMISE", compromisedAt });
+        log.push(e); cur = next; next = after;
+        await publish(e);
+        return e;
+      },
+      forgeRotation: (thief) => signRootEvent(thief, { seq: log.length, previousRootKid: cur.kid, nextRootCommitment: rootCommitment(generateKeyPair().publicJwk), at: new Date().toISOString(), reason: "ROTATION" }, cur),
+    };
+    for (const r of this.registries) await r.pinRegulator({ regulatorId, establishment });
     if (!this.defaultRegulator) this.defaultRegulator = desk;
     return desk;
   }

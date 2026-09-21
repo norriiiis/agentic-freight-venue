@@ -8,7 +8,8 @@
  * own data — and the venue only ever sees what it signs.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { filerKeyLicensed, recordHash, verifyRegulatorAttestation, type InsurerRegistration, type OutOfBand, type RegistryRecord, type RegistryView, type RegulatorAttestation, type RegulatorKey } from "../protocol/registry";
+import { filerKeyLicensed, recordHash, regulatorKeyAt, verifyRegulatorAttestation, type InsurerRegistration, type OutOfBand, type RegistryRecord, type RegistryView, type RegulatorAttestation, type RegulatorKey } from "../protocol/registry";
+import { verifyRootEventSelf, walkRootLog, type RootEvent } from "../protocol/venue-keys";
 import { importPublicKey, verifyJws } from "../protocol/crypto";
 import type { ReasonCode } from "../protocol/reasons";
 
@@ -24,8 +25,12 @@ export class MockRegistry implements RegistryView {
   private records = new Map<string, StoredRecord>();
   /** Registered filers: the insurers that file with this registry, the names they file under, and their keys. */
   private filers = new Map<string, InsurerRegistration>();
-  /** The regulators whose word this registry accepts about who is a licensed insurer and which key it files under. */
-  private regulators = new Map<string, RegulatorKey>();
+  /**
+   * The regulators whose word this registry accepts about who is a licensed insurer and which key it files under:
+   * each bootstrapped ONCE from its establishment event (operator configuration at the upstream — the law's binding),
+   * then followed mechanically through pre-committed rotations. Nobody can hand this registry a new regulator root.
+   */
+  private regulators = new Map<string, { regulatorId: string; log: RootEvent[] }>();
   private readonly filersPath: string;
   constructor(private readonly path: string, filersPath?: string) {
     this.filersPath = filersPath ?? path.replace(/\.json$/, "") + ".filers.json";
@@ -35,7 +40,7 @@ export class MockRegistry implements RegistryView {
     const arr: StoredRecord[] = JSON.parse(readFileSync(this.path, "utf8"));
     this.records = new Map(arr.map((r) => [r.usdot, r]));
     if (existsSync(this.filersPath)) {
-      const f = JSON.parse(readFileSync(this.filersPath, "utf8")) as { filers: InsurerRegistration[]; regulators: RegulatorKey[] } | InsurerRegistration[];
+      const f = JSON.parse(readFileSync(this.filersPath, "utf8")) as { filers: InsurerRegistration[]; regulators: { regulatorId: string; log: RootEvent[] }[] } | InsurerRegistration[];
       const filers = Array.isArray(f) ? f : f.filers;
       this.filers = new Map(filers.map((x) => [x.insurerId, x]));
       this.regulators = new Map((Array.isArray(f) ? [] : f.regulators).map((r) => [r.regulatorId, r]));
@@ -45,19 +50,38 @@ export class MockRegistry implements RegistryView {
     writeFileSync(this.path, JSON.stringify([...this.records.values()], null, 2));
     writeFileSync(this.filersPath, JSON.stringify({ filers: [...this.filers.values()], regulators: [...this.regulators.values()] }, null, 2));
   }
-  /** The registry pins its regulators (operator configuration at the upstream — the one binding that is the law's, not a protocol's). */
-  pinRegulator(r: RegulatorKey) {
-    this.regulators.set(r.regulatorId, r);
+  /** Bootstrap a regulator ONCE from its establishment event. A registry cannot be given a new root for a regulator it knows. */
+  pinRegulator(r: { regulatorId: string; establishment: RootEvent }) {
+    if (!verifyRootEventSelf(r.establishment) || r.establishment.reason !== "ESTABLISHMENT" || r.establishment.seq !== 0) throw new FilerRefusal("REGULATOR_ROTATION_UNAUTHORIZED", { error: "not a self-signed establishment event (seq 0)", regulatorId: r.regulatorId });
+    const cur = this.regulators.get(r.regulatorId);
+    if (cur && cur.log[0]?.rootKid !== r.establishment.rootKid) throw new FilerRefusal("REGULATOR_ROTATION_UNAUTHORIZED", { error: "this registry already knows this regulator by another root; a new key arrives only as a pre-committed rotation", regulatorId: r.regulatorId, knownRoot: cur.log[0]?.rootKid, offered: r.establishment.rootKid });
+    if (!cur) this.regulators.set(r.regulatorId, { regulatorId: r.regulatorId, log: [r.establishment] });
     this.persist();
   }
+  /** The regulator publishes a key event; the registry accepts it iff it extends the walk from the root it bootstrapped. */
+  acceptRegulatorEvent(regulatorId: string, event: RootEvent) {
+    const cur = this.regulators.get(regulatorId);
+    if (!cur) throw new FilerRefusal("REGULATOR_ROTATION_UNAUTHORIZED", { error: "unknown regulator", regulatorId });
+    if (cur.log.some((e) => e.seq === event.seq)) return; // already have it
+    const walk = walkRootLog(cur.log[0]!.rootPublicKey, [...cur.log, event]);
+    const rejected = walk?.rejected.find((x) => x.seq === event.seq);
+    if (!walk || rejected || !walk.roots.has(event.rootKid)) throw new FilerRefusal("REGULATOR_ROTATION_UNAUTHORIZED", { error: rejected?.why ?? "event does not extend the regulator's log", regulatorId, seq: event.seq, offeredKid: event.rootKid, currentKid: walk?.current.kid });
+    cur.log.push(event);
+    this.persist();
+  }
+  regulatorLog(regulatorId: string): RootEvent[] | null {
+    return this.regulators.get(regulatorId)?.log ?? null;
+  }
   allRegulators(): RegulatorKey[] {
-    return [...this.regulators.values()];
+    return [...this.regulators.values()].map((r) => ({ regulatorId: r.regulatorId, publicKey: walkRootLog(r.log[0]!.rootPublicKey, r.log)?.current.publicKey ?? r.log[0]!.rootPublicKey }));
   }
   private licenseOk(lic: RegulatorAttestation | undefined, legalName: string, publicKeyX: string): Record<string, unknown> | undefined {
     if (!lic) return { error: "no regulator attestation: the registry registers a filer's key on the regulator's word or not at all" };
-    const rk = this.regulators.get(lic.regulatorId);
-    if (!rk) return { error: `regulator ${lic.regulatorId} is not one this registry pins`, pinned: [...this.regulators.keys()] };
-    if (!verifyRegulatorAttestation(lic, rk.publicKey)) return { error: `attestation does not verify under ${lic.regulatorId}'s key` };
+    const reg = this.regulators.get(lic.regulatorId);
+    if (!reg) return { error: `regulator ${lic.regulatorId} is not one this registry pins`, pinned: [...this.regulators.keys()] };
+    const k = regulatorKeyAt({ regulatorId: reg.regulatorId, publicKey: reg.log[0]!.rootPublicKey }, reg.log, lic.kid, new Date(lic.asOf));
+    if (!k.ok) return { error: `${lic.regulatorId}: ${k.why}`, reasonCode: "REGULATOR_KEY_UNTRUSTED" };
+    if (!verifyRegulatorAttestation(lic, k.publicKey!)) return { error: `attestation does not verify under ${lic.regulatorId}'s key ${lic.kid.slice(0, 12)}…` };
     const check = filerKeyLicensed({ kid: lic.publicKey.kid ?? "", publicKey: { ...lic.publicKey, x: publicKeyX }, validFrom: "", licensedBy: lic }, legalName);
     if (!check.ok) return { error: check.why };
     if (lic.publicKey.x !== publicKeyX) return { error: "the regulator's attestation binds a different key than the one presented" };

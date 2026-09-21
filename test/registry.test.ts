@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { generateKeyPair, signJws } from "../src/protocol/crypto";
-import { attestationFreshAt, contradictedBy, coverageAssuredThrough, filerContradictedBy, filerKeyAt, filerKeyLicensed, filerKeyOfRecord, filingsShownBy, insurerContradictedBy, insurerOfRecord, insurerStanding, keyEventsShownBy, renewalWindow, satisfiesRenewal, signAttestation, signFilerAttestation, signInsurerAttestation, signRegulatorAttestation, standing, verifyAttestation, verifyFilerAttestation, verifyInsurerAttestation, verifyRegulatorAttestation, type InsurerRegistration, type RegistryAttestation, type RegistryRecord } from "../src/protocol/registry";
+import { attestationFreshAt, contradictedBy, coverageAssuredThrough, filerContradictedBy, filerKeyAt, filerKeyLicensed, filerKeyOfRecord, filingsShownBy, insurerContradictedBy, insurerOfRecord, insurerStanding, keyEventsShownBy, regulatorKeyAt, regulatorLogOfRecord, renewalWindow, satisfiesRenewal, signAttestation, signFilerAttestation, signInsurerAttestation, signRegulatorAttestation, signRegulatorLogAttestation, standing, verifyAttestation, verifyFilerAttestation, verifyInsurerAttestation, verifyRegulatorAttestation, verifyRegulatorLogAttestation, type InsurerRegistration, type RegistryAttestation, type RegistryRecord } from "../src/protocol/registry";
+import { rootCommitment, signRootEvent } from "../src/protocol/venue-keys";
 import { buildArtifact, verifyArtifact } from "../src/ledger/artifact";
 import { signCert } from "../src/protocol/venue-keys";
 import { buildMessage, signMessage } from "../src/protocol/envelope";
@@ -517,7 +518,7 @@ describe("artifact carries the registry's word", () => {
       expect(filerKeyLicensed({ ...K1, licensedBy: signRegulatorAttestation(regulator, "naic-mock", { naicCode: "12345", legalName: "Great Plains Mutual Insurance Co", publicKey: k1.publicJwk, licensed: false }) }, "Great Plains Mutual Insurance Co").why).toContain("NOT licensed");
       // A forged regulator attestation fails under the pinned regulator key; a regulator the verifier does not pin is refused.
       const forged = signRegulatorAttestation(generateKeyPair(), "naic-mock", { naicCode: "12345", legalName: "Great Plains Mutual Insurance Co", publicKey: k1.publicJwk });
-      expect(filerKeyLicensed({ ...K1, licensedBy: forged }, "Great Plains Mutual Insurance Co", [regulatorKey]).why).toContain("does not verify");
+      expect(filerKeyLicensed({ ...K1, licensedBy: forged }, "Great Plains Mutual Insurance Co", [regulatorKey]).why).toContain("not reachable from the pinned");
       expect(filerKeyLicensed(K1, "Great Plains Mutual Insurance Co", [{ regulatorId: "other-doi", publicKey: regulator.publicJwk }]).why).toContain("not one you pin");
       // The filer directory refuses an unlicensed key as "of record" even when every mirror shows it.
       const unlicensed = word(A, "mirror-a", reg([{ ...K1, licensedBy: undefined }]));
@@ -526,6 +527,59 @@ describe("artifact carries the registry's word", () => {
       const sameName = signInsurerAttestation(k2, "gpm-tx", policy, now, "Great Plains Mutual Insurance Co");
       expect(insurerOfRecord(sameName, [pub(CARRIER)])).toMatchObject({ ok: false, why: expect.stringContaining("a name is not an account") });
       expect(insurerOfRecord(signInsurerAttestation(k1, "great-plains-mutual", policy, now, "Great Plains Mutual Insurance Co"), [pub(CARRIER)]).ok).toBe(true);
+    });
+  });
+
+  describe("how anyone knows the regulator's key: a pre-rotation log, learned once", () => {
+    const A = generateKeyPair(), B = generateKeyPair();
+    const keys = [{ registryId: "mirror-a", publicKey: A.publicJwk }, { registryId: "mirror-b", publicKey: B.publicJwk }];
+    const r0 = generateKeyPair(), r1 = generateKeyPair(), r2 = generateKeyPair();
+    const now = new Date();
+    const t = (ms: number) => new Date(now.getTime() + ms);
+    const est = signRootEvent(r0, { seq: 0, nextRootCommitment: rootCommitment(r1.publicJwk), at: t(-10 * 86_400_000).toISOString(), reason: "ESTABLISHMENT" });
+    const rot = signRootEvent(r1, { seq: 1, previousRootKid: r0.kid, nextRootCommitment: rootCommitment(r2.publicJwk), at: t(-5 * 86_400_000).toISOString(), reason: "ROTATION" }, r0);
+    const pinned = { regulatorId: "naic-mock", publicKey: est.rootPublicKey };
+
+    it("a party that pinned the establishment key follows rotations mechanically, and cannot be walked to an uncommitted key", () => {
+      expect(regulatorKeyAt(pinned, [est, rot], r1.kid, now).ok).toBe(true);
+      expect(regulatorKeyAt(pinned, [est, rot], r0.kid, now).ok).toBe(true); // a routine rotation keeps the old key's past signatures good
+      // A thief holding r1 "rotates" to a key of their choosing: not the pre-committed successor.
+      const thief = generateKeyPair();
+      const forged = signRootEvent(thief, { seq: 2, previousRootKid: r1.kid, nextRootCommitment: rootCommitment(generateKeyPair().publicJwk), at: now.toISOString(), reason: "ROTATION" }, r1);
+      const w = regulatorKeyAt(pinned, [est, rot, forged], thief.kid, now);
+      expect(w.ok).toBe(false);
+      expect(w.why).toContain("not reachable");
+      // The real successor, declaring r1 compromised as of a time: r1's later signatures are void, earlier ones stand.
+      const comp = signRootEvent(r2, { seq: 2, previousRootKid: r1.kid, nextRootCommitment: rootCommitment(generateKeyPair().publicJwk), at: now.toISOString(), reason: "COMPROMISE", compromisedAt: t(-86_400_000).toISOString() });
+      expect(regulatorKeyAt(pinned, [est, rot, comp], r1.kid, t(-2 * 86_400_000)).ok).toBe(true);
+      expect(regulatorKeyAt(pinned, [est, rot, comp], r1.kid, now).why).toContain("compromised");
+      expect(regulatorKeyAt(pinned, [est, rot, comp], r2.kid, now).ok).toBe(true);
+      // Pinned a LATER key: earlier ones still resolve through the two-way link.
+      expect(regulatorKeyAt({ regulatorId: "naic-mock", publicKey: rot.rootPublicKey }, [est, rot], r0.kid, t(-7 * 86_400_000)).ok).toBe(true);
+    });
+
+    it("a license signed under a rotated key verifies for a verifier who pinned the establishment key, via the log", () => {
+      const k = generateKeyPair();
+      const lic = signRegulatorAttestation(r1, "naic-mock", { naicCode: "24601", legalName: "Great Plains Mutual Insurance Co", publicKey: k.publicJwk }, t(-86_400_000));
+      const key = { kid: k.kid, publicKey: k.publicJwk, validFrom: t(-86_400_000).toISOString(), licensedBy: lic };
+      expect(filerKeyLicensed(key, "Great Plains Mutual Insurance Co", [pinned], { "naic-mock": [est, rot] }).ok).toBe(true);
+      // Without the log, only the pinned key itself is the regulator's.
+      const noLog = filerKeyLicensed(key, "Great Plains Mutual Insurance Co", [pinned]);
+      expect(noLog.ok).toBe(false);
+      expect(noLog.keyUntrusted).toBe(true);
+    });
+
+    it("the registries' word on the regulator: unanimous on the head, the establishment key as anchor for whoever pins none", () => {
+      const wa = signRegulatorLogAttestation(A, "mirror-a", "naic-mock", [est, rot]);
+      const wb = signRegulatorLogAttestation(B, "mirror-b", "naic-mock", [est, rot]);
+      expect(verifyRegulatorLogAttestation(wa, A.publicJwk)).toBe(true);
+      expect(verifyRegulatorLogAttestation(wa, B.publicJwk)).toBe(false);
+      const rec = regulatorLogOfRecord([wa, wb]);
+      expect(rec.ok).toBe(true);
+      expect(rec.anchor?.publicKey.x).toBe(est.rootPublicKey.x);
+      // A mirror still showing the pre-rotation head dissents: a rotation is news that cannot be un-known.
+      const stale = signRegulatorLogAttestation(B, "mirror-b", "naic-mock", [est]);
+      expect(regulatorLogOfRecord([wa, stale])).toMatchObject({ ok: false, why: expect.stringContaining("disagree") });
     });
   });
 });

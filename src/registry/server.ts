@@ -10,7 +10,8 @@
  */
 import { startServer, type HttpRoute } from "../protocol/rpc";
 import { RegistryService } from "./service";
-import type { RegistryRecord, RegulatorKey } from "../protocol/registry";
+import type { RegistryRecord } from "../protocol/registry";
+import type { RootEvent } from "../protocol/venue-keys";
 import { FilerRefusal } from "./store";
 
 /** A refusal is an outcome, not a crash: the registry says why, with a reason code, and stays up. */
@@ -38,6 +39,11 @@ const routes: Record<string, HttpRoute> = {
   /** The registry's signed word about a registered filer (an insurer), as of now. */
   "GET /attest-filer": async (req) => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.attestFiler(new URL(req.url ?? "/", "http://localhost").searchParams.get("insurerId") ?? ""))),
   "GET /filers": async () => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.store.allFilers())),
+  /** The registry's signed word about a regulator's key log, as of now. */
+  "GET /attest-regulator": async (req) => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.attestRegulator(new URL(req.url ?? "/", "http://localhost").searchParams.get("regulatorId") ?? ""))),
+  "GET /regulators": async () => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.store.allRegulators())),
+  /** A regulator publishes a key event (rotation / compromise); accepted iff it extends the log from the bootstrapped root. */
+  "POST /regulators/event": async (_r, b) => refusable(() => { const f = b as { regulatorId: string; event: RootEvent }; svc.store.acceptRegulatorEvent(f.regulatorId, f.event); return { ok: true, log: svc.store.regulatorLog(f.regulatorId) }; }),
   /** STUB out-of-band channel (proof-of-control token, vetting flags). */
   "GET /stub/out-of-band": async (req) => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.outOfBand(usdotOf(req)) ?? null)),
 };
@@ -49,8 +55,8 @@ if (simMode) {
       svc.store.update(usdot, patch);
       return ok({ ok: true, recordHash: svc.store.snapshotHash(usdot) });
     },
-    /** The upstream pins a regulator (operator configuration at the registry — the law's binding, not a protocol's). */
-    "POST /admin/regulators": async (_r, b) => { svc.store.pinRegulator(b as RegulatorKey); return ok({ ok: true, regulators: svc.store.allRegulators().map((r) => r.regulatorId) }); },
+    /** The upstream bootstraps a regulator from its establishment event (operator configuration at the registry — the law's binding, not a protocol's), once. */
+    "POST /admin/regulators": async (_r, b) => refusable(() => { svc.store.pinRegulator(b as { regulatorId: string; establishment: RootEvent }); return { ok: true, regulators: svc.store.allRegulators().map((r) => r.regulatorId) }; }),
     /** The upstream onboards a filer on its regulator's word; the filer rotates (regulator) or revokes (itself or regulator) a key. */
     "POST /admin/filers": async (_r, b) => refusable(() => { const f = b as Parameters<typeof svc.store.registerFiler>[0]; svc.store.registerFiler(f); return { ok: true, filer: svc.store.filer(f.insurerId) }; }),
     "POST /admin/filers/rotate": async (_r, b) => refusable(() => { const f = b as Parameters<typeof svc.store.rotateFilerKey>[0]; svc.store.rotateFilerKey(f); return { ok: true, filer: svc.store.filer(f.insurerId) }; }),

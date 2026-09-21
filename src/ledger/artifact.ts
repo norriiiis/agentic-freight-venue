@@ -29,7 +29,7 @@ import type { Credential, CredentialStatusEntry } from "../protocol/types";
 import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyHistory } from "../protocol/venue-keys";
 import { verifyEquivocationProof, verifyReceipt, witnessedAsOf, type EquivocationProof, type WitnessKey, type Witnessed } from "../protocol/witness";
 import { findInclusion, verifyNotice, verifyPromise, type BrokenPromiseProof, type InclusionPromise, type PendingNotice } from "../protocol/inclusion";
-import { attestationFreshAt, contradictedBy, coverageAssuredThrough, filerContradictedBy, filerKeyOfRecord, filingShownByInsurer, filingsShownBy, insurerContradictedBy, insurerOfRecord, insurerStanding, keyEventsShownBy, renewalWindow, satisfiesRenewal, standing, standingProjection, verifyAttestation, verifyFilerAttestation, verifyInsurerAttestation, type FilerAttestation, type FilingEvidence, type InsurerAttestation, type InsurerKey, type RegistryAttestation, type RegistryKey, type RegulatorKey } from "../protocol/registry";
+import { attestationFreshAt, contradictedBy, coverageAssuredThrough, filerContradictedBy, filerKeyOfRecord, filingShownByInsurer, filingsShownBy, insurerContradictedBy, insurerOfRecord, insurerStanding, keyEventsShownBy, regulatorLogOfRecord, renewalWindow, satisfiesRenewal, standing, standingProjection, verifyAttestation, verifyFilerAttestation, verifyInsurerAttestation, verifyRegulatorLogAttestation, type FilerAttestation, type FilingEvidence, type InsurerAttestation, type InsurerKey, type RegistryAttestation, type RegistryKey, type RegulatorKey, type RegulatorLogAttestation } from "../protocol/registry";
 import { verifyChain, type LedgerEntry } from "./chain";
 import type { ReasonCode } from "../protocol/reasons";
 
@@ -76,7 +76,7 @@ export interface CommitmentArtifact {
    * registries mirror. `renewal` marks a CONDITIONAL commitment: the carrier's word falls short of delivery, and a
    * renewal signed at or after `earliestSignedAt` must be on file by `dueBy` (pickup) or the venue voids.
    */
-  insurance?: { broker?: InsurerAttestation; carrier?: InsurerAttestation; renewal?: { earliestSignedAt: string; dueBy: string; requiredBy: string }; filers?: { broker?: FilerAttestation[]; carrier?: FilerAttestation[] } };
+  insurance?: { broker?: InsurerAttestation; carrier?: InsurerAttestation; renewal?: { earliestSignedAt: string; dueBy: string; requiredBy: string }; filers?: { broker?: FilerAttestation[]; carrier?: FilerAttestation[] }; regulators?: RegulatorLogAttestation[] };
   underwriting: { decision: "GUARANTEED" | "UNGUARANTEED"; riskScore?: number; guarantee?: GuaranteeSummary; reasonCode?: ReasonCode };
   /** Position this record will occupy in the venue ledger (known before append, so it is inside the attestation). */
   ledger: { seq: number; prevHash: string };
@@ -248,13 +248,18 @@ export type KeyHistoryInput = Partial<Pick<VenueKeyHistory, "certs" | "revocatio
  * signed word that this licensed insurer files under this key, and the
  * registration carries that word; a key without it, or with one naming
  * another name or key, is FILER_UNLICENSED. `regulatorKeys` pins the
- * regulators and checks the signature itself; without them the registries'
- * onboarding is trusted to have, and only the binding's presence and
- * consistency are checked.
+ * regulators — ANY key each regulator ever had: the regulator's key-event
+ * log, as the registries attest it in the artifact (`insurance.regulators`)
+ * or today (`currentRegulatorAttestations`), is walked from the pinned key
+ * through pre-committed rotations, and the licensing signature must be by a
+ * key so reached and not since declared compromised as of before it
+ * (REGULATOR_KEY_UNTRUSTED). Without pinned regulators the registries'
+ * word anchors the log — k independent mirrors say who the regulator is —
+ * and the check says so.
  */
 export function verifyArtifact(
   a: CommitmentArtifact,
-  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; minWitnesses?: number; requiredWitnesses?: string[]; equivocationProofs?: EquivocationProof[]; inclusionPromises?: InclusionPromise[]; brokenPromises?: BrokenPromiseProof[]; pendingNotices?: PendingNotice[]; noticeSources?: WitnessKey[]; registryKeys?: RegistryKey[]; minRegistries?: number; requiredRegistries?: string[]; maxRegistryAgeMs?: number; currentAttestations?: RegistryAttestation[]; insurerKeys?: InsurerKey[]; requireInsurerAttestation?: boolean; requireInsurerUndertaking?: boolean; currentInsurerAttestations?: InsurerAttestation[]; currentFilerAttestations?: FilerAttestation[]; regulatorKeys?: RegulatorKey[]; renewals?: InsurerAttestation[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
+  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; minWitnesses?: number; requiredWitnesses?: string[]; equivocationProofs?: EquivocationProof[]; inclusionPromises?: InclusionPromise[]; brokenPromises?: BrokenPromiseProof[]; pendingNotices?: PendingNotice[]; noticeSources?: WitnessKey[]; registryKeys?: RegistryKey[]; minRegistries?: number; requiredRegistries?: string[]; maxRegistryAgeMs?: number; currentAttestations?: RegistryAttestation[]; insurerKeys?: InsurerKey[]; requireInsurerAttestation?: boolean; requireInsurerUndertaking?: boolean; currentInsurerAttestations?: InsurerAttestation[]; currentFilerAttestations?: FilerAttestation[]; regulatorKeys?: RegulatorKey[]; currentRegulatorAttestations?: RegulatorLogAttestation[]; renewals?: InsurerAttestation[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
 ): ArtifactVerification {
   const checks: ArtifactCheck[] = [];
   const push = (name: string, ok: boolean, detail?: string) => checks.push({ name, ok, detail });
@@ -443,17 +448,39 @@ export function verifyArtifact(
     // The registries' word on a filer: verified under pinned registry keys, quorum, fresh at commitment; unanimous on the key at `at`.
     const k = Math.max(1, opts.minRegistries ?? reg?.policy.quorum ?? 1);
     const maxAge = opts.maxRegistryAgeMs ?? reg?.policy.maxAgeMs ?? 5 * 60_000;
-    const filerWord = (side: "broker" | "carrier", insurerId: string, kid: string, at: Date): { ok: boolean; key?: OkpJwk; legalName?: string; why?: string; unlicensed?: string; qualifying: FilerAttestation[] } => {
+    // The regulators' key logs per the registries: verified under pinned registry keys, fresh at commitment (or today), unanimous on the head.
+    const regulatorWord = (regulatorId: string): { keys?: RegulatorKey; log?: RootEvent[]; anchoredBy: string; why?: string } => {
+      const all = [...(a.insurance?.regulators ?? []), ...(opts.currentRegulatorAttestations ?? [])].filter((r) => r.regulatorId === regulatorId);
+      const qualifying = all.filter((r) => { const key = regKeys.find((x) => x.registryId === r.registryId)?.publicKey; return !!key && verifyRegulatorLogAttestation(r, key) && (opts.currentRegulatorAttestations?.includes(r) || attestationFreshAt(r, reliedAt, maxAge).ok); });
+      const rec = regulatorLogOfRecord(qualifying);
+      const pinned = opts.regulatorKeys?.find((r) => r.regulatorId === regulatorId);
+      if (pinned) return { keys: pinned, log: rec.ok ? rec.log : undefined, anchoredBy: `your pinned ${regulatorId} key${rec.ok ? `, log per ${qualifying.map((q) => q.registryId).join(", ")}` : " alone (no registry word on its log)"}` };
+      if (rec.ok && qualifying.filter((q) => !opts.currentRegulatorAttestations?.includes(q)).length >= k) return { keys: rec.anchor, log: rec.log, anchoredBy: `the registries' word (${qualifying.map((q) => q.registryId).join(", ")}) — pin the regulator to anchor it yourself` };
+      return { anchoredBy: "nothing", why: rec.why ?? `${qualifying.length} registries vouch for who ${regulatorId} is; ${k} required` };
+    };
+    const filerWord = (side: "broker" | "carrier", insurerId: string, kid: string, at: Date): { ok: boolean; key?: OkpJwk; legalName?: string; why?: string; unlicensed?: string; regulatorKeyUntrusted?: boolean; qualifying: FilerAttestation[] } => {
       const all = [...(a.insurance?.filers?.[side] ?? []), ...(opts.currentFilerAttestations ?? [])].filter((f) => f.insurerId === insurerId);
       const qualifying = all.filter((f) => { const key = regKeys.find((r) => r.registryId === f.registryId)?.publicKey; return !!key && verifyFilerAttestation(f, key) && (opts.currentFilerAttestations?.includes(f) || attestationFreshAt(f, reliedAt, maxAge).ok); });
       const embeddedQualifying = qualifying.filter((f) => !opts.currentFilerAttestations?.includes(f));
       if (embeddedQualifying.length < k && !opts.currentFilerAttestations?.length) return { ok: false, why: `${embeddedQualifying.length} pinned registr${embeddedQualifying.length === 1 ? "y" : "ies"} vouch for who ${insurerId} is (${embeddedQualifying.map((f) => f.registryId).join(", ") || "none"}); ${k} required — the artifact does not establish whose key signed`, qualifying };
-      const r = filerKeyOfRecord(qualifying, kid, at, opts.regulatorKeys);
-      return { ok: r.ok, key: r.key?.publicKey, legalName: r.legalName, why: r.why, unlicensed: r.unlicensed, qualifying };
+      // Resolve every regulator the filer's keys cite, from a pinned key or the registries' anchor, through its log.
+      const regulatorIds = [...new Set(qualifying.flatMap((f) => f.registration?.keys.map((x) => x.licensedBy?.regulatorId).filter((x): x is string => !!x) ?? []))];
+      const rkeys: RegulatorKey[] = [];
+      const rlogs: Record<string, RootEvent[]> = {};
+      for (const id of regulatorIds) {
+        const w = regulatorWord(id);
+        if (w.keys) rkeys.push(w.keys);
+        if (w.log) rlogs[id] = w.log;
+        // Unanchored (no pinned key, no registry word) is reported, not failed: the licensing binding is then checked for presence and consistency only, as it was before regulators had logs.
+        push(`${side}.regulator[${id}].anchored`, !!w.keys || !opts.regulatorKeys, w.keys ? `anchored by ${w.anchoredBy}` : opts.regulatorKeys ? `no anchor for regulator ${id}: ${w.why}` : `NOT anchored — regulator signature unchecked (pin the regulator, or supply the registries' word on it): ${w.why}`);
+      }
+      const r = filerKeyOfRecord(qualifying, kid, at, rkeys.length || opts.regulatorKeys ? rkeys : undefined, rlogs);
+      return { ok: r.ok, key: r.key?.publicKey, legalName: r.legalName, why: r.why, unlicensed: r.unlicensed, regulatorKeyUntrusted: r.regulatorKeyUntrusted, qualifying };
     };
     const insurerKey = (id: string, kid: string, at: Date, side: "broker" | "carrier"): { key?: OkpJwk; legalName?: string; source: string; why?: string } => {
       const fw = filerWord(side, id, kid, at);
       if (fw.qualifying.length) push(`${side}.filer[${id}].licensed`, !fw.unlicensed, fw.unlicensed ?? "");
+      if (fw.regulatorKeyUntrusted) push(`${side}.filer[${id}].regulator-key-trusted`, false, fw.why ?? "");
       const pinned = pinnedInsurer(id);
       if (fw.ok && pinned && pinned.publicKey.x !== fw.key!.x) return { source: "conflict", why: `the key you pinned for ${id} (${pinned.publicKey.kid?.slice(0, 12)}…) is not the one the registries list for that filer at ${at.toISOString()} (${fw.key!.kid?.slice(0, 12)}…)` };
       if (fw.ok) return { key: fw.key, legalName: pinned?.insurerName ?? fw.legalName, source: `registries (${fw.qualifying.map((f) => f.registryId).join(", ")})` };
@@ -562,6 +589,7 @@ export function verifyArtifact(
   const insurerNotOfRecord = failed.some((c) => /\.insurer\[[^\]]+\]\.of-record$/.test(c.name));
   const insurerKeyNotOfRecord = failed.some((c) => /\.insurer\[[^\]]+\]\.key-of-record$/.test(c.name));
   const filerUnlicensed = failed.some((c) => /\.filer\[[^\]]+\]\.licensed$/.test(c.name));
+  const regulatorUntrusted = failed.some((c) => /\.filer\[[^\]]+\]\.regulator-key-trusted$|\.regulator\[[^\]]+\]\.anchored$/.test(c.name));
   const insurerFalse = failed.some((c) => /\.insurer\[[^\]]+\]\.true-when-signed$/.test(c.name));
   const undertakingMissing = failed.some((c) => c.name.endsWith(".insurer.undertaking"));
   const notAssured = failed.some((c) => c.name.endsWith(".insurer.assured-through-delivery"));
@@ -570,7 +598,7 @@ export function verifyArtifact(
   const renewalPending = failed.some((c) => c.name.endsWith(".insurer.renewal-due"));
   // Graded like NOTICE_PENDING: a conditional commitment before its deadline is not wrong, only not yet "fine".
   const pendingOnly = renewalPending && failed.every((c) => c.name.endsWith(".insurer.renewal-due") || /\.(witnessed|witness-quorum|fresh-as-of|complete-to-witnessed-head)$/.test(c.name));
-  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : equivocated ? "VENUE_EQUIVOCATION" : promiseBroken ? "INCLUSION_PROMISE_BROKEN" : noticePending ? "NOTICE_PENDING" : registryFalse ? "REGISTRY_FALSE_ATTESTATION" : insurerFalse ? "INSURER_FALSE_ATTESTATION" : insurerContradiction || renewalContradiction ? "INSURER_CONTRADICTS_COMMITMENT" : registryContradiction ? "REGISTRY_CONTRADICTS_COMMITMENT" : registryMissing ? "REGISTRY_ATTESTATION_MISSING" : registryStale ? "REGISTRY_STALE" : registryInvalid && registryQuorum ? "REGISTRY_ATTESTATION_INVALID" : registryQuorum ? "REGISTRY_QUORUM_NOT_MET" : registryInvalid ? "REGISTRY_ATTESTATION_INVALID" : registryDisagreement ? "REGISTRY_DISAGREEMENT" : insurerInvalid ? "INSURER_ATTESTATION_INVALID" : filerUnlicensed ? "FILER_UNLICENSED" : insurerKeyNotOfRecord ? "INSURER_KEY_NOT_OF_RECORD" : insurerNotOfRecord ? "INSURER_NOT_OF_RECORD" : insurerMissing ? "INSURER_ATTESTATION_MISSING" : undertakingMissing ? "INSURER_UNDERTAKING_MISSING" : notAssured ? "INSURANCE_NOT_ASSURED_THROUGH_DELIVERY" : renewalNotPresented ? "INSURANCE_RENEWAL_NOT_PRESENTED" : pendingOnly ? "INSURANCE_RENEWAL_PENDING" : quorumOnly ? "WITNESS_QUORUM_NOT_MET" : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
+  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : equivocated ? "VENUE_EQUIVOCATION" : promiseBroken ? "INCLUSION_PROMISE_BROKEN" : noticePending ? "NOTICE_PENDING" : registryFalse ? "REGISTRY_FALSE_ATTESTATION" : insurerFalse ? "INSURER_FALSE_ATTESTATION" : insurerContradiction || renewalContradiction ? "INSURER_CONTRADICTS_COMMITMENT" : registryContradiction ? "REGISTRY_CONTRADICTS_COMMITMENT" : registryMissing ? "REGISTRY_ATTESTATION_MISSING" : registryStale ? "REGISTRY_STALE" : registryInvalid && registryQuorum ? "REGISTRY_ATTESTATION_INVALID" : registryQuorum ? "REGISTRY_QUORUM_NOT_MET" : registryInvalid ? "REGISTRY_ATTESTATION_INVALID" : registryDisagreement ? "REGISTRY_DISAGREEMENT" : insurerInvalid ? "INSURER_ATTESTATION_INVALID" : regulatorUntrusted ? "REGULATOR_KEY_UNTRUSTED" : filerUnlicensed ? "FILER_UNLICENSED" : insurerKeyNotOfRecord ? "INSURER_KEY_NOT_OF_RECORD" : insurerNotOfRecord ? "INSURER_NOT_OF_RECORD" : insurerMissing ? "INSURER_ATTESTATION_MISSING" : undertakingMissing ? "INSURER_UNDERTAKING_MISSING" : notAssured ? "INSURANCE_NOT_ASSURED_THROUGH_DELIVERY" : renewalNotPresented ? "INSURANCE_RENEWAL_NOT_PRESENTED" : pendingOnly ? "INSURANCE_RENEWAL_PENDING" : quorumOnly ? "WITNESS_QUORUM_NOT_MET" : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
   return {
     ok: failed.length === 0,
     reasonCode,

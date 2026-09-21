@@ -77,11 +77,26 @@
  * key can revoke itself but not appoint its successor — a thief holding
  * it gains nothing — because, as everywhere in this system, the party
  * that uses a key does not hold the authority to replace it.
+ *
+ * And how anyone knows the REGULATOR's key. Nothing sits above a
+ * regulator to vouch for it, so its identity is the same construction as
+ * the venue root's: a key-event log with pre-rotation — each key commits
+ * to the hash of its successor, a rotation reveals the committed key and
+ * is signed by it, a compromise is declared by the successor as of a time.
+ * Whoever learned any key in the log, once, follows every rotation
+ * mechanically and can never be walked to a key the regulator did not
+ * pre-commit to (REGULATOR_KEY_UNTRUSTED); a thief holding the current
+ * key cannot rotate, because rotation needs the key the regulator holds
+ * offline. The registries mirror the log as a record — attested, quorum,
+ * unanimous, accountable — so a party that pins only the registries
+ * still learns the regulator's identity from k independent mirrors, and
+ * one that pinned the regulator itself cross-checks them.
  */
 import { hashObject } from "./canonical";
 import { importPublicKey, signJws, verifyJws, type KeyPair, type OkpJwk } from "./crypto";
 import type { ReasonCode } from "./reasons";
 import type { EntityType } from "./types";
+import { walkRootLog, type RootEvent } from "./venue-keys";
 
 export type FilingType = "BIPD" | "CARGO" | "BOND" | "TRUST_FUND";
 export type FilingForm = "BMC-91" | "BMC-91X" | "BMC-34" | "BMC-84" | "BMC-85";
@@ -345,9 +360,82 @@ export interface RegulatorAttestation {
   signature: string;
 }
 
+/** A pinned regulator key: ANY key in the regulator's log — the walk finds the rest. */
 export interface RegulatorKey {
   regulatorId: string;
   publicKey: OkpJwk;
+}
+
+/** The regulator's published key-event log: establishment, pre-committed rotations, compromise declarations. */
+export interface RegulatorLog {
+  regulatorId: string;
+  events: RootEvent[];
+}
+
+/**
+ * Which regulator key signed, and was it the regulator's at that time?
+ * Walk from the pinned key through the log: `kid` must be reachable by
+ * valid pre-committed rotations and not declared compromised as of before
+ * `at`. Without a log, only the pinned key itself is trusted.
+ */
+export function regulatorKeyAt(pinned: RegulatorKey, log: RootEvent[] | undefined, kid: string, at: Date): { ok: boolean; publicKey?: OkpJwk; why?: string; currentKid?: string } {
+  const walk = walkRootLog(pinned.publicKey, log ?? []);
+  if (!walk) return { ok: false, why: "regulator log does not walk from the pinned key" };
+  const r = walk.roots.get(kid);
+  if (!r) return { ok: false, why: `key ${kid.slice(0, 12)}… is not reachable from the pinned ${pinned.regulatorId} key by pre-committed rotations${walk.rejected.length ? ` (${walk.rejected.length} event(s) rejected: ${walk.rejected.map((x) => x.why).join("; ")})` : ""}`, currentKid: walk.current.kid };
+  if (r.untrustedFrom && new Date(r.untrustedFrom) <= at) return { ok: false, why: `key ${kid.slice(0, 12)}… was declared compromised as of ${r.untrustedFrom}; signature at ${at.toISOString()}`, currentKid: walk.current.kid };
+  return { ok: true, publicKey: r.publicKey, currentKid: walk.current.kid };
+}
+
+/** The registry's signed word about a regulator's key log, on the same terms as its word about an entity or a filer. */
+export interface RegulatorLogAttestation {
+  schema: "freight-venue/regulator-log-attestation/v1";
+  registryId: string;
+  regulatorId: string;
+  asOf: string;
+  upstreamAsOf?: string;
+  log: RootEvent[] | null;
+  recordHash: string;
+  kid: string;
+  signature: string;
+}
+
+export function signRegulatorLogAttestation(registry: KeyPair, registryId: string, regulatorId: string, log: RootEvent[] | null, now = new Date(), upstreamAsOf: Date = now): RegulatorLogAttestation {
+  const unsigned: Omit<RegulatorLogAttestation, "signature"> = { schema: "freight-venue/regulator-log-attestation/v1", registryId, regulatorId, asOf: now.toISOString(), upstreamAsOf: upstreamAsOf.toISOString(), log, recordHash: log ? hashObject(log) : "", kid: registry.kid };
+  return { ...unsigned, signature: signJws(unsigned, registry, { typ: "regulator-log-attestation+jws" }, true) };
+}
+
+export function verifyRegulatorLogAttestation(a: RegulatorLogAttestation, key: OkpJwk): boolean {
+  if (a.schema !== "freight-venue/regulator-log-attestation/v1") return false;
+  const { signature, ...unsigned } = a;
+  if ((a.log ? hashObject(a.log) : "") !== a.recordHash) return false;
+  try {
+    return verifyJws(signature, importPublicKey(key), unsigned).ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The regulator's log per the registries: every fresh mirror must show a
+ * log with the same current key (unanimity — a rotation is news that
+ * cannot be un-known); the longest is taken. With no pinned regulator key
+ * the log's establishment key is the anchor: the registries' word, k of n.
+ */
+export function regulatorLogOfRecord(atts: RegulatorLogAttestation[]): { ok: boolean; log?: RootEvent[]; anchor?: RegulatorKey; why?: string; currentKids: Record<string, string | null> } {
+  const currentKids: Record<string, string | null> = {};
+  let best: RootEvent[] | undefined;
+  for (const a of atts) {
+    const sorted = [...(a.log ?? [])].sort((x, y) => x.seq - y.seq);
+    currentKids[a.registryId] = sorted.at(-1)?.rootKid ?? null;
+    if (!best || sorted.length > best.length) best = sorted;
+  }
+  if (atts.length === 0) return { ok: false, why: "no registry word about this regulator", currentKids };
+  const heads = new Set(Object.values(currentKids));
+  if (heads.size > 1) return { ok: false, why: `registries disagree on the regulator's current key: ${Object.entries(currentKids).map(([r, k]) => `${r}=${k?.slice(0, 12) ?? "none"}…`).join(", ")}`, currentKids };
+  if (!best?.length) return { ok: false, why: "no such regulator", currentKids };
+  const first = best[0]!;
+  return { ok: true, log: best, anchor: { regulatorId: atts[0]!.regulatorId, publicKey: first.rootPublicKey }, currentKids };
 }
 
 export function signRegulatorAttestation(regulator: KeyPair, regulatorId: string, fields: { naicCode: string; legalName: string; publicKey: OkpJwk; licensed?: boolean }, now = new Date()): RegulatorAttestation {
@@ -371,7 +459,7 @@ export function verifyRegulatorAttestation(a: RegulatorAttestation, key: OkpJwk)
  * signature is checked; without, the registries' onboarding is trusted to
  * have checked it, and the binding's presence and consistency are.
  */
-export function filerKeyLicensed(key: FilerKey, legalName: string, regulatorKeys?: RegulatorKey[]): { ok: boolean; why?: string; regulatorId?: string } {
+export function filerKeyLicensed(key: FilerKey, legalName: string, regulatorKeys?: RegulatorKey[], regulatorLogs?: Record<string, RootEvent[]>): { ok: boolean; why?: string; regulatorId?: string; keyUntrusted?: boolean } {
   const lic = key.licensedBy;
   if (!lic) return { ok: false, why: `key ${key.kid.slice(0, 12)}… carries no regulator attestation: the registry onboarded it on nobody's word` };
   if (lic.publicKey.x !== key.publicKey.x) return { ok: false, why: `the regulator's attestation binds a different key (${lic.publicKey.kid?.slice(0, 12)}…) than the one registered`, regulatorId: lic.regulatorId };
@@ -380,7 +468,10 @@ export function filerKeyLicensed(key: FilerKey, legalName: string, regulatorKeys
   if (regulatorKeys) {
     const rk = regulatorKeys.find((r) => r.regulatorId === lic.regulatorId);
     if (!rk) return { ok: false, why: `regulator ${lic.regulatorId} is not one you pin`, regulatorId: lic.regulatorId };
-    if (!verifyRegulatorAttestation(lic, rk.publicKey)) return { ok: false, why: `regulator attestation does not verify under ${lic.regulatorId}'s pinned key`, regulatorId: lic.regulatorId };
+    // The signing key must be the regulator's at signing time: reachable from the pinned key by pre-committed rotations, not since declared compromised as of before.
+    const k = regulatorKeyAt(rk, regulatorLogs?.[lic.regulatorId], lic.kid, new Date(lic.asOf));
+    if (!k.ok) return { ok: false, why: `${lic.regulatorId}: ${k.why}`, regulatorId: lic.regulatorId, keyUntrusted: true };
+    if (!verifyRegulatorAttestation(lic, k.publicKey!)) return { ok: false, why: `regulator attestation does not verify under ${lic.regulatorId}'s key ${lic.kid.slice(0, 12)}…`, regulatorId: lic.regulatorId };
   }
   return { ok: true, regulatorId: lic.regulatorId };
 }
@@ -448,24 +539,25 @@ export function filerKeyAt(reg: InsurerRegistration | null, kid: string, at: Dat
  * show `kid` valid at `at` — unanimity, as for standing, because a
  * revocation is news that cannot be un-known. Names the dissent.
  */
-export function filerKeyOfRecord(atts: FilerAttestation[], kid: string, at: Date, regulatorKeys?: RegulatorKey[]): { ok: boolean; key?: FilerKey; legalName?: string; why?: string; showing: string[]; dissenting: string[]; unlicensed?: string } {
+export function filerKeyOfRecord(atts: FilerAttestation[], kid: string, at: Date, regulatorKeys?: RegulatorKey[], regulatorLogs?: Record<string, RootEvent[]>): { ok: boolean; key?: FilerKey; legalName?: string; why?: string; showing: string[]; dissenting: string[]; unlicensed?: string; regulatorKeyUntrusted?: boolean } {
   const showing: string[] = [];
   const dissenting: string[] = [];
   let key: FilerKey | undefined;
   let legalName: string | undefined;
   let unlicensed: string | undefined;
+  let regulatorKeyUntrusted = false;
   for (const a of atts) {
     const k = filerKeyAt(a.registration, kid, at);
     if (k) {
       showing.push(a.registryId);
       key ??= k;
       legalName ??= a.registration!.legalName;
-      const lic = filerKeyLicensed(k, a.registration!.legalName, regulatorKeys);
-      if (!lic.ok) unlicensed ??= `${a.registryId}: ${lic.why}`;
+      const lic = filerKeyLicensed(k, a.registration!.legalName, regulatorKeys, regulatorLogs);
+      if (!lic.ok) { unlicensed ??= `${a.registryId}: ${lic.why}`; regulatorKeyUntrusted ||= !!lic.keyUntrusted; }
     } else dissenting.push(a.registryId);
   }
   if (atts.length === 0) return { ok: false, why: "no registry word about this filer", showing, dissenting };
-  if (unlicensed && dissenting.length === 0) return { ok: false, key, legalName, why: unlicensed, showing, dissenting, unlicensed };
+  if (unlicensed && dissenting.length === 0) return { ok: false, key, legalName, why: unlicensed, showing, dissenting, unlicensed, regulatorKeyUntrusted };
   if (dissenting.length) {
     const first = atts.find((a) => a.registryId === dissenting[0])!;
     const known = first.registration?.keys.find((k) => k.kid === kid);
