@@ -14,6 +14,11 @@
  * --party-witnesses      also pin both parties' keys from the artifact itself (they witness their own transactions)
  * --require-witness id   a witness that MUST have cosigned the head (repeatable): your counterparty, your insurer, yourself
  * --equivocation-proof f a witness-signed proof file (repeatable); any valid one for this venue voids its publications
+ * --registry-key f[,id]  pin the registry (vetting-provider) signer: the artifact must carry ITS signed word on both
+ *                        parties, no older at commitment than --max-registry-age-ms (default: the venue's own declared
+ *                        policy), and the standing check is rerun over that word (REGISTRY_STALE / _CONTRADICTS_COMMITMENT)
+ * --registry-attestation f  the registry's word fetched today (repeatable): was the party in good standing at the
+ *                        commitment time in the artifact? Needs nothing from the venue.
  * Without the two lists the signatures still verify; a compromise declared after signing is invisible offline.
  * Uses nothing from the venue process. Exit code 0 iff the artifact verifies.
  */
@@ -21,6 +26,7 @@ import { readFileSync } from "node:fs";
 import { artifactHash, partyWitnessKeys, verifyArtifact, type CommitmentArtifact, type KeyHistoryInput } from "./artifact";
 import type { WitnessKey } from "../protocol/witness";
 import type { OkpJwk } from "../protocol/crypto";
+import type { RegistryAttestation, RegistryKey } from "../protocol/registry";
 import { verifyChain, type LedgerEntry } from "./chain";
 
 const args = process.argv.slice(2);
@@ -51,7 +57,14 @@ const minWitnesses = opt("--min-witnesses") ? Number(opt("--min-witnesses")) : u
 if (args.includes("--party-witnesses")) witnessKeys.push(...partyWitnessKeys(artifact));
 const requiredWitnesses = opts("--require-witness");
 const equivocationProofs = opts("--equivocation-proof").flatMap((f) => { const j = JSON.parse(readFileSync(f, "utf8")); return Array.isArray(j) ? j : [j]; });
-const res = verifyArtifact(artifact, { pinnedRootKey: pinned, keyHistory, statusList: statusList as never, witnessKeys: witnessKeys.length ? witnessKeys : undefined, minWitnesses, requiredWitnesses: requiredWitnesses.length ? requiredWitnesses : undefined, equivocationProofs: equivocationProofs.length ? equivocationProofs : undefined, asOf, maxStalenessMs, ledger: ledgerEntries });
+const registryKeys: RegistryKey[] = opts("--registry-key").map((spec) => {
+  const [file, id] = spec.split(",");
+  const key = JSON.parse(readFileSync(file!, "utf8")) as OkpJwk & { registryId?: string };
+  return { registryId: id ?? key.registryId ?? artifact.registry?.registryId ?? "registry", publicKey: key };
+});
+const currentAttestations = opts("--registry-attestation").map((f) => JSON.parse(readFileSync(f, "utf8")) as RegistryAttestation);
+const maxRegistryAgeMs = opt("--max-registry-age-ms") ? Number(opt("--max-registry-age-ms")) : undefined;
+const res = verifyArtifact(artifact, { pinnedRootKey: pinned, keyHistory, statusList: statusList as never, witnessKeys: witnessKeys.length ? witnessKeys : undefined, minWitnesses, requiredWitnesses: requiredWitnesses.length ? requiredWitnesses : undefined, equivocationProofs: equivocationProofs.length ? equivocationProofs : undefined, registryKeys: registryKeys.length ? registryKeys : undefined, currentAttestations: currentAttestations.length ? currentAttestations : undefined, maxRegistryAgeMs, asOf, maxStalenessMs, ledger: ledgerEntries });
 
 console.log(`Commitment ${artifact.commitmentId}`);
 console.log(`  load      ${res.summary.loadRef}`);
@@ -62,6 +75,7 @@ console.log(`  guarantee ${res.summary.guaranteed ? "attached" : "none"}`);
 console.log(`  venue root ${pinned ? "PINNED (supplied by you)" : "EMBEDDED (untrusted unless you pin it)"}; venue keys used: ${artifact.venue.certs.map((c) => c.kid.slice(0, 10) + "…").join(", ")}`);
 console.log(`  history    ${keyHistory ? "venue key history supplied — venue-key compromise is checked" : "no key history — a VENUE key compromise declared later cannot be detected offline"}`);
 console.log(`  status     ${statusList ? "credential status list supplied — agent-key compromise is checked" : "no status list — an AGENT key compromise declared later cannot be detected offline"}`);
+console.log(`  registry   ${artifact.registry ? `${artifact.registry.registryId} word on both parties embedded (venue policy ${artifact.registry.policy.maxAgeMs}ms); key ${registryKeys.length ? "PINNED (supplied by you)" : "EMBEDDED (the venue's choice of registry — pin one)"}${currentAttestations.length ? `; ${currentAttestations.length} current attestation(s) supplied` : ""}` : registryKeys.length ? "NONE embedded — the venue's standing checks are unverifiable" : "none embedded (pre-attestation artifact)"}`);
 console.log(`  witnesses  ${witnessKeys.length ? `${witnessKeys.map((w) => w.witnessId).join(", ")} pinned — lists are trusted only up to the latest witnessed time${res.witnessed?.statusAsOf ? ` (status ${res.witnessed.statusAsOf}` : ""}${res.witnessed?.keysAsOf ? `, keys ${res.witnessed.keysAsOf})` : res.witnessed?.statusAsOf ? ")" : ""}; judged as of ${(asOf ?? new Date()).toISOString()}` : "none pinned — the lists' asOf is the venue's own word"}`);
 console.log("");
 for (const c of res.checks) console.log(`  ${c.ok ? "PASS" : "FAIL"}  ${c.name}${!c.ok && c.detail ? `  — ${c.detail}` : ""}`);
@@ -78,5 +92,5 @@ if (ledgerPath) {
   if (!chain.ok || !included) process.exit(1);
 }
 console.log("");
-console.log(res.ok ? "VERIFIED: both parties signed these exact terms." : res.reasonCode === "VENUE_EQUIVOCATION" ? "NOT VERIFIED: VENUE_EQUIVOCATION — witnesses hold proof this venue showed different ledgers to different parties; do not rely on anything it publishes" : res.reasonCode === "STATUS_STALE" || res.reasonCode === "STATUS_NOT_WITNESSED" || res.reasonCode === "WITNESS_QUORUM_NOT_MET" ? `SIGNATURES GENUINE, STATUS UNCERTAIN: ${res.reasonCode} — a revocation or compromise after the witnessed time would be invisible; fetch a fresher, better-witnessed list` : `NOT VERIFIED: ${res.reasonCode}`);
+console.log(res.ok ? "VERIFIED: both parties signed these exact terms." : res.reasonCode === "VENUE_EQUIVOCATION" ? "NOT VERIFIED: VENUE_EQUIVOCATION — witnesses hold proof this venue showed different ledgers to different parties; do not rely on anything it publishes" : res.reasonCode === "STATUS_STALE" || res.reasonCode === "STATUS_NOT_WITNESSED" || res.reasonCode === "WITNESS_QUORUM_NOT_MET" ? `SIGNATURES GENUINE, STATUS UNCERTAIN: ${res.reasonCode} — a revocation or compromise after the witnessed time would be invisible; fetch a fresher, better-witnessed list` : res.reasonCode === "REGISTRY_STALE" ? "NOT VERIFIED: REGISTRY_STALE — the venue committed on registry word older than its own policy; whether the parties were in good standing is unknown from this artifact. Fetch the registry's word today (--registry-attestation) to settle it" : res.reasonCode === "REGISTRY_CONTRADICTS_COMMITMENT" ? "NOT VERIFIED: REGISTRY_CONTRADICTS_COMMITMENT — the registry's signed record shows a party was not in good standing when this commitment was made; the venue committed against the registry's word" : `NOT VERIFIED: ${res.reasonCode}`);
 process.exit(res.ok ? 0 : 1);

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeyPair } from "../src/protocol/crypto";
 import { buildMessage, signMessage } from "../src/protocol/envelope";
-import { MockRegistry } from "../src/identity/registry";
+import { MockRegistry } from "../src/registry/store";
 import { StubVettingProvider } from "../src/identity/vetting";
 import { CredentialIssuer } from "../src/identity/issuer";
 import { liveCheck, verifyCredential, verifyPresentation } from "../src/identity/verifier";

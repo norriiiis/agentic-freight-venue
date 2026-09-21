@@ -26,6 +26,8 @@ export interface VenueAttachment {
     publicKey: OkpJwk;
     insurance: { bipdUsd: number; cargoUsd: number; bondUsd: number };
     verifiedAt: string;
+    /** The registry's signed word these figures come from, and how old it was. */
+    registry?: { registryId: string; kid: string; asOf: string };
   };
   /** Present when the venue has already quoted a guarantee for this commitment. */
   guaranteeAvailable?: boolean;

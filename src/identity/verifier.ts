@@ -15,7 +15,7 @@ import { verifyMessageSignature } from "../protocol/envelope";
 import type { ReasonCode } from "../protocol/reasons";
 import type { Credential, CredentialStatusEntry } from "../protocol/types";
 import type { VenueKeyResolver } from "../protocol/venue-keys";
-import { authorityActive, hasBrokerAuthority, insuranceStatus, type InsuranceStatus, type MockRegistry } from "./registry";
+import { standing, type InsuranceStatus, type RegistryView } from "../protocol/registry";
 
 export interface Verdict {
   ok: boolean;
@@ -102,49 +102,42 @@ export interface LiveCheckResult extends Verdict {
   insurance?: InsuranceStatus;
   brokerAuthority?: boolean;
   registrySnapshotHash?: string;
+  /** Which signed registry word this verdict rests on (a mirror); absent for a bare store. */
+  registry?: { registryId: string; kid: string; asOf: string };
 }
 
+/**
+ * Standing NOW, per the registry's latest word the view holds. The caller is
+ * responsible for having refreshed that word (see RegistryView.refresh); the
+ * verdict names the attestation it relied on so the reliance is auditable.
+ */
 export function liveCheck(
-  registry: MockRegistry,
+  registry: RegistryView,
   cred: Credential,
-  opts: { now?: Date; hazmat?: boolean; requiredBipdUsd?: number } = {},
+  opts: { now?: Date; hazmat?: boolean; requiredBipdUsd?: number; through?: Date } = {},
 ): LiveCheckResult {
   const now = opts.now ?? new Date();
-  const rec = registry.get(cred.subject.entity.usdot);
-  if (!rec) return { ok: false, reasonCode: "ONBOARDING_ENTITY_NOT_FOUND", evidence: { usdot: cred.subject.entity.usdot } };
-  const snapshot = registry.snapshotHash(rec.usdot);
-  if (!authorityActive(rec, now)) {
+  const usdot = cred.subject.entity.usdot;
+  const rec = registry.get(usdot) ?? null;
+  const snapshot = registry.snapshotHash(usdot);
+  const att = registry.attestation?.(usdot);
+  const ref = att ? { registryId: att.registryId, kid: att.kid, asOf: att.asOf } : undefined;
+  const st = standing(rec, now, { hazmat: opts.hazmat, requiredBipdUsd: opts.requiredBipdUsd, through: opts.through });
+  if (!st.ok) {
     return {
       ok: false,
-      reasonCode: "AUTHORITY_NOT_ACTIVE",
-      evidence: { usdot: rec.usdot, operatingStatus: rec.operatingStatus, outOfServiceDate: rec.outOfServiceDate, authorities: rec.authorities, registrySnapshotHash: snapshot },
+      reasonCode: st.reasonCode,
+      insurance: st.insurance,
       registrySnapshotHash: snapshot,
-    };
-  }
-  const ins = insuranceStatus(rec, now, { hazmat: opts.hazmat, requiredBipdUsd: opts.requiredBipdUsd });
-  if (!ins.ok) {
-    return {
-      ok: false,
-      reasonCode: ins.reasonCode,
-      insurance: ins,
-      registrySnapshotHash: snapshot,
+      registry: ref,
       evidence: {
-        usdot: rec.usdot,
-        asOf: ins.asOf,
-        lapsedFilings: ins.lapsedFilings.map((f) => ({ type: f.type, form: f.form, insurer: f.insurer, policyNumber: f.policyNumber, cancellationDate: f.cancellationDate })),
-        activeBipdUsd: ins.bipdCoverageUsd,
-        requiredBipdUsd: opts.requiredBipdUsd,
+        ...st.evidence,
+        registrySnapshotHash: snapshot,
+        registry: ref,
         credentialIssuedWithSnapshot: cred.evidence.registrySnapshotHash,
-        registrySnapshotNow: snapshot,
         snapshotChangedSinceIssuance: cred.evidence.registrySnapshotHash !== snapshot,
       },
     };
   }
-  return {
-    ok: true,
-    insurance: ins,
-    brokerAuthority: hasBrokerAuthority(rec, now),
-    registrySnapshotHash: snapshot,
-    evidence: { usdot: rec.usdot, bipdUsd: ins.bipdCoverageUsd, cargoUsd: ins.cargoCoverageUsd, bondUsd: ins.bondUsd, safetyRating: rec.safetyRating, registrySnapshotHash: snapshot },
-  };
+  return { ok: true, insurance: st.insurance, brokerAuthority: st.brokerAuthority, registrySnapshotHash: snapshot, registry: ref, evidence: { ...st.evidence, registrySnapshotHash: snapshot, registry: ref } };
 }

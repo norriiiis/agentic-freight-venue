@@ -5,7 +5,7 @@
  *
  * STUB: returns the flags recorded in the mock registry fixture.
  */
-import type { MockRegistry } from "./registry";
+import type { RegistryView } from "../protocol/registry";
 
 export interface VettingAssessment {
   provider: string;
@@ -20,7 +20,7 @@ export interface VettingProvider {
 }
 
 export class StubVettingProvider implements VettingProvider {
-  constructor(private readonly registry: MockRegistry, private readonly name = "stub:highway-like") {}
+  constructor(private readonly registry: RegistryView, private readonly name = "stub:highway-like") {}
   async assess(usdot: string): Promise<VettingAssessment> {
     const rec = this.registry.get(usdot);
     const flags = rec?._vettingFlags ?? ["not-found"];

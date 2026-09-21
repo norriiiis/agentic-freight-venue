@@ -26,7 +26,8 @@ import { REASONS, type ReasonCode } from "../protocol/reasons";
 import { AuditLog, type Component } from "../protocol/audit";
 import { rpcCall, RpcRefusal } from "../protocol/rpc";
 import type { Credential, MandateEnvelope, RotationAuthorization, RotationClaims } from "../protocol/types";
-import { MockRegistry } from "../identity/registry";
+import { RegistryMirror, RegistryUnavailable } from "../identity/registry-mirror";
+import { hasBrokerAuthority, insuranceStatus, type RegistryAttestation, type RegistryKey } from "../protocol/registry";
 import { StubVettingProvider } from "../identity/vetting";
 import { CredentialIssuer } from "../identity/issuer";
 import { liveCheck, signatureTrustedAt, verifyCredential, verifyPresentation, type LiveCheckResult } from "../identity/verifier";
@@ -44,7 +45,12 @@ import { guaranteeWouldHavePaid } from "./guarantee-outcome";
 export interface VenueConfig {
   venueId: string;
   dataDir: string;
-  registryPath: string;
+  /** The registry process (mock FMCSA L&I / vetting-provider signer). The venue holds only what it signs. */
+  registryUrl: string;
+  /** Operator-pinned registry key; absent = trust on first use from the registry's well-known document. */
+  registryKey?: RegistryKey;
+  /** Freshness policy: the registry's signed word relied on at any step may be at most this old. Embedded in every artifact. */
+  registryMaxAgeMs: number;
   port: number;
   maxRounds: number;
   messageMaxAgeMs: number;
@@ -70,7 +76,7 @@ export class Refusal extends Error {
 export class VenueService {
   /** Venue key ring: root public key, ACTIVE operational key, certificates, revocations. Never cache `kp` across a rotation. */
   readonly keys: VenueKeyRing;
-  readonly registry: MockRegistry;
+  readonly registry: RegistryMirror;
   readonly issuer: CredentialIssuer;
   readonly ledger: Ledger;
   readonly underwriting: UnderwritingEngine;
@@ -83,14 +89,62 @@ export class VenueService {
     mkdirSync(config.dataDir, { recursive: true });
     this.keys = new VenueKeyRing(config.dataDir, config.venueId);
     this.url = `http://127.0.0.1:${config.port}`;
-    this.registry = new MockRegistry(config.registryPath);
-    this.issuer = new CredentialIssuer(config.venueId, () => this.keys.signer(), this.registry, new StubVettingProvider(this.registry), config.dataDir);
+    this.registry = new RegistryMirror(config.registryUrl, config.dataDir);
+    this.issuer = new CredentialIssuer(config.venueId, () => this.keys.signer(), this.registry, new StubVettingProvider(this.registry), config.dataDir, undefined, undefined, config.registryMaxAgeMs);
     this.ledger = new Ledger(join(config.dataDir, "ledger.jsonl"), () => this.keys.signer(), this.keys.currentCert(), this.keys.currentRootEvent());
     this.underwriting = new UnderwritingEngine(config.dataDir, { ...DEFAULT_PARAMS, ...config.underwriting });
     this.audit = new AuditLog(join(config.dataDir, "audit.jsonl"));
     this.state = new VenueState(config.dataDir);
     for (const w of config.witnesses ?? []) this.registerWitness(w);
     for (const src of config.noticeSources ?? []) this.registerNoticeSource(src);
+  }
+
+  /** Pin the registry key (configured, or TOFU from its well-known document). Must complete before serving. */
+  async init(): Promise<void> {
+    const k = await this.registry.init(this.config.registryKey);
+    this.audit.writeOnce(`registry-pinned:${k.registryId}:${k.publicKey.kid}`, { component: "venue.identity", event: "registry-pinned", outcome: "INFO", evidence: { registryId: k.registryId, kid: k.publicKey.kid, source: this.config.registryKey ? "operator-config" : "tofu", registryUrl: this.config.registryUrl } });
+  }
+
+  // ------------------------------------------------------------ registry
+  //
+  // Nobody is obliged to tell the venue that an insurer cancelled or FMCSA
+  // revoked: the registry is where those facts live. So before every step
+  // that relies on a party's standing, the venue obtains the registry's SIGNED
+  // word no older than its freshness policy — or refuses. What it relied on
+  // goes into the artifact, where a verifier holds it to the same policy.
+
+  /** Obtain a fresh attestation for each entity, or say which one could not be had. */
+  private async freshen(usdots: string[], now = new Date(), maxAgeMs = this.config.registryMaxAgeMs): Promise<{ ok: true; attestations: RegistryAttestation[] } | { ok: false; usdot: string; evidence: Record<string, unknown> }> {
+    const attestations: RegistryAttestation[] = [];
+    for (const usdot of [...new Set(usdots)]) {
+      try {
+        attestations.push(await this.registry.refresh(usdot, maxAgeMs, now));
+      } catch (e) {
+        const u = e as RegistryUnavailable;
+        const evidence = { usdot, error: u.why ?? u.message, lastAttestationAsOf: u.lastAsOf ?? this.registry.attestation(usdot)?.asOf ?? null, registryMaxAgeMs: this.config.registryMaxAgeMs, registryUrl: this.config.registryUrl };
+        this.audit.write({ component: "venue.identity", event: "registry-refresh", outcome: "REFUSED", reasonCode: "REGISTRY_UNAVAILABLE", subject: usdot, evidence });
+        return { ok: false, usdot, evidence };
+      }
+    }
+    return { ok: true, attestations };
+  }
+
+  /**
+   * Standing per the registry's word the mirror holds. Under the SIM `ignoreRegistry` fault a failing verdict is
+   * overridden and the coverage figures are reported as if no cancellation had been filed — a venue lying to the
+   * counterparty about what the registry says. The artifact still carries the registry's real signature, which is
+   * why the lie is detectable.
+   */
+  private live(cred: Credential, opts: Parameters<typeof liveCheck>[2] = {}): LiveCheckResult {
+    const r = liveCheck(this.registry, cred, opts);
+    if (!r.ok && this.simFault?.ignoreRegistry && process.env.SIM_MODE === "1") {
+      const rec = this.registry.get(cred.subject.entity.usdot);
+      const now = opts.now ?? new Date();
+      const pretend = rec ? insuranceStatus({ ...rec, insurance: rec.insurance.map((f) => ({ ...f, cancellationDate: undefined })) }, now, { hazmat: opts.hazmat, requiredBipdUsd: opts.requiredBipdUsd }) : undefined;
+      this.audit.write({ component: "sim", event: "registry-verdict-ignored", outcome: "INFO", subject: cred.subject.agentId, evidence: { reasonCode: r.reasonCode, ...r.evidence, reportedBipdUsd: pretend?.bipdCoverageUsd } });
+      return { ...r, ok: true, reasonCode: undefined, insurance: pretend ?? r.insurance, brokerAuthority: rec ? hasBrokerAuthority(rec, now) : r.brokerAuthority };
+    }
+    return r;
   }
 
   // ------------------------------------------------------- witnessed heads
@@ -646,9 +700,17 @@ export class VenueService {
     const contextId = `ctx_${data.load.loadRef}`;
     const violations: { code: ReasonCode; evidence: Record<string, unknown> }[] = [];
 
+    // (a0) the registry's fresh word on everyone involved — or nothing else is worth checking
+    const cp0 = this.state.agents.get(data.to.agentId);
+    const cpCred0 = cp0 ? this.issuer.get(cp0.credentialId) : undefined;
+    const through = new Date(data.load.destination.windowEnd);
+    const reg = await this.freshen([senderCred.subject.entity.usdot, ...(cpCred0 ? [cpCred0.subject.entity.usdot] : [])], now);
+    if (!reg.ok) violations.push({ code: "REGISTRY_UNAVAILABLE", evidence: reg.evidence });
+
     // (a) sender must be in good standing and hold brokerage authority to tender
-    const senderLive = liveCheck(this.registry, senderCred, { now });
-    if (!senderLive.ok) violations.push({ code: senderLive.reasonCode!, evidence: senderLive.evidence });
+    const senderLive = this.live(senderCred, { now, through });
+    if (!reg.ok) { /* standing is unknowable; already a violation */ }
+    else if (!senderLive.ok) violations.push({ code: senderLive.reasonCode!, evidence: senderLive.evidence });
     else if (!senderLive.brokerAuthority) violations.push({ code: "NO_BROKERAGE_AUTHORITY", evidence: { usdot: senderCred.subject.entity.usdot, entityType: senderCred.subject.entity.entityType, authorities: this.registry.get(senderCred.subject.entity.usdot)?.authorities } });
 
     // (b) double-brokering: is the sender the committed performing carrier for this load?
@@ -677,8 +739,8 @@ export class VenueService {
       if (!cv.ok || !cpCred) violations.push({ code: cv.reasonCode!, evidence: { counterparty: cp.agentId, ...cv.evidence } });
       else {
         const requiredBipd = sender.envelope?.limits.requiredCounterpartyInsuranceUsd;
-        cpLive = liveCheck(this.registry, cpCred, { now, hazmat: data.load.hazmat, requiredBipdUsd: requiredBipd });
-        if (!cpLive.ok) violations.push({ code: cpLive.reasonCode!, evidence: { counterparty: cp.agentId, ...cpLive.evidence } });
+        cpLive = this.live(cpCred, { now, hazmat: data.load.hazmat, requiredBipdUsd: requiredBipd, through });
+        if (reg.ok && !cpLive.ok) violations.push({ code: cpLive.reasonCode!, evidence: { counterparty: cp.agentId, ...cpLive.evidence } });
         if (cpCred.subject.entity.entityType === "BROKER") violations.push({ code: "PROTOCOL_VIOLATION", evidence: { error: "counterparty is not a carrier", entityType: cpCred.subject.entity.entityType } });
       }
     }
@@ -691,7 +753,7 @@ export class VenueService {
 
     if (violations.length) {
       // most specific first
-      const order: ReasonCode[] = ["DOUBLE_BROKERING_ATTEMPT", "LOAD_ALREADY_COMMITTED", "NO_BROKERAGE_AUTHORITY", "INSURANCE_LAPSED", "INSURANCE_BELOW_MINIMUM", "AUTHORITY_NOT_ACTIVE", "CREDENTIAL_REVOKED", "CREDENTIAL_EXPIRED", "COUNTERPARTY_UNVERIFIED", "MANDATE_RATE_ABOVE_CEILING", "MANDATE_RATE_BELOW_FLOOR", "MANDATE_LANE_NOT_APPROVED", "MANDATE_EQUIPMENT_NOT_APPROVED"];
+      const order: ReasonCode[] = ["DOUBLE_BROKERING_ATTEMPT", "LOAD_ALREADY_COMMITTED", "REGISTRY_UNAVAILABLE", "NO_BROKERAGE_AUTHORITY", "INSURANCE_LAPSED", "INSURANCE_CANCELLATION_PENDING", "INSURANCE_BELOW_MINIMUM", "AUTHORITY_NOT_ACTIVE", "CREDENTIAL_REVOKED", "CREDENTIAL_EXPIRED", "COUNTERPARTY_UNVERIFIED", "MANDATE_RATE_ABOVE_CEILING", "MANDATE_RATE_BELOW_FLOOR", "MANDATE_LANE_NOT_APPROVED", "MANDATE_EQUIPMENT_NOT_APPROVED"];
       const primary = [...violations].sort((a, b) => (order.indexOf(a.code) === -1 ? 99 : order.indexOf(a.code)) - (order.indexOf(b.code) === -1 ? 99 : order.indexOf(b.code)))[0]!;
       const refusedBy: Component = primary.code.startsWith("MANDATE_") ? "venue.mandate" : ["DOUBLE_BROKERING_ATTEMPT", "COUNTERPARTY_UNVERIFIED", "NO_BROKERAGE_AUTHORITY", "LOAD_ALREADY_COMMITTED"].includes(primary.code) ? "venue.routing" : "venue.identity";
       const evidence = { ...primary.evidence, allViolations: violations.map((v) => v.code), details: violations };
@@ -734,7 +796,18 @@ export class VenueService {
     t.task.history!.push(m);
     const otherId = sender.agentId === t.brokerAgentId ? t.carrierAgentId : t.brokerAgentId;
     const other = this.state.agents.get(otherId)!;
-    const senderLive = liveCheck(this.registry, senderCred, { hazmat: t.load.hazmat });
+    const otherCred = this.issuer.get(other.credentialId)!;
+    const through = new Date(t.load.destination.windowEnd);
+    const reg = await this.freshen([senderCred.subject.entity.usdot, otherCred.subject.entity.usdot]);
+    if (!reg.ok) {
+      await this.fail(t, "REGISTRY_UNAVAILABLE", "venue.identity", { ...reg.evidence, stage: data.type, round: data.round }, m, other);
+      return t.task;
+    }
+    const senderLive = this.live(senderCred, { hazmat: t.load.hazmat, through });
+    if (!senderLive.ok) {
+      await this.fail(t, senderLive.reasonCode!, "venue.identity", { stage: data.type, agentId: sender.agentId, ...senderLive.evidence }, m, other, sender.agentId);
+      return t.task;
+    }
 
     if (data.type === "REJECT") {
       await this.fail(t, "NEGOTIATION_WALKAWAY", "venue.protocol", { by: sender.agentId, round: data.round, reasonCode: data.reasonCode, ...textDigest(data.text) }, m, other);
@@ -777,8 +850,11 @@ export class VenueService {
       return t.task;
     }
     // Venue-side mandate envelope for the accepting party
-    const otherCred = this.issuer.get(other.credentialId)!;
-    const otherLive = liveCheck(this.registry, otherCred, { hazmat: t.load.hazmat });
+    const otherLive = this.live(otherCred, { hazmat: t.load.hazmat, through });
+    if (!otherLive.ok) {
+      await this.fail(t, otherLive.reasonCode!, "venue.identity", { stage: data.type, agentId: other.agentId, ...otherLive.evidence }, m, other, other.agentId);
+      return t.task;
+    }
     const env = sender.envelope;
     if (!env) {
       await this.fail(t, "MANDATE_ENVELOPE_MISSING", "venue.mandate", { agentId: sender.agentId }, m, other);
@@ -868,7 +944,7 @@ export class VenueService {
     const brokerReg = this.state.agents.get(t.brokerAgentId)!;
     const now = Date.now();
     const oldest = rec.authorities.filter((a) => a.status === "ACTIVE").map((a) => new Date(a.grantDate).getTime()).sort()[0] ?? now;
-    const live = liveCheck(this.registry, cred, { hazmat: t.load.hazmat });
+    const live = this.live(cred, { hazmat: t.load.hazmat });
     return {
       usdot: rec.usdot,
       authorityAgeDays: Math.floor((now - oldest) / 86_400_000),
@@ -917,16 +993,25 @@ export class VenueService {
     const brokerCred = this.issuer.get((t.acceptances[t.brokerAgentId]!.metadata as SignedMeta).credentialId)!;
     const carrierCred = this.issuer.get((t.acceptances[t.carrierAgentId]!.metadata as SignedMeta).credentialId)!;
 
-    // 1. PREPARE — final identity re-verification of both parties at the moment of commitment.
+    // 1. PREPARE — final identity re-verification of both parties at the moment of commitment, against the
+    //    registry's word obtained NOW. The attestations relied on go into the artifact: a verifier reruns the
+    //    same standing check over them and holds the venue to the freshness policy it declares.
+    const now = new Date();
+    const fresh = await this.freshen([terms.brokerEntity.usdot, terms.carrierEntity.usdot], now, 0); // NOW: not "recently enough"
+    if (!fresh.ok) {
+      await this.fail(t, "REGISTRY_UNAVAILABLE", "venue.identity", { stage: "commit", ...fresh.evidence }, undefined, undefined);
+      return;
+    }
     for (const [reg, cred] of [[brokerReg, this.issuer.get(brokerReg.credentialId)!], [carrierReg, this.issuer.get(carrierReg.credentialId)!]] as const) {
-      const cv = verifyCredential(cred, { issuerKeys: this.venueKeys(), status: this.issuer.status(cred.credentialId) });
-      const lv = cv.ok ? liveCheck(this.registry, cred, { hazmat: t.load.hazmat, requiredBipdUsd: reg.agentId === t.carrierAgentId ? brokerReg.envelope?.limits.requiredCounterpartyInsuranceUsd : undefined }) : undefined;
+      const cv = verifyCredential(cred, { issuerKeys: this.venueKeys(), status: this.issuer.status(cred.credentialId), now });
+      const lv = cv.ok ? this.live(cred, { now, hazmat: t.load.hazmat, requiredBipdUsd: reg.agentId === t.carrierAgentId ? brokerReg.envelope?.limits.requiredCounterpartyInsuranceUsd : undefined, through: new Date(terms.delivery.windowEnd) }) : undefined;
       const bad = !cv.ok ? cv : lv && !lv.ok ? lv : undefined;
       if (bad) {
         await this.fail(t, bad.reasonCode!, "venue.identity", { stage: "commit", agentId: reg.agentId, ...bad.evidence }, undefined, undefined);
         return;
       }
     }
+    const registryAtt = { broker: this.registry.attestation(terms.brokerEntity.usdot)!, carrier: this.registry.attestation(terms.carrierEntity.usdot)! };
     const quote = this.quoteFor(t, terms);
     const requireGuarantee = !!brokerReg.envelope?.limits.requireGuarantee || !!carrierReg.envelope?.limits.requireGuarantee;
     if (quote.decision === "DECLINED" && requireGuarantee) {
@@ -942,6 +1027,7 @@ export class VenueService {
         termsHash: termsHash(terms),
         acceptances: { broker: t.acceptances[t.brokerAgentId]!, carrier: t.acceptances[t.carrierAgentId]! },
         credentials: { broker: brokerCred, carrier: carrierCred },
+        registry: { registryId: this.registry.pinned!.registryId, publicKey: this.registry.pinned!.publicKey, attestations: registryAtt, policy: { maxAgeMs: this.config.registryMaxAgeMs } },
         underwriting: quote.decision === "GUARANTEED" ? { decision: "GUARANTEED", riskScore: quote.assessment.probabilityOfLoss, guarantee: quote.guarantee } : { decision: "UNGUARANTEED", riskScore: quote.assessment.probabilityOfLoss, reasonCode: quote.reasonCode },
         ledger: { seq: head.seq + 1, prevHash: head.hash },
       },
@@ -1135,7 +1221,7 @@ export class VenueService {
   }
 
   /** SIM-ONLY fault injection: die at a named point inside a commit. Never present in a deployed venue. */
-  simFault?: { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number }; suppressNotices?: boolean; dropNotices?: boolean };
+  simFault?: { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number }; suppressNotices?: boolean; dropNotices?: boolean; registryStale?: boolean; ignoreRegistry?: boolean };
   /** SIM-ONLY: receipts the fooled witness gave for heads of the fork view — the venue's second book. */
   private forkReceipts: Record<string, WitnessReceipt[]> = {};
 
@@ -1244,6 +1330,7 @@ export class VenueService {
         publicKey: fromCred.subject.publicKey,
         insurance: { bipdUsd: fromLive.insurance?.bipdCoverageUsd ?? 0, cargoUsd: fromLive.insurance?.cargoCoverageUsd ?? 0, bondUsd: fromLive.insurance?.bondUsd ?? 0 },
         verifiedAt: new Date().toISOString(),
+        registry: fromLive.registry,
       },
       guaranteeAvailable,
     };
@@ -1343,7 +1430,9 @@ export class VenueService {
         // and the SIGNING credential only for a compromise declared effective before the signature.
         const current = this.issuer.currentInLineage(signing.credentialId) ?? signing;
         const cv = verifyCredential(current, { issuerKeys: this.venueKeys(), status: this.issuer.status(current.credentialId), now });
-        const lv = cv.ok ? liveCheck(this.registry, current, { now, hazmat: c.artifact.terms.load.hazmat }) : undefined;
+        // Registry unreachable: standing is unknowable, not bad — do not void on an outage; the next check will ask again.
+        const reg = cv.ok ? await this.freshen([current.subject.entity.usdot], now) : undefined;
+        const lv = cv.ok && reg?.ok ? this.live(current, { now, hazmat: c.artifact.terms.load.hazmat, through: new Date(c.artifact.terms.delivery.windowEnd) }) : undefined;
         const st = signatureTrustedAt(signing, new Date((c.artifact.acceptances[side].metadata as SignedMeta).ts), this.issuer.status(signing.credentialId));
         const bad = !cv.ok ? cv : lv && !lv.ok ? lv : !st.ok ? st : undefined;
         if (!bad) continue;

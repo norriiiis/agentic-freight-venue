@@ -8,6 +8,7 @@ export function guaranteeWouldHavePaid(code: ReasonCode): string {
   switch (code) {
     case "INSURANCE_LAPSED":
     case "INSURANCE_BELOW_MINIMUM":
+    case "INSURANCE_CANCELLATION_PENDING":
     case "AUTHORITY_NOT_ACTIVE":
       return "No. Refused before commitment, so no guarantee attached. Even if missed, an uninsured carrier's accident is a liability/cargo loss — excluded (NON_PERFORMANCE / CARGO), not an identity failure.";
     case "IDENTITY_KEY_MISMATCH":
@@ -32,6 +33,12 @@ export function guaranteeWouldHavePaid(code: ReasonCode): string {
     case "VENUE_PORTFOLIO_LIMIT_EXCEEDED":
     case "UNDERWRITING_DECLINED_RISK":
       return "No — the venue declined to guarantee. Commitment was refused only because a party's mandate requires a guarantee; a principal whose mandate permits unguaranteed commits could proceed with NO coverage.";
+    case "REGISTRY_UNAVAILABLE":
+      return "N/A — refused before commitment: the venue could not obtain the registry's signed word and will not attest standing from memory. A liveness cost, not a coverage gap.";
+    case "REGISTRY_STALE":
+    case "REGISTRY_CONTRADICTS_COMMITMENT":
+    case "REGISTRY_ATTESTATION_MISSING":
+      return "The guarantee was attached on the venue's say-so, and the artifact shows that say-so was not backed by the registry's word at the time. The venue's own evidence indicts it: a claim against the venue, not against the guarantee's exclusions.";
     case "NEGOTIATION_MAX_ROUNDS":
     case "NEGOTIATION_WALKAWAY":
     case "NEGOTIATION_TIMEOUT":

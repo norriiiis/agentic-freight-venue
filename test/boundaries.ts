@@ -3,7 +3,8 @@
  *
  * The rule: agent code may depend only on stateless library code (protocol,
  * mandate engine, agentkit) — never on the other agent, the venue, or any
- * venue-side service. The venue never imports agent code.
+ * venue-side service. The venue never imports agent code, and never imports
+ * the registry process: the registry's word reaches it only as signatures.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
@@ -22,6 +23,11 @@ export const RULES: BoundaryRule[] = [
   { scope: "agentkit", allowed: ["protocol", "mandate", "agentkit"] },
   { scope: "venue", allowed: ["protocol", "mandate", "identity", "underwriting", "ledger", "venue"] },
   { scope: "witness", allowed: ["protocol", "ledger", "witness"] },
+  // The registry is its own trust domain: the venue reaches it only over HTTP and holds only what it signs.
+  { scope: "registry", allowed: ["protocol", "registry"] },
+  { scope: "identity", allowed: ["protocol", "identity"] },
+  { scope: "ledger", allowed: ["protocol", "ledger"] },
+  { scope: "underwriting", allowed: ["protocol", "mandate", "ledger", "underwriting"] },
   { scope: "mandate", allowed: ["protocol", "mandate"] },
   { scope: "protocol", allowed: ["protocol"] },
 ];

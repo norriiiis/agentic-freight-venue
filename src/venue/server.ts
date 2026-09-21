@@ -3,7 +3,9 @@
  * venue never receives or reads either agent's data directory.
  *
  *   VENUE_DATA_DIR       own state dir
- *   VENUE_REGISTRY_PATH  path to the mock FMCSA registry JSON
+ *   VENUE_REGISTRY_URL   the registry process (mock FMCSA L&I signer); the venue holds only what it signs
+ *   VENUE_REGISTRY_KEY   JSON { registryId, publicKey } pinned by the operator (default: trust on first use)
+ *   VENUE_REGISTRY_MAX_AGE_MS  freshness policy for the registry's word at every standing check (default 5 min)
  *   VENUE_PORT           listen port (127.0.0.1)
  *   VENUE_ID             venue identifier
  *   VENUE_MAX_ROUNDS     protocol bound on negotiation rounds
@@ -19,7 +21,9 @@ import type { OkpJwk } from "../protocol/crypto";
 const config = {
   venueId: process.env.VENUE_ID ?? "venue-local",
   dataDir: process.env.VENUE_DATA_DIR ?? ".data/venue",
-  registryPath: process.env.VENUE_REGISTRY_PATH ?? "src/identity/fixtures/registry.json",
+  registryUrl: process.env.VENUE_REGISTRY_URL ?? "http://127.0.0.1:4400",
+  registryKey: process.env.VENUE_REGISTRY_KEY ? JSON.parse(process.env.VENUE_REGISTRY_KEY) : undefined,
+  registryMaxAgeMs: Number(process.env.VENUE_REGISTRY_MAX_AGE_MS ?? 5 * 60_000),
   port: Number(process.env.VENUE_PORT ?? 4100),
   maxRounds: Number(process.env.VENUE_MAX_ROUNDS ?? 8),
   messageMaxAgeMs: Number(process.env.VENUE_MSG_MAX_AGE_MS ?? 5 * 60_000),
@@ -62,12 +66,8 @@ const routes: Record<string, HttpRoute> = {
 if (simMode) {
   // ---- SIM-ONLY. Never present in a deployed venue. ----
   const admin: Record<string, HttpRoute> = {
-    "POST /admin/registry/update": async (_r, b) => {
-      const { usdot, patch } = b as { usdot: string; patch: Record<string, unknown> };
-      venue.registry.update(usdot, patch);
-      venue.audit.write({ component: "sim", event: "registry-mutation", outcome: "INFO", subject: usdot, evidence: { patch } });
-      return ok({ ok: true, snapshotHash: venue.registry.snapshotHash(usdot) });
-    },
+    /** What the venue holds of the registry's word: the attestations it last verified. */
+    "GET /admin/registry-mirror": async () => ok({ pinned: venue.registry.pinned ?? null, stale: venue.registry.stale, attestations: venue.registry.all().map((a) => ({ usdot: a.usdot, asOf: a.asOf, recordHash: a.recordHash, kid: a.kid })) }),
     "POST /admin/credential/revoke": async (_r, b) => {
       const { agentId, reason, evidence } = b as { agentId: string; reason: string; evidence?: Record<string, unknown> };
       const entry = venue.revokeCredential(agentId, reason, evidence);
@@ -87,9 +87,11 @@ if (simMode) {
     },
     /** Crash the venue process at a named point inside the next commit (after-journal | after-ledger-append | after-apply). */
     "POST /admin/fault": async (_r, b) => {
-      const { crashAt, holdOutbox, equivocate, suppressNotices, dropNotices } = b as { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number }; suppressNotices?: boolean; dropNotices?: boolean };
-      venue.simFault = crashAt || holdOutbox || equivocate || suppressNotices || dropNotices ? { crashAt: crashAt || undefined, holdOutbox: !!holdOutbox, equivocate, suppressNotices: !!suppressNotices, dropNotices: !!dropNotices } : undefined;
-      venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null, holdOutbox: !!holdOutbox, equivocate: equivocate ?? null, suppressNotices: !!suppressNotices, dropNotices: !!dropNotices } });
+      const { crashAt, holdOutbox, equivocate, suppressNotices, dropNotices, registryStale, ignoreRegistry } = b as { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number }; suppressNotices?: boolean; dropNotices?: boolean; registryStale?: boolean; ignoreRegistry?: boolean };
+      venue.simFault = crashAt || holdOutbox || equivocate || suppressNotices || dropNotices || registryStale || ignoreRegistry ? { crashAt: crashAt || undefined, holdOutbox: !!holdOutbox, equivocate, suppressNotices: !!suppressNotices, dropNotices: !!dropNotices, registryStale: !!registryStale, ignoreRegistry: !!ignoreRegistry } : undefined;
+      // A venue that read the registry once and never again: the mirror serves what it has.
+      venue.registry.stale = !!registryStale;
+      venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null, holdOutbox: !!holdOutbox, equivocate: equivocate ?? null, suppressNotices: !!suppressNotices, dropNotices: !!dropNotices, registryStale: !!registryStale, ignoreRegistry: !!ignoreRegistry } });
       return ok({ ok: true, fault: venue.simFault ?? null });
     },
     "POST /admin/flush-outbox": async () => { await venue.flushOutbox(); return ok({ pending: venue.state.outbox.length, deadLetter: venue.state.deadLetter.length }); },
@@ -126,8 +128,8 @@ if (simMode) {
   Object.assign(routes, admin);
 }
 
-// Recover BEFORE serving: reconcile journal vs ledger, finish in-flight commits, re-deliver owed notices.
-venue.recover().then((r) => {
+// Pin the registry key, then recover BEFORE serving: reconcile journal vs ledger, finish in-flight commits, re-deliver owed notices.
+venue.init().then(() => venue.recover()).then((r) => {
   if (r.applied.length || r.aborted.length || r.retried.length || r.redelivered) console.log(`[venue] recovery: applied=${r.applied.length} aborted=${r.aborted.length} retried=${r.retried.length} redelivered=${r.redelivered}`);
   return startServer(config.port, {
     rpcPath: "/a2a",

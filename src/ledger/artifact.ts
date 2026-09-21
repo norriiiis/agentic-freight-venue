@@ -7,6 +7,10 @@
  *     signer's detached JWS over the message (which contains the full terms)
  *   - both parties' credentials are included, binding each key to a registry
  *     entity, signed by the venue's issuer key
+ *   - the REGISTRY's signed word about each party, as the venue held it at
+ *     commitment: a verifier reruns the standing check over it and holds the
+ *     venue to the freshness policy it declares — "the venue checked" is not
+ *     a claim anyone has to take on trust
  *   - the venue's attestation signature covers the whole bundle
  *   - a ledger inclusion pointer lets anyone with the ledger file confirm
  *     the record's position in the chain
@@ -25,6 +29,7 @@ import type { Credential, CredentialStatusEntry } from "../protocol/types";
 import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyHistory } from "../protocol/venue-keys";
 import { verifyEquivocationProof, verifyReceipt, witnessedAsOf, type EquivocationProof, type WitnessKey, type Witnessed } from "../protocol/witness";
 import { findInclusion, verifyNotice, verifyPromise, type BrokenPromiseProof, type InclusionPromise, type PendingNotice } from "../protocol/inclusion";
+import { attestationFreshAt, standing, verifyAttestation, type RegistryAttestation, type RegistryKey } from "../protocol/registry";
 import { verifyChain, type LedgerEntry } from "./chain";
 import type { ReasonCode } from "../protocol/reasons";
 
@@ -58,6 +63,13 @@ export interface CommitmentArtifact {
   termsHash: string;
   acceptances: { broker: Message; carrier: Message };
   credentials: { broker: Credential; carrier: Credential };
+  /**
+   * The registry's signed word on each party that the venue relied on at
+   * commitment, and the venue's own freshness policy. Absent only in
+   * artifacts from before registry attestations existed; a verifier that pins
+   * a registry key treats absence as REGISTRY_ATTESTATION_MISSING.
+   */
+  registry?: { registryId: string; publicKey: OkpJwk; attestations: { broker: RegistryAttestation; carrier: RegistryAttestation }; policy: { maxAgeMs: number } };
   underwriting: { decision: "GUARANTEED" | "UNGUARANTEED"; riskScore?: number; guarantee?: GuaranteeSummary; reasonCode?: ReasonCode };
   /** Position this record will occupy in the venue ledger (known before append, so it is inside the attestation). */
   ledger: { seq: number; prevHash: string };
@@ -165,10 +177,20 @@ export type KeyHistoryInput = Partial<Pick<VenueKeyHistory, "certs" | "revocatio
  * ledger. `pendingNotices` are source-signed notices a pinned witness holds
  * that the venue never acknowledged: not proof of anything, but status is
  * uncertain until they appear (NOTICE_PENDING).
+ *
+ * Registry. `registryKeys` pins the registry (vetting-provider) signer; the
+ * attestations the venue embedded must verify under it, be about the
+ * committed parties, and be no older at `createdAt` than `maxRegistryAgeMs`
+ * (default: the policy the venue itself declares in the artifact) — else the
+ * venue committed on stale word: REGISTRY_STALE. The standing check is then
+ * RERUN over the attested record: a lapse the registry had already published
+ * is REGISTRY_CONTRADICTS_COMMITMENT, the venue's own evidence against it.
+ * `currentAttestations` — the registry's word fetched today — answers the
+ * same question without the venue's help: cancellation dates are history.
  */
 export function verifyArtifact(
   a: CommitmentArtifact,
-  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; minWitnesses?: number; requiredWitnesses?: string[]; equivocationProofs?: EquivocationProof[]; inclusionPromises?: InclusionPromise[]; brokenPromises?: BrokenPromiseProof[]; pendingNotices?: PendingNotice[]; noticeSources?: WitnessKey[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
+  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; minWitnesses?: number; requiredWitnesses?: string[]; equivocationProofs?: EquivocationProof[]; inclusionPromises?: InclusionPromise[]; brokenPromises?: BrokenPromiseProof[]; pendingNotices?: PendingNotice[]; noticeSources?: WitnessKey[]; registryKeys?: RegistryKey[]; maxRegistryAgeMs?: number; currentAttestations?: RegistryAttestation[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
 ): ArtifactVerification {
   const checks: ArtifactCheck[] = [];
   const push = (name: string, ok: boolean, detail?: string) => checks.push({ name, ok, detail });
@@ -289,6 +311,41 @@ export function verifyArtifact(
     }
   }
 
+  // 5. The registry's word: what the venue relied on, fresh enough, and consistent with committing.
+  const reg = a.registry;
+  const regKeys = opts.registryKeys ?? (reg ? [{ registryId: reg.registryId, publicKey: reg.publicKey }] : []);
+  if (opts.registryKeys || reg) {
+    const reliedAt = new Date(a.createdAt);
+    const through = new Date(a.terms.delivery.windowEnd);
+    push("registry.attestations-present", !!reg, opts.registryKeys ? "the artifact carries no registry attestation: the venue's claim to have checked standing cannot be verified" : "");
+    if (reg) {
+      const maxAge = opts.maxRegistryAgeMs ?? reg.policy.maxAgeMs;
+      if (opts.registryKeys) push("registry.key-pinned", opts.registryKeys.some((k) => k.registryId === reg.registryId && k.publicKey.x === reg.publicKey.x), `the venue names registry ${reg.registryId} under a key that is not the pinned one`);
+      for (const side of ["broker", "carrier"] as const) {
+        const att = reg.attestations[side];
+        const cred = a.credentials[side];
+        const key = regKeys.find((k) => k.registryId === att.registryId);
+        const signed = !!key && verifyAttestation(att, key.publicKey);
+        push(`${side}.registry.attestation-signed`, signed, key ? "attestation does not verify under the pinned registry key" : `no pinned key for registry ${att.registryId}`);
+        push(`${side}.registry.attestation-subject`, att.usdot === cred.subject.entity.usdot && (!att.record || att.record.usdot === att.usdot), `attestation is about ${att.usdot}, credential binds ${cred.subject.entity.usdot}`);
+        const fresh = attestationFreshAt(att, reliedAt, maxAge);
+        push(`${side}.registry.fresh-at-commitment`, fresh.ok, fresh.ok ? `registry word ${fresh.ageMs}ms old at commitment (policy ${maxAge}ms)` : `registry word was ${fresh.ageMs}ms old at commitment; policy allows ${maxAge}ms — a cancellation filed in between was invisible to the venue, and it did not ask`);
+        const st = standing(att.record, reliedAt, { hazmat: a.terms.load.hazmat, through });
+        push(`${side}.registry.standing-at-commitment`, st.ok, st.ok ? `${st.reasonCode ?? "in good standing"} per registry as of ${att.asOf}` : `${st.reasonCode}: the registry's own record, which the venue held, shows this at ${reliedAt.toISOString()} — ${JSON.stringify(st.evidence).slice(0, 200)}`);
+      }
+    }
+    for (const cur of opts.currentAttestations ?? []) {
+      const side = cur.usdot === a.credentials.broker.subject.entity.usdot ? "broker" : cur.usdot === a.credentials.carrier.subject.entity.usdot ? "carrier" : undefined;
+      if (!side) continue;
+      const key = regKeys.find((k) => k.registryId === cur.registryId);
+      const signed = !!key && verifyAttestation(cur, key.publicKey);
+      push(`${side}.registry.current-attestation-signed`, signed, "current registry attestation does not verify under the pinned registry key");
+      if (!signed) continue;
+      const st = standing(cur.record, reliedAt, { hazmat: a.terms.load.hazmat, through });
+      push(`${side}.registry.standing-per-current-record`, st.ok, st.ok ? `in good standing at commitment per registry as of ${cur.asOf}` : `${st.reasonCode}: the registry's record as of ${cur.asOf} shows this party was NOT in good standing at ${reliedAt.toISOString()} — ${JSON.stringify(st.evidence).slice(0, 200)}`);
+    }
+  }
+
   const failed = checks.filter((c) => !c.ok);
   const equivocated = failed.some((c) => c.name === "venue.no-equivocation");
   const promiseBroken = failed.some((c) => c.name === "venue.honours-inclusion-promises" || (c.name.startsWith("inclusion[") && !c.name.endsWith(".promise-valid")));
@@ -298,7 +355,11 @@ export function verifyArtifact(
   const structural = failed.some((c) => /\.signature$|terms\.hash|-match$/.test(c.name) && !c.name.startsWith("venue.attestation["));
   const venueKeyProblem = failed.some((c) => c.name === "venue.attestation.any-trusted" || c.name.endsWith("issuer-trusted-at-issuance") || c.name === "venue.certs.signed-by-root" || c.name === "venue.root.pinned-reaches-embedded");
   const agentKeyProblem = failed.some((c) => c.name.endsWith("credential.trusted-at-signing"));
-  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : equivocated ? "VENUE_EQUIVOCATION" : promiseBroken ? "INCLUSION_PROMISE_BROKEN" : noticePending ? "NOTICE_PENDING" : quorumOnly ? "WITNESS_QUORUM_NOT_MET" : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
+  const registryContradiction = failed.some((c) => /\.registry\.standing-(at-commitment|per-current-record)$/.test(c.name));
+  const registryMissing = failed.some((c) => c.name === "registry.attestations-present");
+  const registryInvalid = failed.some((c) => c.name === "registry.key-pinned" || /\.registry\.(attestation-signed|attestation-subject|current-attestation-signed)$/.test(c.name));
+  const registryStale = failed.some((c) => c.name.endsWith(".registry.fresh-at-commitment"));
+  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : equivocated ? "VENUE_EQUIVOCATION" : promiseBroken ? "INCLUSION_PROMISE_BROKEN" : noticePending ? "NOTICE_PENDING" : registryContradiction ? "REGISTRY_CONTRADICTS_COMMITMENT" : registryMissing ? "REGISTRY_ATTESTATION_MISSING" : registryInvalid ? "REGISTRY_ATTESTATION_INVALID" : registryStale ? "REGISTRY_STALE" : quorumOnly ? "WITNESS_QUORUM_NOT_MET" : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
   return {
     ok: failed.length === 0,
     reasonCode,
