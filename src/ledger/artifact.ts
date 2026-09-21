@@ -29,7 +29,7 @@ import type { Credential, CredentialStatusEntry } from "../protocol/types";
 import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyHistory } from "../protocol/venue-keys";
 import { verifyEquivocationProof, verifyReceipt, witnessedAsOf, type EquivocationProof, type WitnessKey, type Witnessed } from "../protocol/witness";
 import { findInclusion, verifyNotice, verifyPromise, type BrokenPromiseProof, type InclusionPromise, type PendingNotice } from "../protocol/inclusion";
-import { attestationFreshAt, contradictedBy, coverageAssuredThrough, filingShownByInsurer, filingsShownBy, insurerStanding, renewalWindow, satisfiesRenewal, standing, standingProjection, verifyAttestation, verifyInsurerAttestation, type FilingEvidence, type InsurerAttestation, type RegistryAttestation, type RegistryKey } from "../protocol/registry";
+import { attestationFreshAt, contradictedBy, coverageAssuredThrough, filingShownByInsurer, filingsShownBy, insurerContradictedBy, insurerOfRecord, insurerStanding, renewalWindow, satisfiesRenewal, standing, standingProjection, verifyAttestation, verifyInsurerAttestation, type FilingEvidence, type InsurerAttestation, type InsurerKey, type RegistryAttestation, type RegistryKey } from "../protocol/registry";
 import { verifyChain, type LedgerEntry } from "./chain";
 import type { ReasonCode } from "../protocol/reasons";
 
@@ -221,10 +221,21 @@ export type KeyHistoryInput = Partial<Pick<VenueKeyHistory, "certs" | "revocatio
  * `asOf`, the verdict is INSURANCE_RENEWAL_PENDING before the deadline,
  * INSURANCE_RENEWAL_NOT_PRESENTED after it, and
  * INSURANCE_NOT_ASSURED_THROUGH_DELIVERY when no renewal could ever help.
+ *
+ * The origin's honesty. An insurer's word counts only if it is the insurer
+ * OF RECORD's — the registry's filing names the insurer (`insurerName` on
+ * the pinned key, or in the attestation) and the policy
+ * (INSURER_NOT_OF_RECORD) — and not a signed falsehood: an insurer that
+ * signed "no cancellation" after the date the registry received its own
+ * filing is convicted by the mirrors' word, symmetric with how the mirrors
+ * are convicted by its (INSURER_FALSE_ATTESTATION). `requireInsurerUndertaking`
+ * accepts only an attestation carrying the insurer's signed promise not to
+ * deny a covered loss for an undisclosed lapse (INSURER_UNDERTAKING_MISSING):
+ * a certificate is a belief; an undertaking is a liability.
  */
 export function verifyArtifact(
   a: CommitmentArtifact,
-  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; minWitnesses?: number; requiredWitnesses?: string[]; equivocationProofs?: EquivocationProof[]; inclusionPromises?: InclusionPromise[]; brokenPromises?: BrokenPromiseProof[]; pendingNotices?: PendingNotice[]; noticeSources?: WitnessKey[]; registryKeys?: RegistryKey[]; minRegistries?: number; requiredRegistries?: string[]; maxRegistryAgeMs?: number; currentAttestations?: RegistryAttestation[]; insurerKeys?: WitnessKey[]; requireInsurerAttestation?: boolean; currentInsurerAttestations?: InsurerAttestation[]; renewals?: InsurerAttestation[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
+  opts: { pinnedRootKey?: OkpJwk; keyHistory?: KeyHistoryInput; statusList?: StatusListInput; witnessKeys?: WitnessKey[]; minWitnesses?: number; requiredWitnesses?: string[]; equivocationProofs?: EquivocationProof[]; inclusionPromises?: InclusionPromise[]; brokenPromises?: BrokenPromiseProof[]; pendingNotices?: PendingNotice[]; noticeSources?: WitnessKey[]; registryKeys?: RegistryKey[]; minRegistries?: number; requiredRegistries?: string[]; maxRegistryAgeMs?: number; currentAttestations?: RegistryAttestation[]; insurerKeys?: InsurerKey[]; requireInsurerAttestation?: boolean; requireInsurerUndertaking?: boolean; currentInsurerAttestations?: InsurerAttestation[]; renewals?: InsurerAttestation[]; asOf?: Date; maxStalenessMs?: number; ledger?: LedgerEntry[]; now?: Date } = {},
 ): ArtifactVerification {
   const checks: ArtifactCheck[] = [];
   const push = (name: string, ok: boolean, detail?: string) => checks.push({ name, ok, detail });
@@ -409,7 +420,8 @@ export function verifyArtifact(
   if (reg || insurerRelevant) {
     const reliedAt = new Date(a.createdAt);
     const through = new Date(a.terms.delivery.windowEnd);
-    const insurerKey = (id: string) => opts.insurerKeys?.find((k) => k.witnessId === id)?.publicKey;
+    const insurerKey = (id: string) => opts.insurerKeys?.find((k) => k.insurerId === id)?.publicKey;
+    const insurerName = (a: InsurerAttestation) => opts.insurerKeys?.find((k) => k.insurerId === a.insurerId)?.insurerName ?? a.insurerName;
     for (const side of ["broker", "carrier"] as const) {
       const cred = a.credentials[side];
       const usdot = cred.subject.entity.usdot;
@@ -423,9 +435,17 @@ export function verifyArtifact(
         const key = insurerKey(embedded.insurerId);
         const signed = !!key && verifyInsurerAttestation(embedded, key);
         push(`${side}.insurer[${embedded.insurerId}].signed`, opts.insurerKeys ? signed : true, key ? "insurer attestation does not verify under the pinned insurer key" : opts.insurerKeys ? `no pinned key for insurer ${embedded.insurerId}` : "no insurer keys pinned — signature not checked");
-        const onRecord = (reg?.attestations[side] ?? []).some((x) => x.record?.insurance.some((f) => f.policyNumber === embedded.policyNumber));
-        push(`${side}.insurer[${embedded.insurerId}].subject`, embedded.usdot === usdot && (!reg || onRecord), embedded.usdot !== usdot ? `insurer attestation is about ${embedded.usdot}, credential binds ${usdot}` : `policy ${embedded.policyNumber} is not among the filings any registry shows for this party`);
-        if (!opts.insurerKeys || signed) {
+        push(`${side}.insurer[${embedded.insurerId}].subject`, embedded.usdot === usdot, `insurer attestation is about ${embedded.usdot}, credential binds ${usdot}`);
+        // Of record: the registry's filing names the insurer and the policy; anyone else's signature is not the origin's word.
+        const recs = [...(reg?.attestations[side] ?? []), ...(opts.currentAttestations ?? []).filter((c) => c.usdot === usdot)].map((x) => x.record);
+        const ofRecord = recs.length ? insurerOfRecord(embedded, recs, insurerName(embedded)) : undefined;
+        if (ofRecord) push(`${side}.insurer[${embedded.insurerId}].of-record`, ofRecord.ok, ofRecord.ok ? `policy ${embedded.policyNumber} filed by ${ofRecord.filing!.insurer} per ${ofRecord.shownBy} registry record(s)` : ofRecord.why);
+        // Symmetric accountability: the origin signed after the registry received its own filing and did not disclose it.
+        const mirrorFilings = [...(reg?.attestations[side] ?? []), ...(opts.currentAttestations ?? []).filter((c) => c.usdot === usdot)].flatMap(filingsShownBy);
+        const lie = insurerContradictedBy(embedded, mirrorFilings);
+        push(`${side}.insurer[${embedded.insurerId}].true-when-signed`, !lie, lie ? `${embedded.insurerId} signed "${embedded.cancellation ? `cancellation effective ${embedded.cancellation.effectiveDate}` : "no cancellation"}" at ${embedded.asOf}; the registry (${lie.missing.source}) received its cancellation filing on ${lie.missing.cancellationFiledDate} (effective ${lie.missing.cancellationDate}): a signed falsehood by the origin` : "");
+        if (opts.requireInsurerUndertaking && side === "carrier") push(`${side}.insurer.undertaking`, embedded.undertaking === "NO_DENIAL_FOR_UNDISCLOSED_LAPSE", embedded.undertaking ? "" : `the insurer's word is a certificate (its belief), not an undertaking: no signed promise not to deny a covered loss for an undisclosed lapse`);
+        if ((!opts.insurerKeys || signed) && !lie && (!ofRecord || ofRecord.ok)) {
           verdicts.push({ label: `${embedded.insurerId} (in artifact, as of ${embedded.asOf})`, a: embedded });
           const st = insurerStanding(embedded, reliedAt, through);
           push(`${side}.insurer.standing-at-commitment`, st.ok, st.ok ? `in force per the insurer's own word; assured through ${st.assuredThrough}` : `${st.reasonCode}: the party's own insurer's word, which the venue held, shows this — ${JSON.stringify(st.evidence).slice(0, 200)}`);
@@ -488,17 +508,20 @@ export function verifyArtifact(
   const registryStale = registryQuorum && perRegistryFailed.length > 0 && perRegistryFailed.every((c) => c.detail?.includes("old at commitment"));
   const registryInvalid = perRegistryFailed.some((c) => !c.detail?.includes("old at commitment"));
   const registryDisagreement = failed.some((c) => c.name.endsWith(".registry.consistent"));
-  const registryFalse = failed.some((c) => c.name.endsWith("].true-when-signed"));
+  const registryFalse = failed.some((c) => /\.registry\[[^\]]+\]\.true-when-signed$/.test(c.name));
   const insurerContradiction = failed.some((c) => /\.insurer\.standing-(at-commitment|per-current-word)$/.test(c.name));
   const insurerMissing = failed.some((c) => c.name.endsWith(".insurer.attestation-present"));
   const insurerInvalid = failed.some((c) => /\.insurer(\.current)?\[[^\]]+\]\.(signed|subject)$/.test(c.name));
+  const insurerNotOfRecord = failed.some((c) => /\.insurer\[[^\]]+\]\.of-record$/.test(c.name));
+  const insurerFalse = failed.some((c) => /\.insurer\[[^\]]+\]\.true-when-signed$/.test(c.name));
+  const undertakingMissing = failed.some((c) => c.name.endsWith(".insurer.undertaking"));
   const notAssured = failed.some((c) => c.name.endsWith(".insurer.assured-through-delivery"));
   const renewalNotPresented = failed.some((c) => c.name.endsWith(".insurer.renewal-not-presented"));
   const renewalContradiction = failed.some((c) => c.name.endsWith(".insurer.standing-per-renewal"));
   const renewalPending = failed.some((c) => c.name.endsWith(".insurer.renewal-due"));
   // Graded like NOTICE_PENDING: a conditional commitment before its deadline is not wrong, only not yet "fine".
   const pendingOnly = renewalPending && failed.every((c) => c.name.endsWith(".insurer.renewal-due") || /\.(witnessed|witness-quorum|fresh-as-of|complete-to-witnessed-head)$/.test(c.name));
-  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : equivocated ? "VENUE_EQUIVOCATION" : promiseBroken ? "INCLUSION_PROMISE_BROKEN" : noticePending ? "NOTICE_PENDING" : registryFalse ? "REGISTRY_FALSE_ATTESTATION" : insurerContradiction || renewalContradiction ? "INSURER_CONTRADICTS_COMMITMENT" : registryContradiction ? "REGISTRY_CONTRADICTS_COMMITMENT" : registryMissing ? "REGISTRY_ATTESTATION_MISSING" : registryStale ? "REGISTRY_STALE" : registryInvalid && registryQuorum ? "REGISTRY_ATTESTATION_INVALID" : registryQuorum ? "REGISTRY_QUORUM_NOT_MET" : registryInvalid ? "REGISTRY_ATTESTATION_INVALID" : registryDisagreement ? "REGISTRY_DISAGREEMENT" : insurerInvalid ? "INSURER_ATTESTATION_INVALID" : insurerMissing ? "INSURER_ATTESTATION_MISSING" : notAssured ? "INSURANCE_NOT_ASSURED_THROUGH_DELIVERY" : renewalNotPresented ? "INSURANCE_RENEWAL_NOT_PRESENTED" : pendingOnly ? "INSURANCE_RENEWAL_PENDING" : quorumOnly ? "WITNESS_QUORUM_NOT_MET" : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
+  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : equivocated ? "VENUE_EQUIVOCATION" : promiseBroken ? "INCLUSION_PROMISE_BROKEN" : noticePending ? "NOTICE_PENDING" : registryFalse ? "REGISTRY_FALSE_ATTESTATION" : insurerFalse ? "INSURER_FALSE_ATTESTATION" : insurerContradiction || renewalContradiction ? "INSURER_CONTRADICTS_COMMITMENT" : registryContradiction ? "REGISTRY_CONTRADICTS_COMMITMENT" : registryMissing ? "REGISTRY_ATTESTATION_MISSING" : registryStale ? "REGISTRY_STALE" : registryInvalid && registryQuorum ? "REGISTRY_ATTESTATION_INVALID" : registryQuorum ? "REGISTRY_QUORUM_NOT_MET" : registryInvalid ? "REGISTRY_ATTESTATION_INVALID" : registryDisagreement ? "REGISTRY_DISAGREEMENT" : insurerInvalid ? "INSURER_ATTESTATION_INVALID" : insurerNotOfRecord ? "INSURER_NOT_OF_RECORD" : insurerMissing ? "INSURER_ATTESTATION_MISSING" : undertakingMissing ? "INSURER_UNDERTAKING_MISSING" : notAssured ? "INSURANCE_NOT_ASSURED_THROUGH_DELIVERY" : renewalNotPresented ? "INSURANCE_RENEWAL_NOT_PRESENTED" : pendingOnly ? "INSURANCE_RENEWAL_PENDING" : quorumOnly ? "WITNESS_QUORUM_NOT_MET" : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
   return {
     ok: failed.length === 0,
     reasonCode,

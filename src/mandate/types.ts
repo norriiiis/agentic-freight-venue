@@ -30,6 +30,12 @@ export interface MandateLimits {
    * presented by pickup; the venue then binds the commitment to that renewal and voids it at pickup if none arrives.
    */
   requireInsurerAttestation?: boolean;
+  /**
+   * If true, the counterparty's insurer's attestation must carry an UNDERTAKING (no denial of a covered loss for an
+   * undisclosed lapse): a certificate is the insurer's belief; an undertaking is a promise it is liable for. Implies
+   * requireInsurerAttestation.
+   */
+  requireInsurerUndertaking?: boolean;
   /** May this agent tender loads to others (i.e. act as a broker)? Carriers: false. */
   mayTender: boolean;
   /** Bound on negotiation rounds this agent will participate in. */
@@ -80,6 +86,8 @@ export type MandateAction =
       counterpartyInsuranceAssuredThrough?: string;
       /** The insurer's statutory notice period (default 30 days): a renewal signed at or after delivery − notice can reach delivery. */
       counterpartyInsuranceNoticeDays?: number;
+      /** The undertaking the counterparty's insurer signed, if any. */
+      counterpartyInsurerUndertaking?: string;
       pickupWindowStart?: string;
       deliveryWindowEnd?: string;
       guaranteeAvailable: boolean;

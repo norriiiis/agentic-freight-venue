@@ -682,7 +682,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     const action: MandateAction = {
       kind: "ACCEPT", rateUsd: t.rateUsd, miles: t.load.miles, originState: t.load.origin.state, destinationState: t.load.destination.state, equipment: t.load.equipment, hazmat: t.load.hazmat,
       paymentTermsDays: t.paymentTermsDays, round: view.round, counterpartyUsdot: view.counterparty.entity.usdot, counterpartyInsuranceUsd: cpIns,
-      counterpartyInsuranceAssuredThrough: view.counterparty.insurance.assuredThrough, counterpartyInsuranceNoticeDays: view.counterparty.insurance.noticeDays, pickupWindowStart: t.pickup.windowStart, deliveryWindowEnd: t.delivery.windowEnd,
+      counterpartyInsuranceAssuredThrough: view.counterparty.insurance.assuredThrough, counterpartyInsuranceNoticeDays: view.counterparty.insurance.noticeDays, counterpartyInsurerUndertaking: view.counterparty.insurance.undertaking, pickupWindowStart: t.pickup.windowStart, deliveryWindowEnd: t.delivery.windowEnd,
       // First acceptor cannot know yet; the venue enforces requireGuarantee at commitment. Countersigner sees the quote.
       guaranteeAvailable: view.guaranteeAvailable ?? true,
       day: t.pickup.windowStart.slice(0, 10),

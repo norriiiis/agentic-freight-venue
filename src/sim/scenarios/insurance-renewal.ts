@@ -25,7 +25,7 @@ export const insuranceRenewal: Scenario = {
     const coi = insurer.attest(policy);
     const broker = await h.startAgent(brokerSpec({ thinkMs: 60, limits: { ...brokerSpec().limits, requireInsurerAttestation: true } }));
     const carrier = await h.startAgent(carrierSpec({ thinkMs: 60, insurerAttestation: coi }));
-    const insurerKey = { witnessId: insurer.insurerId, publicKey: insurer.kp.publicJwk };
+    const insurerKey = insurer.key;
     const registryKey = await h.registry.key();
     const root = JSON.parse(readFileSync(join(h.venue.dir, "venue-root-public.jwk.json"), "utf8")) as OkpJwk;
     const artifactOf = (id: string) => JSON.parse(readFileSync(join(broker.dir, "commitments", `${id}.json`), "utf8")) as CommitmentArtifact;

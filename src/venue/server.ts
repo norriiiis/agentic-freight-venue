@@ -119,7 +119,7 @@ if (simMode) {
     "GET /admin/public-key": async () => ok(venue.kp.publicJwk),
     "GET /admin/venue-keys": async () => ok(venue.keys.history()),
     "POST /admin/witnesses": async (_r, b) => { venue.registerWitness(b as WitnessKey); return ok({ ok: true, witnesses: venue.state.witnesses.map((w) => w.witnessId) }); },
-    "POST /admin/notice-sources": async (_r, b) => { venue.registerNoticeSource(b as { sourceId: string; publicKey: OkpJwk }); return ok({ ok: true, sources: venue.state.noticeSources.map((s) => s.sourceId) }); },
+    "POST /admin/notice-sources": async (_r, b) => { venue.registerNoticeSource(b as { sourceId: string; publicKey: OkpJwk; insurerName?: string }); return ok({ ok: true, sources: venue.state.noticeSources.map((s) => s.sourceId) }); },
     /** Rollback fault: a compromised venue rewriting its own history. Drops every ledger entry after `seq`. */
     "POST /admin/ledger/truncate": async (_r, b) => {
       const { seq } = b as { seq: number };

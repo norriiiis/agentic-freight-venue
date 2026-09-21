@@ -108,6 +108,7 @@ export interface MandateEnvelope {
     requiredCounterpartyInsuranceUsd: number;
     requireGuarantee: boolean;
     requireInsurerAttestation?: boolean;
+    requireInsurerUndertaking?: boolean;
   };
   principalSignature: string; // JWS over envelope sans this field
   principalPublicKey: OkpJwk;

@@ -73,7 +73,7 @@ export function evaluateMandate(limits: MandateLimits, action: MandateAction, ex
     if (limits.requireGuarantee && !action.guaranteeAvailable) {
       v.push({ code: "MANDATE_GUARANTEE_REQUIRED", evidence: { requireGuarantee: true, guaranteeAvailable: false } });
     }
-    if (limits.requireInsurerAttestation) {
+    if (limits.requireInsurerAttestation || limits.requireInsurerUndertaking) {
       checked.push("insurerAttestation");
       const assured = action.counterpartyInsuranceAssuredThrough ? new Date(action.counterpartyInsuranceAssuredThrough) : undefined;
       const delivery = action.deliveryWindowEnd ? new Date(action.deliveryWindowEnd) : undefined;
@@ -83,6 +83,9 @@ export function evaluateMandate(limits: MandateLimits, action: MandateAction, ex
       const renewable = !!delivery && !!pickup && delivery.getTime() - notice <= pickup.getTime();
       if (!assured || !delivery || (assured < delivery && !renewable)) {
         v.push({ code: "MANDATE_INSURER_ATTESTATION_REQUIRED", evidence: { counterpartyInsuranceAssuredThrough: action.counterpartyInsuranceAssuredThrough ?? null, deliveryWindowEnd: action.deliveryWindowEnd, pickupWindowStart: action.pickupWindowStart, noticeDays: action.counterpartyInsuranceNoticeDays ?? 30, note: !assured ? "no insurer attestation on file for the counterparty" : "no word signed before pickup can assure coverage through delivery: transit outruns the insurer's notice period" } });
+      } else if (limits.requireInsurerUndertaking && action.counterpartyInsurerUndertaking !== "NO_DENIAL_FOR_UNDISCLOSED_LAPSE") {
+        checked.push("insurerUndertaking");
+        v.push({ code: "MANDATE_INSURER_UNDERTAKING_REQUIRED", evidence: { counterpartyInsurerUndertaking: action.counterpartyInsurerUndertaking ?? null, note: "the counterparty's insurer signed a certificate (its belief), not an undertaking (a promise it is liable for)" } });
       }
     }
     if (exposure) {
@@ -114,6 +117,7 @@ export function envelopeToLimits(e: MandateEnvelope): MandateLimits {
     maxDailyExposureUsd: e.limits.maxDailyExposureUsd,
     requireGuarantee: e.limits.requireGuarantee,
     requireInsurerAttestation: e.limits.requireInsurerAttestation,
+    requireInsurerUndertaking: e.limits.requireInsurerUndertaking,
     mayTender: true, // brokerage authority is checked by the venue against the registry, not the envelope
     maxNegotiationRounds: Number.MAX_SAFE_INTEGER, // protocol bound is the venue's own, not the envelope's
     paymentTermsDays: { min: 0, max: 365 },

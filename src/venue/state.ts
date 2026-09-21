@@ -145,7 +145,7 @@ interface Snapshot {
   /** Receipts by ledger head hash. */
   witnessReceipts: Record<string, WitnessReceipt[]>;
   /** Sources whose signed status notices are accepted. */
-  noticeSources: { sourceId: string; publicKey: OkpJwk }[];
+  noticeSources: { sourceId: string; publicKey: OkpJwk; insurerName?: string }[];
 }
 
 export class VenueState {
@@ -158,7 +158,8 @@ export class VenueState {
   lastAliveAt?: string;
   witnesses: WitnessKey[] = [];
   witnessReceipts: Record<string, WitnessReceipt[]> = {};
-  noticeSources: { sourceId: string; publicKey: OkpJwk }[] = [];
+  /** Registered sources (registry feeds, insurers, …). An insurer's `insurerName` is the name it files under — what makes its word "of record". */
+  noticeSources: { sourceId: string; publicKey: OkpJwk; insurerName?: string }[] = [];
   private readonly dir: string;
   private readonly journalDir: string;
 

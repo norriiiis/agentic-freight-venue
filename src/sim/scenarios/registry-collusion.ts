@@ -28,7 +28,7 @@ export const registryCollusion: Scenario = {
     const broker = await h.startAgent(brokerSpec({ thinkMs: 60 }));
     const carrier = await h.startAgent(carrierSpec({ thinkMs: 60, insurerAttestation: coi }));
     const keys = await Promise.all(h.registries.map((r) => r.key()));
-    const insurerKey = { witnessId: insurer.insurerId, publicKey: insurer.kp.publicJwk };
+    const insurerKey = insurer.key;
     const root = JSON.parse(readFileSync(join(h.venue.dir, "venue-root-public.jwk.json"), "utf8")) as OkpJwk;
     const artifactOf = (id: string) => JSON.parse(readFileSync(join(broker.dir, "commitments", `${id}.json`), "utf8")) as CommitmentArtifact;
     const failing = (v: ReturnType<typeof verifyArtifact>) => v.checks.filter((x) => !x.ok).map((x) => `${x.name}: ${x.detail}`);
@@ -51,7 +51,7 @@ export const registryCollusion: Scenario = {
     await b!.fault({ freeze: true, claimsCurrent: true });
     await c!.fault({ freeze: true, claimsCurrent: true });
     const rec = await a!.record("2751903");
-    const cancelled: InsuranceFiling[] = rec.insurance.map((f) => (f.type === "BIPD" ? { ...f, cancellationDate: effective, cancellationFiledDate: filed } : f));
+    const cancelled: InsuranceFiling[] = rec.insurance.map((f) => (f.type === "BIPD" ? { ...f, cancellationDate: effective, cancellationFiledDate: filed, cancellationReceivedDate: filed } : f));
     await h.registryUpdate("2751903", { insurance: cancelled });
     say(`registry: Great Plains Mutual files BMC-91X cancellation for PRAIRIE WIND — filed ${filed}, effective ${effective}. ${a!.registryId} shows it. ${b!.registryId} and ${c!.registryId} keep serving the old record and claim a current sync.`);
 

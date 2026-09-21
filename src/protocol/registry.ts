@@ -39,6 +39,20 @@
  * directly: an InsurerAttestation no set of mirrors can forge, whose
  * statutory notice period turns a point-in-time statement into a window
  * within which coverage cannot lawfully end.
+ *
+ * The origin's honesty is then the last thing left, and it is answered the
+ * same three ways. Identity: the registry's filing names the insurer of
+ * record and the policy, so an attestation from anyone else — however well
+ * signed — is not the origin's word (INSURER_NOT_OF_RECORD). Accountability,
+ * symmetric with the mirrors': an insurer that signs "no cancellation" after
+ * the date the registry received its own filing has signed a falsehood, and
+ * the mirrors' word is the proof (INSURER_FALSE_ATTESTATION). Liability: a
+ * certificate of insurance famously "confers no rights"; an attestation can
+ * instead carry an UNDERTAKING — the insurer's signed promise not to deny a
+ * covered loss on the basis of any lapse it did not disclose here, through
+ * the date it assures — and a principal or verifier can accept nothing
+ * less. The protocol cannot make an insurer pay; it can make sure the only
+ * word that satisfies the policy is one the insurer is liable for.
  */
 import { hashObject } from "./canonical";
 import { importPublicKey, signJws, verifyJws, type KeyPair, type OkpJwk } from "./crypto";
@@ -57,8 +71,10 @@ export interface InsuranceFiling {
   coverageToUsd: number;
   effectiveDate: string;      // ISO date
   cancellationDate?: string;  // ISO date; insurer-filed cancellation, effective on this date
-  /** ISO date the registry received the cancellation notice (statute requires ≥ 30 days before it takes effect). */
+  /** ISO date on the insurer's cancellation notice — when the insurer FILED it (statute requires ≥ 30 days before it takes effect). */
   cancellationFiledDate?: string;
+  /** ISO date the registry received/published the notice; the same day as filed unless the registry lagged. Defaults to the filed date. */
+  cancellationReceivedDate?: string;
 }
 
 export interface AuthorityRecord {
@@ -284,17 +300,25 @@ export function attestationFreshAt(a: RegistryAttestation, reliedAt: Date, maxAg
 
 // ------------------------------------------------------- accountability
 
-/** A cancellation somebody's signed word shows: the fact a mirror claiming a later sync cannot honestly lack. */
+/**
+ * A cancellation somebody's signed word shows. Two dates matter: when the
+ * insurer FILED it (the insurer's own act — what the insurer is accountable
+ * for) and when the registry RECEIVED it (what a mirror synced later is
+ * accountable for). Dates, not instants: same-day ordering is not judged.
+ */
 export interface FilingEvidence {
   source: string;
   policyNumber: string;
   cancellationDate: string;
   cancellationFiledDate: string;
+  cancellationReceivedDate: string;
   asOf: string;
 }
 
+const dayOf = (iso: string) => iso.slice(0, 10);
+
 export function filingsShownBy(a: RegistryAttestation): FilingEvidence[] {
-  return (a.record?.insurance ?? []).filter((f) => f.cancellationDate && f.cancellationFiledDate).map((f) => ({ source: a.registryId, policyNumber: f.policyNumber, cancellationDate: f.cancellationDate!, cancellationFiledDate: f.cancellationFiledDate!, asOf: a.upstreamAsOf ?? a.asOf }));
+  return (a.record?.insurance ?? []).filter((f) => f.cancellationDate && f.cancellationFiledDate).map((f) => ({ source: a.registryId, policyNumber: f.policyNumber, cancellationDate: f.cancellationDate!, cancellationFiledDate: f.cancellationFiledDate!, cancellationReceivedDate: f.cancellationReceivedDate ?? f.cancellationFiledDate!, asOf: a.upstreamAsOf ?? a.asOf }));
 }
 
 /** A signed falsehood: attestation `x` claims a sync after a filing that its record lacks. Self-contained given the signers' keys. */
@@ -317,7 +341,8 @@ export function contradictedBy(x: RegistryAttestation, evidence: FilingEvidence[
   const sync = new Date(x.upstreamAsOf ?? x.asOf);
   for (const e of evidence) {
     if (e.source === x.registryId && e.asOf === (x.upstreamAsOf ?? x.asOf)) continue;
-    if (new Date(e.cancellationFiledDate) >= sync) continue;
+    // A mirror answers for what the registry had published on an earlier day than its sync claim.
+    if (e.cancellationReceivedDate >= dayOf(sync.toISOString())) continue;
     const own = x.record?.insurance.find((f) => f.policyNumber === e.policyNumber);
     if (!own) continue; // a policy this mirror never showed: not a contradiction, a different record — caught as disagreement
     if (own.cancellationDate && own.cancellationDate <= e.cancellationDate) continue;
@@ -335,9 +360,20 @@ export function contradictedBy(x: RegistryAttestation, evidence: FilingEvidence[
  * cancellation takes effect, so a statement with no cancellation disclosed
  * assures coverage through asOf + noticeDays whatever any mirror says.
  */
+/**
+ * The insurer's signed promise, if it makes one: a covered loss during the
+ * assured window will not be denied on the basis of any cancellation,
+ * non-renewal or lapse this attestation did not disclose. Without it the
+ * attestation is a certificate — the insurer's belief; with it, a statement
+ * the insurer is liable for, and the evidence for estoppel is the artifact.
+ */
+export type InsurerUndertaking = "NO_DENIAL_FOR_UNDISCLOSED_LAPSE";
+
 export interface InsurerAttestation {
   schema: "freight-venue/insurer-attestation/v1";
   insurerId: string;
+  /** The insurer's name as it appears on the registry filing — what makes this the insurer OF RECORD. */
+  insurerName?: string;
   usdot: string;
   policyNumber: string;
   type: FilingType;
@@ -347,14 +383,22 @@ export interface InsurerAttestation {
   /** A cancellation the insurer has filed (or is filing now), if any. */
   cancellation?: { filedDate: string; effectiveDate: string };
   noticeDays: number;
+  undertaking?: InsurerUndertaking;
   asOf: string;
   kid: string;
   /** Detached JWS by the insurer's key over the attestation sans this field. */
   signature: string;
 }
 
-export function signInsurerAttestation(insurer: KeyPair, insurerId: string, fields: Omit<InsurerAttestation, "schema" | "insurerId" | "asOf" | "kid" | "signature" | "noticeDays"> & { noticeDays?: number }, now = new Date()): InsurerAttestation {
-  const unsigned: Omit<InsurerAttestation, "signature"> = { schema: "freight-venue/insurer-attestation/v1", insurerId, noticeDays: 30, ...fields, asOf: now.toISOString(), kid: insurer.kid };
+export interface InsurerKey {
+  insurerId: string;
+  publicKey: OkpJwk;
+  /** The name under which this insurer files with the registry; when known, attestations must be of record under it. */
+  insurerName?: string;
+}
+
+export function signInsurerAttestation(insurer: KeyPair, insurerId: string, fields: Omit<InsurerAttestation, "schema" | "insurerId" | "asOf" | "kid" | "signature" | "noticeDays"> & { noticeDays?: number }, now = new Date(), insurerName?: string): InsurerAttestation {
+  const unsigned: Omit<InsurerAttestation, "signature"> = { schema: "freight-venue/insurer-attestation/v1", insurerId, insurerName, noticeDays: 30, ...fields, asOf: now.toISOString(), kid: insurer.kid };
   return { ...unsigned, signature: signJws(unsigned, insurer, { typ: "insurer-attestation+jws" }, true) };
 }
 
@@ -410,8 +454,44 @@ export function satisfiesRenewal(a: InsurerAttestation, w: RenewalWindow, delive
   return new Date(a.asOf) >= new Date(w.earliestSignedAt) && coverageAssuredThrough(a) >= delivery;
 }
 
+/**
+ * Is this attestation the word of the insurer OF RECORD? The registry's
+ * filing names the insurer and the policy; an attestation about a policy the
+ * registry does not show, or under a name that is not the filing's insurer,
+ * is somebody's word, not the origin's.
+ */
+export function insurerOfRecord(a: InsurerAttestation, records: (RegistryRecord | null)[], insurerName = a.insurerName): { ok: boolean; why?: string; filing?: InsuranceFiling; shownBy: number } {
+  const filings = records.flatMap((r) => (r?.usdot === a.usdot ? r.insurance : [])).filter((f) => f.policyNumber === a.policyNumber);
+  if (records.filter(Boolean).length === 0) return { ok: false, why: "no registry record to check the filing against", shownBy: 0 };
+  if (filings.length === 0) return { ok: false, why: `policy ${a.policyNumber} is not among the filings the registry shows for ${a.usdot}`, shownBy: 0 };
+  const named = insurerName ? filings.filter((f) => f.insurer === insurerName) : filings;
+  if (named.length === 0) return { ok: false, why: `policy ${a.policyNumber} is filed by ${[...new Set(filings.map((f) => f.insurer))].join("/")}, not by ${insurerName}`, shownBy: filings.length };
+  if (named.some((f) => f.type !== a.type)) return { ok: false, why: `policy ${a.policyNumber} is filed as ${named[0]!.type}, attested as ${a.type}`, shownBy: named.length };
+  return { ok: true, filing: named[0], shownBy: named.length };
+}
+
+/** A signed falsehood by the origin: the insurer signed after the registry received its own filing, and did not disclose it. */
+export interface InsurerFalseAttestationProof {
+  insurerId: string;
+  usdot: string;
+  signedAt: string;
+  attestation: InsurerAttestation;
+  missing: FilingEvidence;
+}
+
+export function insurerContradictedBy(a: InsurerAttestation, evidence: FilingEvidence[]): InsurerFalseAttestationProof | undefined {
+  for (const e of evidence) {
+    if (e.policyNumber !== a.policyNumber || e.source === `insurer:${a.insurerId}` && e.asOf === a.asOf) continue;
+    // The insurer answers for what it had itself filed on an earlier day than it signed.
+    if (e.cancellationFiledDate >= dayOf(a.asOf)) continue;
+    if (a.cancellation && a.cancellation.effectiveDate <= e.cancellationDate) continue;
+    return { insurerId: a.insurerId, usdot: a.usdot, signedAt: a.asOf, attestation: a, missing: e };
+  }
+  return undefined;
+}
+
 export function filingShownByInsurer(a: InsurerAttestation): FilingEvidence | undefined {
-  return a.cancellation ? { source: `insurer:${a.insurerId}`, policyNumber: a.policyNumber, cancellationDate: a.cancellation.effectiveDate, cancellationFiledDate: a.cancellation.filedDate, asOf: a.asOf } : undefined;
+  return a.cancellation ? { source: `insurer:${a.insurerId}`, policyNumber: a.policyNumber, cancellationDate: a.cancellation.effectiveDate, cancellationFiledDate: a.cancellation.filedDate, cancellationReceivedDate: a.cancellation.filedDate, asOf: a.asOf } : undefined;
 }
 
 /**

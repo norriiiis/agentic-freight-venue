@@ -82,6 +82,12 @@ describe("mandate engine refuses its own principal's agent", () => {
     expect(codes({ pickupWindowStart: "2026-09-23T13:00:00.000Z", deliveryWindowEnd: "2026-11-24T21:00:00.000Z", counterpartyInsuranceAssuredThrough: "2026-10-20T00:00:00.000Z" })).toContain("MANDATE_INSURER_ATTESTATION_REQUIRED");
     expect(codes({ pickupWindowStart: "2026-09-23T13:00:00.000Z", deliveryWindowEnd: "2026-09-24T21:00:00.000Z", counterpartyInsuranceAssuredThrough: "2026-10-20T00:00:00.000Z" })).not.toContain("MANDATE_INSURER_ATTESTATION_REQUIRED");
     expect(evaluateMandate(LIMITS, { ...baseAccept, deliveryWindowEnd: "2026-09-24T21:00:00.000Z" }).violations.map((x) => x.code)).not.toContain("MANDATE_INSURER_ATTESTATION_REQUIRED");
+    // An undertaking, not a certificate.
+    const liable = { ...LIMITS, requireInsurerUndertaking: true };
+    const ok = { pickupWindowStart: "2026-09-23T13:00:00.000Z", deliveryWindowEnd: "2026-09-24T21:00:00.000Z", counterpartyInsuranceAssuredThrough: "2026-10-20T00:00:00.000Z" };
+    expect(evaluateMandate(liable, { ...baseAccept, ...ok }).violations.map((x) => x.code)).toContain("MANDATE_INSURER_UNDERTAKING_REQUIRED");
+    expect(evaluateMandate(liable, { ...baseAccept, ...ok, counterpartyInsurerUndertaking: "NO_DENIAL_FOR_UNDISCLOSED_LAPSE" }).violations.map((x) => x.code)).toEqual([]);
+    expect(evaluateMandate(liable, { ...baseAccept, deliveryWindowEnd: ok.deliveryWindowEnd }).violations.map((x) => x.code)).toContain("MANDATE_INSURER_ATTESTATION_REQUIRED");
   });
   it("refuses when per-counterparty exposure would be exceeded", () => {
     const book = new ExposureBook();

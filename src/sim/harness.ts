@@ -26,7 +26,7 @@ import type { AuditEntry } from "../protocol/audit";
 import type { NegotiationTask, CommitmentRecord } from "../venue/state";
 import type { LedgerEntry } from "../ledger/chain";
 import type { Message, Task } from "../protocol/a2a";
-import { signInsurerAttestation, type InsurerAttestation, type RegistryAttestation, type RegistryKey, type RegistryRecord } from "../protocol/registry";
+import { signInsurerAttestation, type InsurerAttestation, type InsurerKey, type RegistryAttestation, type RegistryKey, type RegistryRecord } from "../protocol/registry";
 import type { LoadSpec, NegotiationPayload } from "../protocol/freight";
 import type { LocalTask } from "../agentkit/types";
 
@@ -156,7 +156,7 @@ export class VenueHandle {
   /** The status list as the venue shows it to a particular requester (SIM: the equivocation fault keys on this id). */
   async statusListAs(requester: string) { return (await (await fetch(`${this.url}/.well-known/credential-status.json`, { headers: { "x-witness-id": requester } })).json()) as Witnessed & { entries: CSE[] }; }
   async venueKeysAs(requester: string) { return (await (await fetch(`${this.url}/.well-known/venue-keys.json`, { headers: { "x-witness-id": requester } })).json()) as VenueKeyHistory & Witnessed; }
-  registerNoticeSource(sourceId: string, publicKey: OkpJwk) { return httpPost<{ ok: boolean }>(`${this.url}/admin/notice-sources`, { sourceId, publicKey }); }
+  registerNoticeSource(sourceId: string, publicKey: OkpJwk, insurerName?: string) { return httpPost<{ ok: boolean }>(`${this.url}/admin/notice-sources`, { sourceId, publicKey, insurerName }); }
   /** Submit a source-signed status notice; returns the venue's inclusion promise, or the failure the source saw. */
   async submitNotice(notice: StatusNotice): Promise<{ promise?: InclusionPromise; recorded?: boolean; failure?: string }> {
     try {
@@ -423,9 +423,10 @@ export class Harness {
    * An INSURER: the origin of the filing every registry mirrors. Registered with the venue like any source; signs
    * coverage attestations (a COI) that the insured presents. The harness plays the insurer's signing desk.
    */
-  async startInsurer(insurerId: string): Promise<{ insurerId: string; kp: KeyPair; attest: (fields: Parameters<typeof signInsurerAttestation>[2], now?: Date) => InsurerAttestation }> {
-    const src = await this.startNoticeSource(insurerId);
-    return { insurerId, kp: src.kp, attest: (fields, now) => signInsurerAttestation(src.kp, insurerId, fields, now) };
+  async startInsurer(insurerId: string, insurerName?: string): Promise<{ insurerId: string; insurerName?: string; kp: KeyPair; key: InsurerKey; attest: (fields: Parameters<typeof signInsurerAttestation>[2], now?: Date) => InsurerAttestation }> {
+    const kp = generateKeyPair();
+    await this.venue.registerNoticeSource(insurerId, kp.publicJwk, insurerName);
+    return { insurerId, insurerName, kp, key: { insurerId, publicKey: kp.publicJwk, insurerName }, attest: (fields, now) => signInsurerAttestation(kp, insurerId, fields, now, insurerName) };
   }
 
   /**

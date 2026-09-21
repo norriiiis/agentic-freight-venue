@@ -48,6 +48,7 @@ export function issueEnvelope(principal: KeyPair, m: Mandate, disclose: Partial<
       requiredCounterpartyInsuranceUsd: m.limits.requiredCounterpartyInsuranceUsd,
       requireGuarantee: m.limits.requireGuarantee,
       requireInsurerAttestation: m.limits.requireInsurerAttestation,
+      requireInsurerUndertaking: m.limits.requireInsurerUndertaking,
       ...disclose,
     },
   };

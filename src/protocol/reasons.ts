@@ -32,6 +32,9 @@ export const REASONS = {
   INSURANCE_RENEWAL_PENDING: "The commitment is conditional: the insurer's word on file assures coverage only through an earlier date than delivery, and a renewal signed within the statutory window must be presented by pickup; it has not been yet, and the deadline has not passed",
   INSURANCE_RENEWAL_NOT_PRESENTED: "The commitment was conditional on the counterparty's insurer re-attesting coverage through delivery by pickup; pickup arrived with no such word on file; commitment voided, guarantee released, in time to re-cover the load",
   INSURER_CONTRADICTS_COMMITMENT: "The party's own insurer's signed word shows coverage cancelled at or before the commitment, or before delivery; the venue committed against the origin of the fact",
+  INSURER_NOT_OF_RECORD: "The attestation is not the word of the insurer of record: the registry's filing names a different insurer for this policy, or shows no such policy for this party — somebody's signature, not the origin's",
+  INSURER_FALSE_ATTESTATION: "The insurer signed 'no cancellation' after the date the registry received its own cancellation filing: a signed falsehood by the origin, proven by the registries' word; an origin caught lying is not an origin",
+  INSURER_UNDERTAKING_MISSING: "The insurer's attestation is a certificate, not an undertaking: it carries no signed promise not to deny a covered loss on the basis of an undisclosed lapse, and the policy accepts nothing less",
   ONBOARDING_PROOF_OF_CONTROL_FAILED: "Could not prove control of the claimed registry identity",
   ONBOARDING_ENTITY_NOT_FOUND: "Claimed USDOT/MC not found in registry",
   ONBOARDING_KEY_ALREADY_BOUND: "A live credential already binds this entity to a different key",
@@ -46,6 +49,7 @@ export const REASONS = {
   MANDATE_EXPOSURE_DAILY_EXCEEDED: "Committing would exceed the principal's daily exposure limit",
   MANDATE_GUARANTEE_REQUIRED: "Principal requires a venue guarantee and none is available",
   MANDATE_INSURER_ATTESTATION_REQUIRED: "Principal requires the counterparty's own insurer to have attested coverage assured through delivery; none on file, or it assures only an earlier date",
+  MANDATE_INSURER_UNDERTAKING_REQUIRED: "Principal requires the counterparty's insurer's attestation to carry an undertaking (no denial for undisclosed lapse); the word on file is a certificate only",
   MANDATE_SIGNATURE_INVALID: "Mandate is not validly signed by the principal",
   MANDATE_ENVELOPE_MISSING: "No principal-signed mandate envelope registered for this agent",
 

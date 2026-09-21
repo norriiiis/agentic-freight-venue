@@ -27,7 +27,7 @@ import { AuditLog, type Component } from "../protocol/audit";
 import { rpcCall, RpcRefusal } from "../protocol/rpc";
 import type { Credential, MandateEnvelope, RotationAuthorization, RotationClaims } from "../protocol/types";
 import { RegistryMirror, RegistryUnavailable, type RegistrySource } from "../identity/registry-mirror";
-import { coverageAssuredThrough, hasBrokerAuthority, insuranceStatus, insurerStanding, renewalWindow, satisfiesRenewal, verifyInsurerAttestation, type InsurerAttestation, type RegistryAttestation } from "../protocol/registry";
+import { coverageAssuredThrough, filingsShownBy, hasBrokerAuthority, insuranceStatus, insurerContradictedBy, insurerOfRecord, insurerStanding, renewalWindow, satisfiesRenewal, verifyInsurerAttestation, type InsurerAttestation, type RegistryAttestation } from "../protocol/registry";
 import { StubVettingProvider } from "../identity/vetting";
 import { CredentialIssuer } from "../identity/issuer";
 import { liveCheck, signatureTrustedAt, verifyCredential, verifyPresentation, type LiveCheckResult } from "../identity/verifier";
@@ -62,7 +62,7 @@ export interface VenueConfig {
   /** Independent witnesses whose receipts are accepted. Configured by the operator; a witness key is never minted by the venue. */
   witnesses?: WitnessKey[];
   /** Sources whose signed status notices are accepted (registry feed, insurers). Principals may always notify about their own agents. */
-  noticeSources?: { sourceId: string; publicKey: OkpJwk }[];
+  noticeSources?: { sourceId: string; publicKey: OkpJwk; insurerName?: string }[];
   /** The venue's maximum recording delay: every inclusion promise commits to this. */
   inclusionDelayMs: number;
 }
@@ -141,7 +141,9 @@ export class VenueService {
    */
   private live(cred: Credential, opts: Parameters<typeof liveCheck>[2] = {}): LiveCheckResult {
     const insurer = this.state.agents.get(cred.subject.agentId)?.insurerAttestation;
-    const r = liveCheck(this.registry, cred, { ...opts, insurer });
+    const insurerName = insurer ? this.state.noticeSources.find((x) => x.sourceId === insurer.insurerId)?.insurerName : undefined;
+    const r = liveCheck(this.registry, cred, { ...opts, insurer, insurerName });
+    if (r.insurerFalse) this.audit.writeOnce(`insurer-false-attestation:${r.insurerFalse.insurerId}:${r.insurerFalse.usdot}:${r.insurerFalse.signedAt}`, { component: "venue.identity", event: "insurer-false-attestation", outcome: "INFO", reasonCode: "INSURER_FALSE_ATTESTATION", subject: r.insurerFalse.insurerId, evidence: { usdot: r.insurerFalse.usdot, signedAt: r.insurerFalse.signedAt, missing: r.insurerFalse.missing, kid: r.insurerFalse.attestation.kid } });
     if (r.falseAttestations?.length) {
       for (const f of r.falseAttestations) this.audit.writeOnce(`false-attestation:${f.registryId}:${f.usdot}:${f.claimedSyncAt}`, { component: "venue.identity", event: "registry-false-attestation", outcome: "INFO", reasonCode: "REGISTRY_FALSE_ATTESTATION", subject: f.registryId, evidence: { usdot: f.usdot, claimedSyncAt: f.claimedSyncAt, missing: f.missing, kid: f.attestation.kid } });
     }
@@ -245,7 +247,7 @@ export class VenueService {
   // and before anything else, with a signed inclusion promise; then it
   // records. It cannot acknowledge and forget without leaving evidence.
 
-  registerNoticeSource(src: { sourceId: string; publicKey: OkpJwk }) {
+  registerNoticeSource(src: { sourceId: string; publicKey: OkpJwk; insurerName?: string }) {
     if (!this.state.noticeSources.some((x) => x.sourceId === src.sourceId)) {
       this.state.noticeSources.push(src);
       this.state.persist();
@@ -363,11 +365,21 @@ export class VenueService {
    * registered key (insurers register as notice sources) and against the party's entity; kept on file and used in
    * every standing check as one more statement that must agree, and the one no registry mirror can forge.
    */
-  private checkInsurerAttestation(a: InsurerAttestation, usdot: string): Record<string, unknown> | undefined {
+  private checkInsurerAttestation(a: InsurerAttestation, usdot: string): { reasonCode: ReasonCode; evidence: Record<string, unknown> } | undefined {
     const src = this.state.noticeSources.find((x) => x.sourceId === a.insurerId);
-    if (!src) return { error: "insurer is not a registered source", insurerId: a.insurerId };
-    if (!verifyInsurerAttestation(a, src.publicKey)) return { error: "insurer attestation does not verify under the registered key", insurerId: a.insurerId };
-    if (a.usdot !== usdot) return { error: "insurer attestation is about another entity", attested: a.usdot, entity: usdot };
+    if (!src) return { reasonCode: "INSURER_ATTESTATION_INVALID", evidence: { error: "insurer is not a registered source", insurerId: a.insurerId } };
+    if (!verifyInsurerAttestation(a, src.publicKey)) return { reasonCode: "INSURER_ATTESTATION_INVALID", evidence: { error: "insurer attestation does not verify under the registered key", insurerId: a.insurerId } };
+    if (a.usdot !== usdot) return { reasonCode: "INSURER_ATTESTATION_INVALID", evidence: { error: "insurer attestation is about another entity", attested: a.usdot, entity: usdot } };
+    // Of record: the registry's filing names the insurer and the policy. Anyone else's signature is not the origin's word.
+    const atts = this.registry.attestations(usdot);
+    const rec = insurerOfRecord(a, atts.map((x) => x.record), src.insurerName ?? a.insurerName);
+    if (!rec.ok) return { reasonCode: "INSURER_NOT_OF_RECORD", evidence: { error: rec.why, insurerId: a.insurerId, insurerName: src.insurerName ?? a.insurerName ?? null, policyNumber: a.policyNumber, registries: atts.map((x) => x.registryId), filingsOnRecord: atts.flatMap((x) => x.record?.insurance.map((f) => ({ insurer: f.insurer, policyNumber: f.policyNumber, type: f.type })) ?? []) } };
+    // Symmetric with the mirrors: the origin signed after the registry received its own filing and did not disclose it.
+    const proof = insurerContradictedBy(a, atts.flatMap(filingsShownBy));
+    if (proof) {
+      this.audit.writeOnce(`insurer-false-attestation:${a.insurerId}:${a.usdot}:${a.asOf}`, { component: "venue.identity", event: "insurer-false-attestation", outcome: "INFO", reasonCode: "INSURER_FALSE_ATTESTATION", subject: a.insurerId, evidence: { usdot: a.usdot, signedAt: a.asOf, missing: proof.missing, kid: a.kid } });
+      return { reasonCode: "INSURER_FALSE_ATTESTATION", evidence: { error: "the insurer signed 'no cancellation' after the registry received its cancellation filing", insurerId: a.insurerId, signedAt: a.asOf, missing: proof.missing } };
+    }
     return undefined;
   }
 
@@ -375,10 +387,13 @@ export class VenueService {
     const reg = this.state.agents.get(params.agentId);
     if (!reg) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "unknown agent", agentId: params.agentId });
     const cred = this.issuer.get(reg.credentialId)!;
+    // The registry's word must be fresh to say who the insurer of record is.
+    const fresh = await this.freshen([cred.subject.entity.usdot]);
+    if (!fresh.ok) throw new Refusal("REGISTRY_UNAVAILABLE", "venue.identity", fresh.evidence);
     const bad = this.checkInsurerAttestation(params.attestation, cred.subject.entity.usdot);
     if (bad) {
-      this.audit.write({ component: "venue.identity", event: "present-insurance", outcome: "REFUSED", reasonCode: "INSURER_ATTESTATION_INVALID", subject: params.agentId, evidence: bad });
-      throw new Refusal("INSURER_ATTESTATION_INVALID", "venue.identity", bad);
+      this.audit.write({ component: "venue.identity", event: "present-insurance", outcome: "REFUSED", reasonCode: bad.reasonCode, subject: params.agentId, evidence: bad.evidence });
+      throw new Refusal(bad.reasonCode, "venue.identity", bad.evidence);
     }
     if (reg.insurerAttestation && new Date(params.attestation.asOf) < new Date(reg.insurerAttestation.asOf)) throw new Refusal("INSURER_ATTESTATION_INVALID", "venue.identity", { error: "older than the attestation on file", onFile: reg.insurerAttestation.asOf, presented: params.attestation.asOf });
     reg.insurerAttestation = params.attestation;
@@ -407,7 +422,9 @@ export class VenueService {
       const delivery = new Date(c.artifact.terms.delivery.windowEnd);
       const w = { earliestSignedAt: c.renewal.earliestSignedAt, dueBy: c.renewal.dueBy, reachesDelivery: false, possible: true };
       const onFile = this.state.agents.get(c.carrierAgentId)?.insurerAttestation;
-      if (onFile) {
+      // A renewal the mirrors' filing dates contradict is a lie, not a renewal: it satisfies nothing (and is audited by live()).
+      const falseWord = onFile ? insurerContradictedBy(onFile, this.registry.attestations(c.carrierUsdot).flatMap(filingsShownBy)) : undefined;
+      if (onFile && !falseWord) {
         const st = insurerStanding(onFile, new Date(onFile.asOf), delivery);
         if (!st.ok) {
           // The origin's word says no: the renewal is the moment the insurer gets to.
@@ -467,8 +484,8 @@ export class VenueService {
     if (params.insurerAttestation) {
       const bad = this.checkInsurerAttestation(params.insurerAttestation, params.claimed.usdot);
       if (bad) {
-        this.audit.write({ component: "venue.identity", event: "present-insurance", outcome: "REFUSED", reasonCode: "INSURER_ATTESTATION_INVALID", subject: agentId, evidence: bad });
-        throw new Refusal("INSURER_ATTESTATION_INVALID", "venue.identity", bad);
+        this.audit.write({ component: "venue.identity", event: "present-insurance", outcome: "REFUSED", reasonCode: bad.reasonCode, subject: agentId, evidence: bad.evidence });
+        throw new Refusal(bad.reasonCode, "venue.identity", bad.evidence);
       }
       insurerAttestation = params.insurerAttestation;
     }
@@ -857,8 +874,10 @@ export class VenueService {
       for (const x of v.violations) violations.push({ code: x.code, evidence: { ...x.evidence, envelopePrincipalKid: sender.envelope.principalKid, agentId: sender.agentId } });
       // (d2) fail early, like the insurance minimum: if the principal requires the counterparty's own insurer to have
       // vouched through delivery, the word on file must reach the load's delivery window before anyone negotiates.
-      if (sender.envelope.limits.requireInsurerAttestation && reg.ok && cpLive) {
-        const w = renewalWindow(cp0 ? this.state.agents.get(cp0.agentId)?.insurerAttestation : undefined, new Date(data.offer.pickup.windowStart), through);
+      if ((sender.envelope.limits.requireInsurerAttestation || sender.envelope.limits.requireInsurerUndertaking) && reg.ok && cpLive) {
+        if (cpLive.insurerFalse) violations.push({ code: "INSURER_FALSE_ATTESTATION", evidence: { counterparty: data.to.agentId, insurerId: cpLive.insurerFalse.insurerId, signedAt: cpLive.insurerFalse.signedAt, missing: cpLive.insurerFalse.missing, note: "an origin caught lying is not an origin: the word on file does not count" } });
+        else if (sender.envelope.limits.requireInsurerUndertaking && cpLive.insurer && !cpLive.insurer.undertaking) violations.push({ code: "MANDATE_INSURER_UNDERTAKING_REQUIRED", evidence: { counterparty: data.to.agentId, insurerId: cpLive.insurer.insurerId, asOf: cpLive.insurer.asOf, envelopePrincipalKid: sender.envelope.principalKid, agentId: sender.agentId, note: "the word on file is a certificate (the insurer's belief); the principal accepts only an undertaking (a promise the insurer is liable for)" } });
+        const w = renewalWindow(cpLive.insurer ? (cp0 ? this.state.agents.get(cp0.agentId)?.insurerAttestation : undefined) : undefined, new Date(data.offer.pickup.windowStart), through);
         // Short of delivery is a CONDITION the commitment will carry (renewal by pickup), not a refusal — unless no renewal can help.
         if (!w.assuredThrough || (!w.reachesDelivery && !w.possible)) violations.push({ code: "MANDATE_INSURER_ATTESTATION_REQUIRED", evidence: { counterparty: data.to.agentId, counterpartyInsuranceAssuredThrough: w.assuredThrough ?? null, assuredBy: cpLive.insurer?.insurerId ?? null, deliveryWindowEnd: through.toISOString(), pickupWindowStart: data.offer.pickup.windowStart, earliestRenewalSignedAt: w.earliestSignedAt, envelopePrincipalKid: sender.envelope.principalKid, agentId: sender.agentId, note: w.assuredThrough ? "no word signed before pickup can assure coverage through delivery: transit outruns the insurer's notice period" : "no insurer attestation on file for the counterparty" } });
       }
@@ -866,7 +885,7 @@ export class VenueService {
 
     if (violations.length) {
       // most specific first
-      const order: ReasonCode[] = ["DOUBLE_BROKERING_ATTEMPT", "LOAD_ALREADY_COMMITTED", "REGISTRY_UNAVAILABLE", "NO_BROKERAGE_AUTHORITY", "INSURANCE_LAPSED", "INSURANCE_CANCELLATION_PENDING", "INSURANCE_BELOW_MINIMUM", "AUTHORITY_NOT_ACTIVE", "CREDENTIAL_REVOKED", "CREDENTIAL_EXPIRED", "COUNTERPARTY_UNVERIFIED", "MANDATE_INSURER_ATTESTATION_REQUIRED", "MANDATE_RATE_ABOVE_CEILING", "MANDATE_RATE_BELOW_FLOOR", "MANDATE_LANE_NOT_APPROVED", "MANDATE_EQUIPMENT_NOT_APPROVED"];
+      const order: ReasonCode[] = ["DOUBLE_BROKERING_ATTEMPT", "LOAD_ALREADY_COMMITTED", "REGISTRY_UNAVAILABLE", "NO_BROKERAGE_AUTHORITY", "INSURANCE_LAPSED", "INSURANCE_CANCELLATION_PENDING", "INSURANCE_BELOW_MINIMUM", "AUTHORITY_NOT_ACTIVE", "CREDENTIAL_REVOKED", "CREDENTIAL_EXPIRED", "COUNTERPARTY_UNVERIFIED", "INSURER_FALSE_ATTESTATION", "MANDATE_INSURER_UNDERTAKING_REQUIRED", "MANDATE_INSURER_ATTESTATION_REQUIRED", "MANDATE_RATE_ABOVE_CEILING", "MANDATE_RATE_BELOW_FLOOR", "MANDATE_LANE_NOT_APPROVED", "MANDATE_EQUIPMENT_NOT_APPROVED"];
       const primary = [...violations].sort((a, b) => (order.indexOf(a.code) === -1 ? 99 : order.indexOf(a.code)) - (order.indexOf(b.code) === -1 ? 99 : order.indexOf(b.code)))[0]!;
       const refusedBy: Component = primary.code.startsWith("MANDATE_") ? "venue.mandate" : ["DOUBLE_BROKERING_ATTEMPT", "COUNTERPARTY_UNVERIFIED", "NO_BROKERAGE_AUTHORITY", "LOAD_ALREADY_COMMITTED"].includes(primary.code) ? "venue.routing" : "venue.identity";
       const evidence = { ...primary.evidence, allViolations: violations.map((v) => v.code), details: violations };
@@ -986,7 +1005,7 @@ export class VenueService {
     const cpInsurance = sender.agentId === t.brokerAgentId ? otherLive.insurance?.bipdCoverageUsd ?? 0 : otherLive.insurance?.bondUsd ?? 0;
     const verdict = evaluateMandate(
       envelopeToLimits(env),
-      { kind: "ACCEPT", rateUsd: data.terms.rateUsd, miles: t.load.miles, originState: t.load.origin.state, destinationState: t.load.destination.state, equipment: t.load.equipment, hazmat: t.load.hazmat, paymentTermsDays: data.terms.paymentTermsDays, round: data.round, counterpartyUsdot: otherCred.subject.entity.usdot, counterpartyInsuranceUsd: cpInsurance, counterpartyInsuranceAssuredThrough: otherLive.insurer?.assuredThrough, counterpartyInsuranceNoticeDays: otherLive.insurer?.noticeDays, pickupWindowStart: data.terms.pickup.windowStart, deliveryWindowEnd: data.terms.delivery.windowEnd, guaranteeAvailable, day: data.terms.pickup.windowStart.slice(0, 10) },
+      { kind: "ACCEPT", rateUsd: data.terms.rateUsd, miles: t.load.miles, originState: t.load.origin.state, destinationState: t.load.destination.state, equipment: t.load.equipment, hazmat: t.load.hazmat, paymentTermsDays: data.terms.paymentTermsDays, round: data.round, counterpartyUsdot: otherCred.subject.entity.usdot, counterpartyInsuranceUsd: cpInsurance, counterpartyInsuranceAssuredThrough: otherLive.insurer?.assuredThrough, counterpartyInsuranceNoticeDays: otherLive.insurer?.noticeDays, counterpartyInsurerUndertaking: otherLive.insurer?.undertaking, pickupWindowStart: data.terms.pickup.windowStart, deliveryWindowEnd: data.terms.delivery.windowEnd, guaranteeAvailable, day: data.terms.pickup.windowStart.slice(0, 10) },
       this.exposureFor(sender.agentId),
     );
     if (!verdict.allowed) {
@@ -1447,7 +1466,7 @@ export class VenueService {
         credentialId: fromCred.credentialId,
         entity: fromCred.subject.entity,
         publicKey: fromCred.subject.publicKey,
-        insurance: { bipdUsd: fromLive.insurance?.bipdCoverageUsd ?? 0, cargoUsd: fromLive.insurance?.cargoCoverageUsd ?? 0, bondUsd: fromLive.insurance?.bondUsd ?? 0, assuredThrough: fromLive.insurer?.assuredThrough, assuredBy: fromLive.insurer?.insurerId, noticeDays: fromLive.insurer?.noticeDays },
+        insurance: { bipdUsd: fromLive.insurance?.bipdCoverageUsd ?? 0, cargoUsd: fromLive.insurance?.cargoCoverageUsd ?? 0, bondUsd: fromLive.insurance?.bondUsd ?? 0, assuredThrough: fromLive.insurer?.assuredThrough, assuredBy: fromLive.insurer?.insurerId, noticeDays: fromLive.insurer?.noticeDays, undertaking: fromLive.insurer?.undertaking },
         verifiedAt: new Date().toISOString(),
         registries: fromLive.registries,
       },
