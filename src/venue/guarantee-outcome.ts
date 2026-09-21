@@ -57,6 +57,8 @@ export function guaranteeWouldHavePaid(code: ReasonCode): string {
     case "CREDENTIAL_SUPERSEDED":
     case "ROTATION_UNAUTHORIZED":
       return "N/A — refused before any transaction. A refused self-rotation is the control working: a stolen key cannot rebind itself.";
+    case "INSURANCE_RENEWAL_NOT_PRESENTED":
+      return "Guarantee WAS attached conditionally and is now RELEASED with the void: the carrier's insurer did not re-attest coverage through delivery by pickup. The broker was told in time to re-cover; dispatching anyway is PRINCIPAL_OVERRODE_REFUSAL, excluded.";
     case "CREDENTIAL_REVOKED_PRE_PICKUP":
     case "CREDENTIAL_REVOKED":
       return "Guarantee WAS attached and is now RELEASED with the commitment voided. If the broker ships anyway after the VOIDED notice, PRINCIPAL_OVERRODE_REFUSAL applies: excluded.";

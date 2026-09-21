@@ -107,7 +107,7 @@ export interface LiveCheckResult extends Verdict {
   /** Every registry whose fresh word was considered. */
   registries?: RegistryRef[];
   /** The origin's word, if on file: who, through when coverage is assured by that word alone. */
-  insurer?: { insurerId: string; policyNumber: string; asOf: string; assuredThrough: string };
+  insurer?: { insurerId: string; policyNumber: string; asOf: string; assuredThrough: string; noticeDays: number };
   /** Mirrors whose signed word is contradicted by a filing someone else's signed word shows: proofs, not suspicions. */
   falseAttestations?: FalseAttestationProof[];
 }
@@ -136,7 +136,7 @@ export function liveCheck(
   // The origin's word, if on file, is one more signed statement that must agree — and the one no mirror can forge.
   const ins = opts.insurer && opts.insurer.usdot === usdot ? opts.insurer : undefined;
   const insSt = ins ? insurerStanding(ins, now, opts.through) : undefined;
-  const insurer = ins && insSt ? { insurerId: ins.insurerId, policyNumber: ins.policyNumber, asOf: ins.asOf, assuredThrough: insSt.assuredThrough } : undefined;
+  const insurer = ins && insSt ? { insurerId: ins.insurerId, policyNumber: ins.policyNumber, asOf: ins.asOf, assuredThrough: insSt.assuredThrough, noticeDays: ins.noticeDays } : undefined;
   // Accountability: a mirror claiming a sync after a filing that its record lacks has signed a falsehood.
   const evidence = [...atts.flatMap(filingsShownBy), ...(ins ? [filingShownByInsurer(ins)].filter((x): x is NonNullable<typeof x> => !!x) : [])];
   const falseAttestations = atts.map((a) => contradictedBy(a, evidence)).filter((x): x is FalseAttestationProof => !!x);

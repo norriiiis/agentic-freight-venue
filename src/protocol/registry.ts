@@ -376,6 +376,40 @@ export function coverageAssuredThrough(a: InsurerAttestation): Date {
   return eff < statutory ? eff : statutory;
 }
 
+/**
+ * The statutory window makes "when must the origin speak again" arithmetic.
+ * A word signed at S assures through S + notice; to reach a delivery at D it
+ * must be signed at or after D − notice, and it must be on file before the
+ * truck moves. So a commitment whose word on file falls short of delivery is
+ * CONDITIONAL: a renewal signed in [D − notice, pickup] must be presented by
+ * pickup, or the commitment is voided in time to re-cover the load. If
+ * D − notice is after pickup (transit longer than the notice period), no word
+ * signed before dispatch can reach delivery and the load cannot be assured.
+ */
+export interface RenewalWindow {
+  /** What the word on file assures through, if any. */
+  assuredThrough?: string;
+  /** Whether the word on file already reaches delivery. */
+  reachesDelivery: boolean;
+  /** Earliest signing time of a word that can reach delivery. */
+  earliestSignedAt: string;
+  /** The renewal must be on file by this moment (pickup). */
+  dueBy: string;
+  /** false when earliestSignedAt is after dueBy: no renewal can help. */
+  possible: boolean;
+}
+
+export function renewalWindow(onFile: InsurerAttestation | undefined, pickup: Date, delivery: Date, noticeDays = onFile?.noticeDays ?? 30): RenewalWindow {
+  const assured = onFile ? coverageAssuredThrough(onFile) : undefined;
+  const earliest = new Date(delivery.getTime() - noticeDays * 86_400_000);
+  return { assuredThrough: assured?.toISOString(), reachesDelivery: !!assured && assured >= delivery, earliestSignedAt: earliest.toISOString(), dueBy: pickup.toISOString(), possible: earliest <= pickup };
+}
+
+/** Does this word satisfy a renewal condition: signed no earlier than the window allows, and assuring through delivery? */
+export function satisfiesRenewal(a: InsurerAttestation, w: RenewalWindow, delivery: Date): boolean {
+  return new Date(a.asOf) >= new Date(w.earliestSignedAt) && coverageAssuredThrough(a) >= delivery;
+}
+
 export function filingShownByInsurer(a: InsurerAttestation): FilingEvidence | undefined {
   return a.cancellation ? { source: `insurer:${a.insurerId}`, policyNumber: a.policyNumber, cancellationDate: a.cancellation.effectiveDate, cancellationFiledDate: a.cancellation.filedDate, asOf: a.asOf } : undefined;
 }

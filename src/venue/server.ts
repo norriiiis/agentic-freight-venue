@@ -107,7 +107,8 @@ if (simMode) {
       return ok(venue.underwriting.exposure(u.searchParams.get("counterparty") ?? "", u.searchParams.get("beneficiary") ?? ""));
     },
     "POST /admin/expire-stale-tasks": async () => ok({ expired: (await venue.expireStaleTasks()).map((t) => ({ taskId: t.task.id, outcome: t.outcome })) }),
-    "POST /admin/pre-pickup-checks": async () => ok({ voided: (await venue.prePickupChecks()).map((c) => ({ commitmentId: c.commitmentId, voided: c.voided })) }),
+    /** `now` (ISO) lets the simulator move the clock for renewal deadlines; standing checks still use real registry time. */
+    "POST /admin/pre-pickup-checks": async (_r, b) => { const at = (b as { now?: string } | undefined)?.now; return ok({ voided: (await venue.prePickupChecks(at ? new Date(at) : undefined)).map((c) => ({ commitmentId: c.commitmentId, voided: c.voided })) }); },
     "GET /admin/audit": async () => ok(venue.audit.readAll()),
     "GET /admin/ledger": async () => ok(venue.ledger.all()),
     "GET /admin/tasks": async () => ok([...venue.state.tasks.values()]),

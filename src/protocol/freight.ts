@@ -151,6 +151,15 @@ export interface CredentialReissuedPayload {
   credential: Record<string, unknown>;
   reason: string;
 }
+/** Venue -> agents: a conditional commitment's insurer-renewal condition was satisfied; the origin's word is recorded. */
+export interface InsuranceRenewedPayload {
+  type: "INSURANCE_RENEWED";
+  loadRef: string;
+  commitmentId: string;
+  attestation: Record<string, unknown>; // InsurerAttestation
+  assuredThrough: string;
+  ledgerSeq: number;
+}
 /** Venue -> agent, after a venue-key compromise: this commitment's artifact carries a new attestation. */
 export interface CommitmentReattestedPayload {
   type: "COMMITMENT_REATTESTED";
@@ -163,6 +172,7 @@ export interface CommitmentReattestedPayload {
 export type NegotiationPayload =
   | CredentialReissuedPayload
   | CommitmentReattestedPayload
+  | InsuranceRenewedPayload
   | TenderPayload
   | CounterPayload
   | AcceptPayload
@@ -205,6 +215,7 @@ const KEYS: Record<string, string[]> = {
   VOIDED: ["type", "loadRef", "commitmentId", "reasonCode", "evidence"],
   CREDENTIAL_REISSUED: ["type", "credential", "reason"],
   COMMITMENT_REATTESTED: ["type", "loadRef", "commitmentId", "artifact", "reason"],
+  INSURANCE_RENEWED: ["type", "loadRef", "commitmentId", "attestation", "assuredThrough", "ledgerSeq"],
 };
 const FORMATS: Record<string, { re: RegExp; max: number }> = {
   loadRef: { re: /^[A-Za-z0-9._\-/]+$/, max: 64 },

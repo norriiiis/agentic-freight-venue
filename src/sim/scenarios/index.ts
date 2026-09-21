@@ -23,6 +23,7 @@ import { delayedRecording } from "./delayed-recording";
 import { registryNotRead } from "./registry-not-read";
 import { registryQuorum } from "./registry-quorum";
 import { registryCollusion } from "./registry-collusion";
+import { insuranceRenewal } from "./insurance-renewal";
 
-export const SCENARIOS: Scenario[] = [happyPath, insuranceLapsed, spoofedCarrier, doubleBrokering, brokerOverCeiling, exposureMidNegotiation, nonConvergence, revokedPrePickup, replayAndTamper, multiTender, negotiationTimeout, promptInjection, venueCrashRecovery, venueCrashNotification, keyRotation, venueKeyRotation, rootKeyRotation, statusTimestamping, witnessEquivocation, witnessCollusion, delayedRecording, registryNotRead, registryQuorum, registryCollusion];
+export const SCENARIOS: Scenario[] = [happyPath, insuranceLapsed, spoofedCarrier, doubleBrokering, brokerOverCeiling, exposureMidNegotiation, nonConvergence, revokedPrePickup, replayAndTamper, multiTender, negotiationTimeout, promptInjection, venueCrashRecovery, venueCrashNotification, keyRotation, venueKeyRotation, rootKeyRotation, statusTimestamping, witnessEquivocation, witnessCollusion, delayedRecording, registryNotRead, registryQuorum, registryCollusion, insuranceRenewal];
 export const ADVERSARIAL = SCENARIOS.filter((s) => s.id !== "happy-path");

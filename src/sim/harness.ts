@@ -104,7 +104,7 @@ export class AgentHandle {
   stateDigest() { return httpGet<{ agentId: string; dataDir: string; files: string[]; privateContextHash: string; knownAgentUrls: string[] }>(`${this.url}/control/state-digest`); }
   canary() { return httpGet<{ canary: string }>(`${this.url}/control/private-canary`); }
   /** The principal obtained a renewed COI from its insurer and hands it to its agent. */
-  presentInsurance(att: InsurerAttestation) { return httpPost<{ ok: boolean; reasonCode?: string; evidence?: unknown }>(`${this.url}/control/present-insurance`, att); }
+  presentInsurance(att: InsurerAttestation) { return httpPost<{ ok: boolean; reasonCode?: string; evidence?: unknown; satisfied?: string[]; voided?: string[] }>(`${this.url}/control/present-insurance`, att); }
   /** Wait until this agent's own record of the task reaches a status (the venue's terminal state arrives asynchronously). */
   async waitStatus(taskId: string, statuses: LocalTask["status"][], timeoutMs = 8000): Promise<LocalTask | undefined> {
     const start = Date.now();
@@ -141,7 +141,7 @@ export class VenueHandle {
   seedExposure(counterpartyUsdot: string, beneficiaryUsdot: string, amountUsd: number, day: string, note: string) { return httpPost<{ exposure: unknown }>(`${this.url}/admin/underwriting/seed-exposure`, { counterpartyUsdot, beneficiaryUsdot, amountUsd, day, note }); }
   seedHistory(usdot: string, history: Record<string, unknown>) { return httpPost(`${this.url}/admin/underwriting/seed-history`, { usdot, history }); }
   expireStaleTasks() { return httpPost<{ expired: { taskId: string; outcome: unknown }[] }>(`${this.url}/admin/expire-stale-tasks`, {}); }
-  prePickupChecks() { return httpPost<{ voided: { commitmentId: string; voided: unknown }[] }>(`${this.url}/admin/pre-pickup-checks`, {}); }
+  prePickupChecks(now?: Date) { return httpPost<{ voided: { commitmentId: string; voided: unknown }[] }>(`${this.url}/admin/pre-pickup-checks`, now ? { now: now.toISOString() } : {}); }
   audit() { return httpGet<AuditEntry[]>(`${this.url}/admin/audit`); }
   ledger() { return httpGet<LedgerEntry[]>(`${this.url}/admin/ledger`); }
   tasks() { return httpGet<NegotiationTask[]>(`${this.url}/admin/tasks`); }

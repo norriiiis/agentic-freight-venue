@@ -27,7 +27,7 @@ import { AuditLog, type Component } from "../protocol/audit";
 import { rpcCall, RpcRefusal } from "../protocol/rpc";
 import type { Credential, MandateEnvelope, RotationAuthorization, RotationClaims } from "../protocol/types";
 import { RegistryMirror, RegistryUnavailable, type RegistrySource } from "../identity/registry-mirror";
-import { hasBrokerAuthority, insuranceStatus, verifyInsurerAttestation, type InsurerAttestation, type RegistryAttestation } from "../protocol/registry";
+import { coverageAssuredThrough, hasBrokerAuthority, insuranceStatus, insurerStanding, renewalWindow, satisfiesRenewal, verifyInsurerAttestation, type InsurerAttestation, type RegistryAttestation } from "../protocol/registry";
 import { StubVettingProvider } from "../identity/vetting";
 import { CredentialIssuer } from "../identity/issuer";
 import { liveCheck, signatureTrustedAt, verifyCredential, verifyPresentation, type LiveCheckResult } from "../identity/verifier";
@@ -384,7 +384,65 @@ export class VenueService {
     reg.insurerAttestation = params.attestation;
     this.state.persist();
     this.audit.write({ component: "venue.identity", event: "present-insurance", outcome: "ALLOWED", subject: params.agentId, evidence: { insurerId: params.attestation.insurerId, policyNumber: params.attestation.policyNumber, asOf: params.attestation.asOf, cancellation: params.attestation.cancellation ?? null } });
-    return { ok: true, insurerId: params.attestation.insurerId, asOf: params.attestation.asOf };
+    // A fresh word from the origin is what conditional commitments wait for — and where the insurer gets to say no.
+    const outcome = await this.checkRenewalConditions(new Date(), params.agentId);
+    return { ok: true, insurerId: params.attestation.insurerId, asOf: params.attestation.asOf, satisfied: outcome.satisfied.map((c) => c.commitmentId), voided: outcome.voided.map((c) => c.commitmentId) };
+  }
+
+  // ---------------------------------------------------- conditional commitments
+  //
+  // The statutory window makes renewal arithmetic: a word signed at S assures
+  // through S + notice, so a load delivering at D needs a word signed at or
+  // after D − notice, on file before the truck moves. A conditional
+  // commitment records that; this check satisfies it when such a word
+  // arrives, voids it if the word discloses a cancellation, and voids it at
+  // pickup if no word came — in time to re-cover the load.
+
+  async checkRenewalConditions(now = new Date(), onlyAgentId?: string): Promise<{ satisfied: CommitmentRecord[]; voided: CommitmentRecord[] }> {
+    const satisfied: CommitmentRecord[] = [];
+    const voided: CommitmentRecord[] = [];
+    for (const c of this.state.commitments.values()) {
+      if (c.status !== "ACTIVE" || !c.renewal || c.renewal.satisfied) continue;
+      if (onlyAgentId && c.carrierAgentId !== onlyAgentId) continue;
+      const delivery = new Date(c.artifact.terms.delivery.windowEnd);
+      const w = { earliestSignedAt: c.renewal.earliestSignedAt, dueBy: c.renewal.dueBy, reachesDelivery: false, possible: true };
+      const onFile = this.state.agents.get(c.carrierAgentId)?.insurerAttestation;
+      if (onFile) {
+        const st = insurerStanding(onFile, new Date(onFile.asOf), delivery);
+        if (!st.ok) {
+          // The origin's word says no: the renewal is the moment the insurer gets to.
+          await this.voidCommitment(c, st.reasonCode!, { commitmentId: c.commitmentId, party: "carrier", agentId: c.carrierAgentId, source: `insurer:${onFile.insurerId}`, ...st.evidence, renewal: c.renewal }, now, "renewal-check");
+          voided.push(c);
+          continue;
+        }
+        if (satisfiesRenewal(onFile, w, delivery)) {
+          const assuredThrough = coverageAssuredThrough(onFile).toISOString();
+          const entry = this.ledger.append("INSURANCE_RENEWAL", { commitmentId: c.commitmentId, insurerId: onFile.insurerId, policyNumber: onFile.policyNumber, attestationHash: hashObject(onFile), attestation: onFile, assuredThrough, earliestSignedAt: c.renewal.earliestSignedAt, dueBy: c.renewal.dueBy });
+          c.renewal.satisfied = { attestation: onFile, assuredThrough, ledgerSeq: entry.seq, at: now.toISOString() };
+          this.state.persist();
+          this.audit.write({ component: "venue.commitment", event: "renewal-satisfied", outcome: "ALLOWED", taskId: c.taskId, evidence: { commitmentId: c.commitmentId, insurerId: onFile.insurerId, signedAt: onFile.asOf, assuredThrough, deliveryWindowEnd: c.artifact.terms.delivery.windowEnd, ledgerSeq: entry.seq } });
+          const notice = this.venueMessage({ type: "INSURANCE_RENEWED", loadRef: c.loadRef, commitmentId: c.commitmentId, attestation: onFile as unknown as Record<string, unknown>, assuredThrough, ledgerSeq: entry.seq }, c.taskId, `ctx_${c.loadRef}`);
+          for (const id of [c.brokerAgentId, c.carrierAgentId]) this.enqueue(id, notice, `INSURANCE_RENEWED ${c.commitmentId}`);
+          satisfied.push(c);
+          continue;
+        }
+      }
+      if (now > new Date(c.renewal.dueBy)) {
+        await this.voidCommitment(c, "INSURANCE_RENEWAL_NOT_PRESENTED", { commitmentId: c.commitmentId, party: "carrier", agentId: c.carrierAgentId, renewal: c.renewal, onFile: onFile ? { insurerId: onFile.insurerId, asOf: onFile.asOf, assuredThrough: coverageAssuredThrough(onFile).toISOString() } : null, deliveryWindowEnd: c.artifact.terms.delivery.windowEnd, checkedAt: now.toISOString() }, now, "renewal-check");
+        voided.push(c);
+      }
+    }
+    if (satisfied.length) await this.flushOutbox();
+    return { satisfied, voided };
+  }
+
+  /** Same transaction shape as commit: journal → one ledger entry (carrying the guarantee release) → idempotent apply. */
+  private async voidCommitment(c: CommitmentRecord, reasonCode: ReasonCode, evidence: Record<string, unknown>, now: Date, origin: string) {
+    const journal: VoidJournal = { kind: "VOID", commitmentId: c.commitmentId, writtenAt: now.toISOString(), reasonCode, evidence, origin: origin as VoidJournal["origin"] };
+    this.state.writeJournal(journal);
+    const g = c.guaranteeId ? this.underwriting.guaranteeForCommitment(c.commitmentId) : undefined;
+    const entry = this.ledger.append("VOID", { commitmentId: c.commitmentId, reasonCode, evidence, guaranteeReleased: g ? { guaranteeId: g.guaranteeId, coveredAmountUsd: g.coveredAmountUsd } : null });
+    await this.applyVoid(journal, entry, "live");
   }
 
   async onboard(params: { card: AgentCard; claimed: { usdot: string; mc?: string }; proofOfControl: { method: string; token: string }; agentUrl: string; envelope?: MandateEnvelope; insurerAttestation?: InsurerAttestation }) {
@@ -800,8 +858,9 @@ export class VenueService {
       // (d2) fail early, like the insurance minimum: if the principal requires the counterparty's own insurer to have
       // vouched through delivery, the word on file must reach the load's delivery window before anyone negotiates.
       if (sender.envelope.limits.requireInsurerAttestation && reg.ok && cpLive) {
-        const assured = cpLive.insurer?.assuredThrough;
-        if (!assured || new Date(assured) < through) violations.push({ code: "MANDATE_INSURER_ATTESTATION_REQUIRED", evidence: { counterparty: data.to.agentId, counterpartyInsuranceAssuredThrough: assured ?? null, assuredBy: cpLive.insurer?.insurerId ?? null, deliveryWindowEnd: through.toISOString(), envelopePrincipalKid: sender.envelope.principalKid, agentId: sender.agentId, note: assured ? "the insurer's own word assures coverage only through the earlier date; beyond it only registry mirrors vouch" : "no insurer attestation on file for the counterparty" } });
+        const w = renewalWindow(cp0 ? this.state.agents.get(cp0.agentId)?.insurerAttestation : undefined, new Date(data.offer.pickup.windowStart), through);
+        // Short of delivery is a CONDITION the commitment will carry (renewal by pickup), not a refusal — unless no renewal can help.
+        if (!w.assuredThrough || (!w.reachesDelivery && !w.possible)) violations.push({ code: "MANDATE_INSURER_ATTESTATION_REQUIRED", evidence: { counterparty: data.to.agentId, counterpartyInsuranceAssuredThrough: w.assuredThrough ?? null, assuredBy: cpLive.insurer?.insurerId ?? null, deliveryWindowEnd: through.toISOString(), pickupWindowStart: data.offer.pickup.windowStart, earliestRenewalSignedAt: w.earliestSignedAt, envelopePrincipalKid: sender.envelope.principalKid, agentId: sender.agentId, note: w.assuredThrough ? "no word signed before pickup can assure coverage through delivery: transit outruns the insurer's notice period" : "no insurer attestation on file for the counterparty" } });
       }
     }
 
@@ -927,7 +986,7 @@ export class VenueService {
     const cpInsurance = sender.agentId === t.brokerAgentId ? otherLive.insurance?.bipdCoverageUsd ?? 0 : otherLive.insurance?.bondUsd ?? 0;
     const verdict = evaluateMandate(
       envelopeToLimits(env),
-      { kind: "ACCEPT", rateUsd: data.terms.rateUsd, miles: t.load.miles, originState: t.load.origin.state, destinationState: t.load.destination.state, equipment: t.load.equipment, hazmat: t.load.hazmat, paymentTermsDays: data.terms.paymentTermsDays, round: data.round, counterpartyUsdot: otherCred.subject.entity.usdot, counterpartyInsuranceUsd: cpInsurance, counterpartyInsuranceAssuredThrough: otherLive.insurer?.assuredThrough, deliveryWindowEnd: data.terms.delivery.windowEnd, guaranteeAvailable, day: data.terms.pickup.windowStart.slice(0, 10) },
+      { kind: "ACCEPT", rateUsd: data.terms.rateUsd, miles: t.load.miles, originState: t.load.origin.state, destinationState: t.load.destination.state, equipment: t.load.equipment, hazmat: t.load.hazmat, paymentTermsDays: data.terms.paymentTermsDays, round: data.round, counterpartyUsdot: otherCred.subject.entity.usdot, counterpartyInsuranceUsd: cpInsurance, counterpartyInsuranceAssuredThrough: otherLive.insurer?.assuredThrough, counterpartyInsuranceNoticeDays: otherLive.insurer?.noticeDays, pickupWindowStart: data.terms.pickup.windowStart, deliveryWindowEnd: data.terms.delivery.windowEnd, guaranteeAvailable, day: data.terms.pickup.windowStart.slice(0, 10) },
       this.exposureFor(sender.agentId),
     );
     if (!verdict.allowed) {
@@ -1066,6 +1125,10 @@ export class VenueService {
       }
     }
     const registryAtt = { broker: fresh.attestations[terms.brokerEntity.usdot]!, carrier: fresh.attestations[terms.carrierEntity.usdot]! };
+    // The statutory window: if the broker requires the carrier's insurer's word and the word on file falls short of
+    // delivery, the commitment is CONDITIONAL on a renewal signed within the window and presented by pickup.
+    const rw = renewalWindow(carrierReg.insurerAttestation, new Date(terms.pickup.windowStart), new Date(terms.delivery.windowEnd));
+    const renewal = brokerReg.envelope?.limits.requireInsurerAttestation && carrierReg.insurerAttestation && !rw.reachesDelivery ? { earliestSignedAt: rw.earliestSignedAt, dueBy: rw.dueBy, requiredBy: brokerReg.agentId } : undefined;
     const quote = this.quoteFor(t, terms);
     const requireGuarantee = !!brokerReg.envelope?.limits.requireGuarantee || !!carrierReg.envelope?.limits.requireGuarantee;
     if (quote.decision === "DECLINED" && requireGuarantee) {
@@ -1082,7 +1145,7 @@ export class VenueService {
         acceptances: { broker: t.acceptances[t.brokerAgentId]!, carrier: t.acceptances[t.carrierAgentId]! },
         credentials: { broker: brokerCred, carrier: carrierCred },
         registry: { registries: this.registry.pinned, attestations: registryAtt, policy: { maxAgeMs: this.config.registryMaxAgeMs, quorum: this.config.registryQuorum } },
-        insurance: { broker: brokerReg.insurerAttestation, carrier: carrierReg.insurerAttestation },
+        insurance: { broker: brokerReg.insurerAttestation, carrier: carrierReg.insurerAttestation, renewal },
         underwriting: quote.decision === "GUARANTEED" ? { decision: "GUARANTEED", riskScore: quote.assessment.probabilityOfLoss, guarantee: quote.guarantee } : { decision: "UNGUARANTEED", riskScore: quote.assessment.probabilityOfLoss, reasonCode: quote.reasonCode },
         ledger: { seq: head.seq + 1, prevHash: head.hash },
       },
@@ -1151,7 +1214,8 @@ export class VenueService {
 
     const alreadyRecorded = this.state.commitments.has(j.commitmentId);
     if (!alreadyRecorded) {
-      const rec: CommitmentRecord = { commitmentId: j.commitmentId, taskId: j.taskId, loadRef: terms.loadRef, loadFingerprint: loadFingerprint(terms.load), brokerAgentId, carrierAgentId, brokerUsdot: terms.brokerEntity.usdot, carrierUsdot: terms.carrierEntity.usdot, rateUsd: terms.rateUsd, pickupWindowStart: terms.pickup.windowStart, status: "ACTIVE", guaranteeId, artifact };
+      const rw = artifact.insurance?.renewal;
+      const rec: CommitmentRecord = { commitmentId: j.commitmentId, taskId: j.taskId, loadRef: terms.loadRef, loadFingerprint: loadFingerprint(terms.load), brokerAgentId, carrierAgentId, brokerUsdot: terms.brokerEntity.usdot, carrierUsdot: terms.carrierEntity.usdot, rateUsd: terms.rateUsd, pickupWindowStart: terms.pickup.windowStart, status: "ACTIVE", guaranteeId, artifact, renewal: rw ? { earliestSignedAt: rw.earliestSignedAt, dueBy: rw.dueBy } : undefined };
       this.state.commitments.set(j.commitmentId, rec);
     }
     const payload = { type: "COMMITTED" as const, loadRef: terms.loadRef, commitmentId: j.commitmentId, termsHash: artifact.termsHash, guarantee: j.guarantee ? { guaranteeId: j.guarantee.guaranteeId, coveredAmountUsd: j.guarantee.coveredAmountUsd, premiumUsd: j.guarantee.premiumUsd, scope: GUARANTEE_SCOPE } : undefined, artifact: artifact as unknown as Record<string, unknown> };
@@ -1383,7 +1447,7 @@ export class VenueService {
         credentialId: fromCred.credentialId,
         entity: fromCred.subject.entity,
         publicKey: fromCred.subject.publicKey,
-        insurance: { bipdUsd: fromLive.insurance?.bipdCoverageUsd ?? 0, cargoUsd: fromLive.insurance?.cargoCoverageUsd ?? 0, bondUsd: fromLive.insurance?.bondUsd ?? 0, assuredThrough: fromLive.insurer?.assuredThrough, assuredBy: fromLive.insurer?.insurerId },
+        insurance: { bipdUsd: fromLive.insurance?.bipdCoverageUsd ?? 0, cargoUsd: fromLive.insurance?.cargoCoverageUsd ?? 0, bondUsd: fromLive.insurance?.bondUsd ?? 0, assuredThrough: fromLive.insurer?.assuredThrough, assuredBy: fromLive.insurer?.insurerId, noticeDays: fromLive.insurer?.noticeDays },
         verifiedAt: new Date().toISOString(),
         registries: fromLive.registries,
       },
@@ -1475,7 +1539,7 @@ export class VenueService {
   /** Re-verify both parties of every ACTIVE commitment whose pickup is still ahead. A scheduler would run this; the sim triggers it. */
   /** Re-verify both parties of every ACTIVE commitment whose pickup is still ahead. A scheduler would run this; the sim triggers it. */
   async prePickupChecks(now = new Date()): Promise<CommitmentRecord[]> {
-    const voided: CommitmentRecord[] = [];
+    const voided: CommitmentRecord[] = [...(await this.checkRenewalConditions(now)).voided];
     for (const c of this.state.commitments.values()) {
       if (c.status !== "ACTIVE" || new Date(c.pickupWindowStart) < now) continue;
       for (const side of ["broker", "carrier"] as const) {
@@ -1494,12 +1558,7 @@ export class VenueService {
         void agentId;
         const reasonCode: ReasonCode = bad.reasonCode === "CREDENTIAL_REVOKED" ? "CREDENTIAL_REVOKED_PRE_PICKUP" : bad.reasonCode!;
         const evidence = { commitmentId: c.commitmentId, party: side, agentId: side === "broker" ? c.brokerAgentId : c.carrierAgentId, pickupWindowStart: c.pickupWindowStart, checkedAt: now.toISOString(), underlying: bad.reasonCode, ...bad.evidence };
-        // Same transaction shape as commit: journal → one ledger entry (carrying the guarantee release) → idempotent apply.
-        const journal: VoidJournal = { kind: "VOID", commitmentId: c.commitmentId, writtenAt: now.toISOString(), reasonCode, evidence };
-        this.state.writeJournal(journal);
-        const g = c.guaranteeId ? this.underwriting.guaranteeForCommitment(c.commitmentId) : undefined;
-        const entry = this.ledger.append("VOID", { commitmentId: c.commitmentId, reasonCode, evidence, guaranteeReleased: g ? { guaranteeId: g.guaranteeId, coveredAmountUsd: g.coveredAmountUsd } : null });
-        await this.applyVoid(journal, entry, "live");
+        await this.voidCommitment(c, reasonCode, evidence, now, "pre-pickup-check");
         voided.push(c);
         break;
       }

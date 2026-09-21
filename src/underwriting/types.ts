@@ -84,4 +84,5 @@ export const GUARANTEE_CONDITIONS = [
   "Venue controls functioned as designed at commitment time (audit trail intact)",
   "Commitment artifact verifies against the venue key",
   "Claim filed within 90 days of scheduled delivery",
+  "Where the artifact records an insurer-renewal condition, the carrier's insurer re-attested coverage through delivery by pickup (else the commitment was voided and this guarantee released)",
 ];

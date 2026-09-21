@@ -14,7 +14,7 @@ type Ev = { registry?: RegistryRef; source?: string; dissentingRegistries?: Regi
 export const registryCollusion: Scenario = {
   id: "registry-collusion",
   title: "Colluding mirrors: a signed lie is convicted by any honest word — a peer's, its own later, or the origin's — and the origin's word cannot be forged",
-  summary: "Independence among registry mirrors is configuration, not proof, so two of three collude: they keep serving the record without the insurer's cancellation and sign a sync time they never had. Two things make that a losing game. Every attestation states when its mirror synced, and every cancellation carries the date it was FILED — so a mirror claiming a sync after a filing it does not show has signed a falsehood, proven by any word that shows the filing. And the ORIGIN of the fact, the insurer, signs it directly: a word no mirror can forge, whose statutory 30-day notice turns 'no cancellation as of T' into coverage assured through T+30. Part 1: honest venue, the honest mirror outranks the two liars, and the refusal names the lie. Part 2: the venue hides the honest mirror and commits on the two liars, for a load delivering beyond what the insurer's word on file assures; a verifier who trusts any two mirrors is fooled; one with the honest mirror's word today convicts the liars; one who requires the origin's word through delivery refuses. Part 3: a broker whose mandate requires the origin's word through delivery — the stale COI is not enough, and the fresh one discloses the cancellation.",
+  summary: "Independence among registry mirrors is configuration, not proof, so two of three collude: they keep serving the record without the insurer's cancellation and sign a sync time they never had. Two things make that a losing game. Every attestation states when its mirror synced, and every cancellation carries the date it was FILED — so a mirror claiming a sync after a filing it does not show has signed a falsehood, proven by any word that shows the filing. And the ORIGIN of the fact, the insurer, signs it directly: a word no mirror can forge, whose statutory 30-day notice turns 'no cancellation as of T' into coverage assured through T+30. Part 1: honest venue, the honest mirror outranks the two liars, and the refusal names the lie. Part 2: the venue hides the honest mirror and commits on the two liars, for a load delivering beyond what the insurer's word on file assures; a verifier who trusts any two mirrors is fooled; one with the honest mirror's word today convicts the liars; one who requires the origin's word through delivery refuses. Part 3: a broker whose mandate requires the origin's word — the commitment forms conditionally because the word on file runs out before delivery, the condition makes the insurer speak again, and its fresh word discloses the cancellation: voided before dispatch.",
   expect: { outcome: "REFUSED", reasonCode: "REGISTRY_FALSE_ATTESTATION", refusedBy: "ledger/verify" },
   async run({ h, say }) {
     h.opts.venue = { registryQuorum: 2 };
@@ -73,37 +73,40 @@ export const registryCollusion: Scenario = {
     const vAny = verifyArtifact(art2, { pinnedRootKey: root, registryKeys: keys });
     const vToday = verifyArtifact(art2, { pinnedRootKey: root, registryKeys: keys, currentAttestations: [await a!.attest("2751903")] });
     const vOrigin = verifyArtifact(art2, { pinnedRootKey: root, registryKeys: keys, insurerKeys: [insurerKey], requireInsurerAttestation: true });
+    const vOriginLate = verifyArtifact(art2, { pinnedRootKey: root, registryKeys: keys, insurerKeys: [insurerKey], requireInsurerAttestation: true, asOf: new Date(new Date(art2.terms.pickup.windowStart).getTime() + 3_600_000) });
     const fresh = insurer.attest({ ...policy, cancellation: { filedDate: filed, effectiveDate: effective } });
     const vOriginToday = verifyArtifact(art2, { pinnedRootKey: root, registryKeys: keys, insurerKeys: [insurerKey], currentInsurerAttestations: [fresh] });
     say(`part 2: venue hides ${a!.registryId} → COMMITS ${art2.commitmentId.slice(0, 16)}… on ${art2.registry?.attestations.carrier.map((x) => x.registryId).join(", ")} with guarantee ${art2.underwriting.decision === "GUARANTEED" ? "ATTACHED" : "none"}; the COI in the artifact is as of ${art2.insurance?.carrier?.asOf.slice(0, 10)}, delivery ${day(35)}`);
     say(`   verifier trusting any two mirrors → ${vAny.ok ? "VERIFIED (!)" : vAny.reasonCode}`);
     say(`   verifier with ${a!.registryId}'s word today → ${vToday.reasonCode ?? "VERIFIED"}: ${vToday.checks.find((x) => x.name === `carrier.registry[${b!.registryId}].true-when-signed`)?.detail?.slice(0, 200)}`);
-    say(`   verifier requiring the origin's word through delivery → ${vOrigin.reasonCode ?? "VERIFIED"}: ${vOrigin.checks.find((x) => x.name === "carrier.insurer.assured-through-delivery")?.detail?.slice(0, 200)}`);
+    say(`   verifier requiring the origin's word through delivery, judging today → ${vOrigin.reasonCode ?? "VERIFIED"}: ${vOrigin.checks.find((x) => x.name === "carrier.insurer.renewal-due")?.detail?.slice(0, 200)}`);
+    say(`   …judging after pickup, no renewal ever recorded → ${vOriginLate.reasonCode ?? "VERIFIED"}`);
     say(`   verifier with the insurer's word today → ${vOriginToday.reasonCode ?? "VERIFIED"}: ${vOriginToday.checks.find((x) => x.name === "carrier.insurer.standing-per-current-word")?.detail?.slice(0, 120)}; liars convicted by the origin: ${vOriginToday.checks.filter((x) => x.name.endsWith("true-when-signed") && !x.ok).length}`);
-    if (!vAny.ok || vToday.reasonCode !== "REGISTRY_FALSE_ATTESTATION" || vOrigin.reasonCode !== "INSURANCE_NOT_ASSURED_THROUGH_DELIVERY" || vOriginToday.reasonCode !== "REGISTRY_FALSE_ATTESTATION" || art2.underwriting.decision !== "GUARANTEED") throw new Error(`part 2: collusion not caught: ${vToday.reasonCode} / ${vOrigin.reasonCode} / ${vOriginToday.reasonCode}`);
+    if (!vAny.ok || vToday.reasonCode !== "REGISTRY_FALSE_ATTESTATION" || vOrigin.reasonCode !== "INSURANCE_RENEWAL_PENDING" || vOriginLate.reasonCode !== "INSURANCE_RENEWAL_NOT_PRESENTED" || vOriginToday.reasonCode !== "REGISTRY_FALSE_ATTESTATION" || art2.underwriting.decision !== "GUARANTEED") throw new Error(`part 2: collusion not caught: ${vToday.reasonCode} / ${vOrigin.reasonCode} / ${vOriginLate.reasonCode} / ${vOriginToday.reasonCode}`);
     findings.push(
       { label: "part 2: any-k is fooled; one honest word convicts", reasonCode: "REGISTRY_FALSE_ATTESTATION", by: "ledger/verify", detail: `two colluding mirrors satisfy a verifier who accepts any two. But their attestations carry sync claims, and ${a!.registryId}'s word today shows a filing dated before those claims: the artifact itself becomes the proof against them. Collusion has to be total and permanent to be safe — one honest word, ever, and the lie is on the record with signatures` },
-      { label: "part 2: the origin bounds what mirrors can promise", reasonCode: "INSURANCE_NOT_ASSURED_THROUGH_DELIVERY", by: "ledger/verify", detail: `the insurer's word on file (no cancellation as of ${coi.asOf.slice(0, 10)}) assures coverage through ${day(30)} by statute; this load delivers ${day(35)}. Beyond that date only the mirrors vouched — and a verifier who requires the origin's word does not accept mirrors alone for it, colluding or not` },
+      { label: "part 2: the origin bounds what mirrors can promise", reasonCode: "INSURANCE_RENEWAL_PENDING", by: "ledger/verify", detail: `the insurer's word on file (no cancellation as of ${coi.asOf.slice(0, 10)}) assures coverage through ${day(30)} by statute; this load delivers ${day(35)}. For the gap only the mirrors vouched, and a verifier who requires the origin's word does not accept mirrors for it, colluding or not: the commitment is conditional on the insurer speaking again by pickup — and this venue recorded no such condition, so after pickup the verdict is that no renewal was ever presented` },
     );
 
-    // ---- Part 3: a principal who requires the origin's word through delivery. The stale COI is not enough; the fresh one tells the truth.
+    // ---- Part 3: a principal who requires the origin's word. The venue still hides the honest mirror; the liars still
+    //      say insured; the commitment forms — CONDITIONALLY, because the word on file falls short of delivery. The
+    //      condition forces the origin to speak again, and that is where the collusion dies.
     await h.venue.fault({ hideRegistries: [a!.registryId] });
     const broker2 = await h.startAgent(brokerSpec({ agentId: "blue-mesa-broker-agent", entity: { usdot: "1984411", mc: "MC-0711450", legalName: "BLUE MESA CARRIERS INC" }, proofOfControlToken: "poc-bluemesa-4e77", principalName: "Blue Mesa Carriers — Brokerage Desk", thinkMs: 60, limits: { ...brokerSpec().limits, requireInsurerAttestation: true } }));
-    const p3a = await negotiate(h, broker2, carrier, late("L-2026-297-0840", "Lumber, bundled", 39_400));
-    const r3a = await resultFromTask(h, p3a.task!);
-    const e3a = (r3a.evidence ?? {}) as Ev;
-    say(`part 3a: ${broker2.spec.agentId} (mandate: counterparty's insurer must vouch through delivery) tenders the late load → ${r3a.outcome} ${r3a.reasonCode} (${r3a.refusedBy}): assured through ${e3a.counterpartyInsuranceAssuredThrough?.slice(0, 10)} by ${e3a.assuredBy}, delivery ${day(35)}`);
-    if (r3a.reasonCode !== "MANDATE_INSURER_ATTESTATION_REQUIRED") throw new Error("part 3a: stale COI accepted");
+    const p3 = await negotiate(h, broker2, carrier, late("L-2026-297-0840", "Lumber, bundled", 39_400));
+    if (p3.task!.status !== "COMMITTED") throw new Error(`part 3: expected a conditional commitment, got ${p3.task!.status} ${p3.task!.outcome?.reasonCode}`);
+    const art3 = JSON.parse(readFileSync(join(broker2.dir, "commitments", `${p3.task!.commitmentId}.json`), "utf8")) as CommitmentArtifact;
+    say(`part 3a: ${broker2.spec.agentId} (mandate: the counterparty's insurer must vouch) tenders the late load; two liars vouch, the COI on file runs out ${art3.insurance?.carrier?.asOf.slice(0, 10)}+30 → COMMITTED ${art3.commitmentId.slice(0, 16)}… CONDITIONALLY: renewal signed ≥ ${art3.insurance?.renewal?.earliestSignedAt.slice(0, 10)}, on file by pickup ${art3.insurance?.renewal?.dueBy.slice(0, 10)}`);
+    if (!art3.insurance?.renewal) throw new Error("part 3a: no renewal condition recorded");
     const pr = await carrier.presentInsurance(fresh);
-    const p3b = await negotiate(h, broker2, carrier, late("L-2026-297-0855", "Canned goods, palletized", 42_800));
-    const r3b = await resultFromTask(h, p3b.task!);
-    const e3b = (r3b.evidence ?? {}) as Ev;
-    say(`part 3b: carrier presents a fresh COI (${pr.ok ? "accepted" : pr.reasonCode}) — the honest insurer discloses the cancellation → ${r3b.outcome} ${r3b.reasonCode} (${r3b.refusedBy}) on ${e3b.source}; mirrors ${e3b.dissentingRegistries?.map((d) => d.registryId).join(", ")} said otherwise and are convicted by the origin: ${e3b.falseAttestations?.map((f) => f.registryId).join(", ")}`);
-    if (r3b.reasonCode !== "INSURANCE_CANCELLATION_PENDING" || !e3b.source?.startsWith("insurer:") || e3b.falseAttestations?.length !== 2) throw new Error("part 3b: origin's word did not prevail");
+    await Promise.all([broker2.waitStatus(p3.task!.task.id, ["VOIDED"]), carrier.waitStatus(p3.task!.task.id, ["VOIDED"])]);
+    const rec3 = (await h.venue.commitments()).find((c) => c.commitmentId === art3.commitmentId)!;
+    say(`part 3b: the carrier presents a fresh COI (${pr.ok ? "accepted" : pr.reasonCode}) — the honest insurer discloses the cancellation (filed ${filed}, effective ${effective}) → ${rec3.status} ${rec3.voided?.reasonCode} on ${(rec3.voided?.evidence as { source?: string })?.source}; guarantee released; both told before dispatch`);
+    if (rec3.status !== "VOIDED" || rec3.voided?.reasonCode !== "INSURANCE_CANCELLATION_PENDING") throw new Error("part 3b: origin's word did not prevail");
     await h.venue.fault(null);
     findings.push(
-      { label: "part 3: the origin's word cannot be forged", reasonCode: "INSURANCE_CANCELLATION_PENDING", by: "venue.identity", detail: "a principal who requires the insurer's own signature through delivery is protected whatever the mirrors do: the word on file ran out before delivery, so the venue refused to negotiate; the renewed word disclosed the cancellation, so the venue refused the load — and named the two mirrors whose sync claims the insurer's filing date contradicts" },
-      { label: "what this leaves", detail: "the insurer's honesty about its own policy, which has nowhere further to go — an insurer that attests coverage it will not honour answers to its regulator and to estoppel, not to this protocol. And the statutory window: a load delivering more than 30 days out needs a fresher word than any COI can give today" },
+      { label: "part 3: the origin's word cannot be forged, and the window makes it speak again", reasonCode: "INSURANCE_CANCELLATION_PENDING", by: "venue.commitment", detail: "a principal who requires the insurer's own signature is protected whatever the mirrors do: the word on file fell short of delivery, so the commitment carried a renewal condition; the renewal is the insurer's, and it disclosed the cancellation — the commitment voided at once, guarantee released, before the truck moved" },
+      { label: "what this leaves", detail: "the insurer's honesty about its own policy, which has nowhere further to go — an insurer that attests coverage it will not honour answers to its regulator and to estoppel, not to this protocol" },
     );
 
     const audit = await h.venue.audit();
@@ -116,7 +119,7 @@ export const registryCollusion: Scenario = {
       taskId: p2.task!.task.id,
       commitmentId: art2.commitmentId,
       findings,
-      auditRefs: [...pickAudit(audit, "venue", (e) => e.event === "registry-false-attestation").slice(0, 2), ...pickAudit(audit, "venue", (e) => e.taskId === p1.task!.task.id && e.outcome === "REFUSED"), ...pickAudit(audit, "venue", (e) => e.taskId === p3a.task!.task.id && e.outcome === "REFUSED"), ...pickAudit(audit, "venue", (e) => e.taskId === p3b.task!.task.id && e.outcome === "REFUSED")],
+      auditRefs: [...pickAudit(audit, "venue", (e) => e.event === "registry-false-attestation").slice(0, 2), ...pickAudit(audit, "venue", (e) => e.taskId === p1.task!.task.id && e.outcome === "REFUSED"), ...pickAudit(audit, "venue", (e) => e.taskId === p3.task!.task.id && e.outcome === "VOIDED")],
     };
   },
 };

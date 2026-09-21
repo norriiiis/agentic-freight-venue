@@ -76,9 +76,13 @@ export function evaluateMandate(limits: MandateLimits, action: MandateAction, ex
     if (limits.requireInsurerAttestation) {
       checked.push("insurerAttestation");
       const assured = action.counterpartyInsuranceAssuredThrough ? new Date(action.counterpartyInsuranceAssuredThrough) : undefined;
-      const needed = action.deliveryWindowEnd ? new Date(action.deliveryWindowEnd) : undefined;
-      if (!assured || !needed || assured < needed) {
-        v.push({ code: "MANDATE_INSURER_ATTESTATION_REQUIRED", evidence: { counterpartyInsuranceAssuredThrough: action.counterpartyInsuranceAssuredThrough ?? null, deliveryWindowEnd: action.deliveryWindowEnd, note: assured ? "the insurer's own word assures coverage only through the earlier date; beyond it only registry mirrors vouch" : "no insurer attestation on file for the counterparty" } });
+      const delivery = action.deliveryWindowEnd ? new Date(action.deliveryWindowEnd) : undefined;
+      const pickup = action.pickupWindowStart ? new Date(action.pickupWindowStart) : delivery;
+      const notice = (action.counterpartyInsuranceNoticeDays ?? 30) * 86_400_000;
+      // Short of delivery is allowed as a CONDITION: a renewal signed at or after delivery − notice, on file by pickup.
+      const renewable = !!delivery && !!pickup && delivery.getTime() - notice <= pickup.getTime();
+      if (!assured || !delivery || (assured < delivery && !renewable)) {
+        v.push({ code: "MANDATE_INSURER_ATTESTATION_REQUIRED", evidence: { counterpartyInsuranceAssuredThrough: action.counterpartyInsuranceAssuredThrough ?? null, deliveryWindowEnd: action.deliveryWindowEnd, pickupWindowStart: action.pickupWindowStart, noticeDays: action.counterpartyInsuranceNoticeDays ?? 30, note: !assured ? "no insurer attestation on file for the counterparty" : "no word signed before pickup can assure coverage through delivery: transit outruns the insurer's notice period" } });
       }
     }
     if (exposure) {

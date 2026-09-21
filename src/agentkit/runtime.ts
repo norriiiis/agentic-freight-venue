@@ -228,8 +228,8 @@ export class AgentRuntime<Ctx extends { canary: string }> {
   }
 
   /** Present a renewed COI from the principal's insurer; kept on disk and on file with the venue. */
-  async presentInsurance(att: InsurerAttestation): Promise<{ ok: boolean; reasonCode?: string; evidence?: unknown }> {
-    const res = await rpcCall(`${this.config.venueUrl}/a2a`, "venue/present-insurance", { agentId: this.config.agentId, attestation: att });
+  async presentInsurance(att: InsurerAttestation): Promise<{ ok: boolean; reasonCode?: string; evidence?: unknown; satisfied?: string[]; voided?: string[] }> {
+    const res = await rpcCall<{ satisfied?: string[]; voided?: string[] }>(`${this.config.venueUrl}/a2a`, "venue/present-insurance", { agentId: this.config.agentId, attestation: att });
     if (res.error) {
       const d = res.error.data as { reasonCode?: string; evidence?: unknown } | undefined;
       this.audit.write({ component: this.comp.runtime, event: "present-insurance", outcome: "REFUSED", evidence: { reasonCode: d?.reasonCode, error: res.error.message } });
@@ -237,8 +237,8 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     }
     this.insurerAttestation = att;
     writeFileAtomic(join(this.config.dataDir, "insurance.json"), JSON.stringify(att, null, 2));
-    this.audit.write({ component: this.comp.runtime, event: "present-insurance", outcome: "ALLOWED", evidence: { insurerId: att.insurerId, policyNumber: att.policyNumber, asOf: att.asOf, cancellation: att.cancellation ?? null } });
-    return { ok: true };
+    this.audit.write({ component: this.comp.runtime, event: "present-insurance", outcome: "ALLOWED", evidence: { insurerId: att.insurerId, policyNumber: att.policyNumber, asOf: att.asOf, cancellation: att.cancellation ?? null, satisfied: res.result?.satisfied ?? [], voided: res.result?.voided ?? [] } });
+    return { ok: true, satisfied: res.result?.satisfied, voided: res.result?.voided };
   }
 
   // ---------------------------------------------------------------- key rotation
@@ -591,6 +591,15 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         }
         break;
       }
+      case "INSURANCE_RENEWED": {
+        // The counterparty's insurer spoke again; the condition our commitment carried is met. Keep the origin's word beside the artifact.
+        mkdirSync(join(this.config.dataDir, "commitments"), { recursive: true });
+        const p = join(this.config.dataDir, "commitments", `${data.commitmentId}.renewals.json`);
+        const have = existsSync(p) ? (JSON.parse(readFileSync(p, "utf8")) as unknown[]) : [];
+        writeFileAtomic(p, JSON.stringify([...have, data.attestation], null, 2));
+        this.audit.write({ component: this.comp.runtime, event: "insurance-renewed", outcome: "INFO", taskId, evidence: { commitmentId: data.commitmentId, assuredThrough: data.assuredThrough, ledgerSeq: data.ledgerSeq, insurerId: (data.attestation as { insurerId?: string }).insurerId } });
+        break;
+      }
       case "VOIDED": {
         if (!lt) return;
         lt.status = "VOIDED";
@@ -673,7 +682,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     const action: MandateAction = {
       kind: "ACCEPT", rateUsd: t.rateUsd, miles: t.load.miles, originState: t.load.origin.state, destinationState: t.load.destination.state, equipment: t.load.equipment, hazmat: t.load.hazmat,
       paymentTermsDays: t.paymentTermsDays, round: view.round, counterpartyUsdot: view.counterparty.entity.usdot, counterpartyInsuranceUsd: cpIns,
-      counterpartyInsuranceAssuredThrough: view.counterparty.insurance.assuredThrough, deliveryWindowEnd: t.delivery.windowEnd,
+      counterpartyInsuranceAssuredThrough: view.counterparty.insurance.assuredThrough, counterpartyInsuranceNoticeDays: view.counterparty.insurance.noticeDays, pickupWindowStart: t.pickup.windowStart, deliveryWindowEnd: t.delivery.windowEnd,
       // First acceptor cannot know yet; the venue enforces requireGuarantee at commitment. Countersigner sees the quote.
       guaranteeAvailable: view.guaranteeAvailable ?? true,
       day: t.pickup.windowStart.slice(0, 10),

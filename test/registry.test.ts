@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { generateKeyPair, signJws } from "../src/protocol/crypto";
-import { attestationFreshAt, contradictedBy, coverageAssuredThrough, filingsShownBy, insurerStanding, signAttestation, signInsurerAttestation, standing, verifyAttestation, verifyInsurerAttestation, type RegistryAttestation, type RegistryRecord } from "../src/protocol/registry";
+import { attestationFreshAt, contradictedBy, coverageAssuredThrough, filingsShownBy, insurerStanding, renewalWindow, satisfiesRenewal, signAttestation, signInsurerAttestation, standing, verifyAttestation, verifyInsurerAttestation, type RegistryAttestation, type RegistryRecord } from "../src/protocol/registry";
 import { buildArtifact, verifyArtifact } from "../src/ledger/artifact";
 import { signCert } from "../src/protocol/venue-keys";
 import { buildMessage, signMessage } from "../src/protocol/envelope";
@@ -17,7 +17,8 @@ const pub = (usdot: string): RegistryRecord => {
 };
 const CARRIER = "2751903";
 const BROKER = "3312874";
-const T = new Date("2026-09-20T12:00:00.000Z");
+const T = new Date(Date.now() - 60_000);
+const dayFromT = (d: number) => new Date(T.getTime() + d * 86_400_000).toISOString().slice(0, 10);
 const cancelled = (rec: RegistryRecord, on: string): RegistryRecord => ({ ...rec, insurance: rec.insurance.map((f) => (f.type === "BIPD" ? { ...f, cancellationDate: on } : f)) });
 
 describe("registry attestation", () => {
@@ -28,7 +29,7 @@ describe("registry attestation", () => {
     expect(verifyAttestation(a, generateKeyPair().publicJwk)).toBe(false);
     // Any edit — to the record, the clock, or the subject — breaks it.
     expect(verifyAttestation({ ...a, asOf: "2026-09-21T12:00:00.000Z" }, reg.publicJwk)).toBe(false);
-    expect(verifyAttestation({ ...a, record: cancelled(a.record!, "2026-09-01") }, reg.publicJwk)).toBe(false);
+    expect(verifyAttestation({ ...a, record: cancelled(a.record!, dayFromT(-20)) }, reg.publicJwk)).toBe(false);
     expect(verifyAttestation({ ...a, usdot: BROKER }, reg.publicJwk)).toBe(false);
     // A signed "not found" is a valid attestation too.
     const none = signAttestation(reg, "fmcsa-li-mock", "0000000", null, T);
@@ -51,13 +52,14 @@ describe("standing over a registry record", () => {
     const rec = pub(CARRIER);
     expect(standing(rec, T).ok).toBe(true);
     // Already effective: lapsed now.
-    expect(standing(cancelled(rec, "2026-09-18"), T)).toMatchObject({ ok: false, reasonCode: "INSURANCE_LAPSED" });
+    expect(standing(cancelled(rec, dayFromT(-2)), T)).toMatchObject({ ok: false, reasonCode: "INSURANCE_LAPSED" });
     // Filed for a date after the commitment but before delivery: the carrier would be uninsured in transit.
-    const pending = standing(cancelled(rec, "2026-09-24"), T, { through: new Date("2026-09-24T21:00:00.000Z") });
+    const through = new Date(`${dayFromT(4)}T21:00:00.000Z`);
+    const pending = standing(cancelled(rec, dayFromT(4)), T, { through });
     expect(pending).toMatchObject({ ok: false, reasonCode: "INSURANCE_CANCELLATION_PENDING" });
-    expect((pending.evidence.cancellingBeforeThrough as { cancellationDate: string }[])[0]!.cancellationDate).toBe("2026-09-24");
+    expect((pending.evidence.cancellingBeforeThrough as { cancellationDate: string }[])[0]!.cancellationDate).toBe(dayFromT(4));
     // Cancelling after delivery: fine for this load.
-    expect(standing(cancelled(rec, "2026-09-25"), T, { through: new Date("2026-09-24T21:00:00.000Z") }).ok).toBe(true);
+    expect(standing(cancelled(rec, dayFromT(5)), T, { through }).ok).toBe(true);
     expect(standing(null, T)).toMatchObject({ ok: false, reasonCode: "ONBOARDING_ENTITY_NOT_FOUND" });
   });
 });
@@ -74,7 +76,7 @@ function cred(venue: ReturnType<typeof generateKeyPair>, agent: ReturnType<typeo
   return { ...unsigned, issuerSignature: signJws(unsigned, venue, { typ: "agent-credential+jws" }, true) };
 }
 
-function makeArtifact(registry: ReturnType<typeof generateKeyPair>, atts: { broker: RegistryAttestation | RegistryAttestation[]; carrier: RegistryAttestation | RegistryAttestation[] }, policyMs = 60_000, opts: { registries?: { registryId: string; publicKey: import("../src/protocol/crypto").OkpJwk }[]; quorum?: number } = {}) {
+function makeArtifact(registry: ReturnType<typeof generateKeyPair>, atts: { broker: RegistryAttestation | RegistryAttestation[]; carrier: RegistryAttestation | RegistryAttestation[] }, policyMs = 60_000, opts: { registries?: { registryId: string; publicKey: import("../src/protocol/crypto").OkpJwk }[]; quorum?: number; load?: typeof LOAD; insurance?: import("../src/ledger/artifact").CommitmentArtifact["insurance"] } = {}) {
   const root = generateKeyPair();
   const venue = generateKeyPair();
   const cert = signCert(root, venue.publicJwk, 0, "INITIAL", new Date(T.getTime() - 2 * 86_400_000));
@@ -82,11 +84,12 @@ function makeArtifact(registry: ReturnType<typeof generateKeyPair>, atts: { brok
   const c = generateKeyPair();
   const bc = cred(venue, b, "broker-1", BROKER, "MC-1088412", "BROKER");
   const cc = cred(venue, c, "carrier-1", CARRIER, "MC-0938251", "CARRIER");
-  const terms: Terms = { loadRef: LOAD.loadRef, load: LOAD, rateUsd: 2215, pickup: { windowStart: LOAD.origin.windowStart, windowEnd: LOAD.origin.windowEnd }, delivery: { windowStart: LOAD.destination.windowStart, windowEnd: LOAD.destination.windowEnd }, paymentTermsDays: 30, brokerAgentId: "broker-1", carrierAgentId: "carrier-1", brokerEntity: { usdot: BROKER, mc: "MC-1088412" }, carrierEntity: { usdot: CARRIER, mc: "MC-0938251" } };
+  const load = opts.load ?? LOAD;
+  const terms: Terms = { loadRef: load.loadRef, load, rateUsd: 2215, pickup: { windowStart: load.origin.windowStart, windowEnd: load.origin.windowEnd }, delivery: { windowStart: load.destination.windowStart, windowEnd: load.destination.windowEnd }, paymentTermsDays: 30, brokerAgentId: "broker-1", carrierAgentId: "carrier-1", brokerEntity: { usdot: BROKER, mc: "MC-1088412" }, carrierEntity: { usdot: CARRIER, mc: "MC-0938251" } };
   const accept = (kp: ReturnType<typeof generateKeyPair>, agentId: string, credentialId: string) =>
     signMessage(buildMessage({ role: "user", data: { type: "ACCEPT", loadRef: terms.loadRef, round: 3, terms, termsHash: termsHash(terms), from: { agentId, usdot: "x" } }, taskId: "t", contextId: "c", senderAgentId: agentId, credentialId }), kp);
   const a = buildArtifact(
-    { venue: { venueId: "v", rootPublicKey: root.publicJwk, certs: [cert] }, terms, termsHash: termsHash(terms), acceptances: { broker: accept(b, "broker-1", bc.credentialId), carrier: accept(c, "carrier-1", cc.credentialId) }, credentials: { broker: bc, carrier: cc }, registry: { registries: opts.registries ?? [{ registryId: "fmcsa-li-mock", publicKey: registry.publicJwk }], attestations: { broker: [atts.broker].flat(), carrier: [atts.carrier].flat() }, policy: { maxAgeMs: policyMs, quorum: opts.quorum ?? 1 } }, underwriting: { decision: "GUARANTEED", riskScore: 0.01, guarantee: { guaranteeId: "g", coveredAmountUsd: 2215, premiumUsd: 40, scope: [], exclusions: [], conditions: [] } }, ledger: { seq: 1, prevHash: "0".repeat(64) } },
+    { venue: { venueId: "v", rootPublicKey: root.publicJwk, certs: [cert] }, terms, termsHash: termsHash(terms), acceptances: { broker: accept(b, "broker-1", bc.credentialId), carrier: accept(c, "carrier-1", cc.credentialId) }, credentials: { broker: bc, carrier: cc }, registry: { registries: opts.registries ?? [{ registryId: "fmcsa-li-mock", publicKey: registry.publicJwk }], attestations: { broker: [atts.broker].flat(), carrier: [atts.carrier].flat() }, policy: { maxAgeMs: policyMs, quorum: opts.quorum ?? 1 } }, insurance: opts.insurance, underwriting: { decision: "GUARANTEED", riskScore: 0.01, guarantee: { guaranteeId: "g", coveredAmountUsd: 2215, premiumUsd: 40, scope: [], exclusions: [], conditions: [] } }, ledger: { seq: 1, prevHash: "0".repeat(64) } },
     venue,
   );
   // buildArtifact stamps createdAt with the wall clock; the attestations are relative to it.
@@ -113,7 +116,7 @@ describe("artifact carries the registry's word", () => {
   });
 
   it("REGISTRY_CONTRADICTS_COMMITMENT: the venue's own embedded word shows the lapse", () => {
-    const { artifact, root, registryKey } = makeArtifact(reg, { broker: fresh(BROKER), carrier: fresh(CARRIER, cancelled(pub(CARRIER), "2026-09-18")) });
+    const { artifact, root, registryKey } = makeArtifact(reg, { broker: fresh(BROKER), carrier: fresh(CARRIER, cancelled(pub(CARRIER), dayFromT(-2))) });
     const v = verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: [registryKey] });
     expect(v).toMatchObject({ ok: false, reasonCode: "REGISTRY_CONTRADICTS_COMMITMENT" });
     expect(v.checks.find((c) => c.name === "carrier.registry.standing-at-commitment")?.detail).toContain("INSURANCE_LAPSED");
@@ -122,11 +125,11 @@ describe("artifact carries the registry's word", () => {
   it("REGISTRY_CONTRADICTS_COMMITMENT: the registry's word fetched later settles it without the venue", () => {
     // The venue embedded pre-cancellation word (fresh enough, so no STALE); today's record shows the filing was already cancelled then.
     const { artifact, root, registryKey } = makeArtifact(reg, { broker: fresh(BROKER), carrier: fresh(CARRIER) });
-    const today = signAttestation(reg, "fmcsa-li-mock", CARRIER, cancelled(pub(CARRIER), "2026-09-18"), new Date(Date.now() + 3_600_000));
+    const today = signAttestation(reg, "fmcsa-li-mock", CARRIER, cancelled(pub(CARRIER), dayFromT(-2)), new Date(Date.now() + 3_600_000));
     const v = verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: [registryKey], currentAttestations: [today] });
     expect(v).toMatchObject({ ok: false, reasonCode: "REGISTRY_CONTRADICTS_COMMITMENT" });
     // A pending-at-the-time cancellation before delivery counts too.
-    const pending = signAttestation(reg, "fmcsa-li-mock", CARRIER, cancelled(pub(CARRIER), "2026-09-24"), new Date(Date.now() + 3_600_000));
+    const pending = signAttestation(reg, "fmcsa-li-mock", CARRIER, cancelled(pub(CARRIER), LOAD.destination.windowEnd.slice(0, 10)), new Date(Date.now() + 3_600_000));
     const v2 = verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: [registryKey], currentAttestations: [pending] });
     expect(v2.checks.find((c) => c.name === "carrier.registry.standing-per-current-record")?.detail).toContain("INSURANCE_CANCELLATION_PENDING");
   });
@@ -173,7 +176,7 @@ describe("artifact carries the registry's word", () => {
     });
 
     it("unanimity: one registry's word of a lapse blocks, however many say otherwise", () => {
-      const lapsed = cancelled(pub(CARRIER), "2026-09-18");
+      const lapsed = cancelled(pub(CARRIER), dayFromT(-2));
       const { artifact, root } = build(three(CARRIER, [pub(CARRIER), pub(CARRIER), lapsed]));
       const v = verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: keys });
       expect(v).toMatchObject({ ok: false, reasonCode: "REGISTRY_CONTRADICTS_COMMITMENT" });
@@ -213,7 +216,7 @@ describe("artifact carries the registry's word", () => {
 
     it("current word from several registries: any lapse blocks, and the split is named", () => {
       const { artifact, root } = build(three(CARRIER));
-      const today = [word(A, "mirror-a", CARRIER, cancelled(pub(CARRIER), "2026-09-18"), -3_600_000), word(B, "mirror-b", CARRIER, pub(CARRIER), -3_600_000)];
+      const today = [word(A, "mirror-a", CARRIER, cancelled(pub(CARRIER), dayFromT(-2)), -3_600_000), word(B, "mirror-b", CARRIER, pub(CARRIER), -3_600_000)];
       const v = verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: keys, currentAttestations: today });
       expect(v).toMatchObject({ ok: false, reasonCode: "REGISTRY_CONTRADICTS_COMMITMENT" });
       expect(v.checks.find((c) => c.name === "carrier.registry.standing-per-current-record")?.detail).toMatch(/mirror-a.*INSURANCE_LAPSED.*mirror-b say otherwise/);
@@ -294,10 +297,12 @@ describe("artifact carries the registry's word", () => {
       const v = verifyArtifact(withCoi, { pinnedRootKey: without.root, registryKeys: keys, insurerKeys: [insurerKey], requireInsurerAttestation: true });
       expect(v.checks.find((c) => c.name === "carrier.insurer.assured-through-delivery")?.ok).toBe(true);
       expect(v.checks.find((c) => c.name === "carrier.insurer[gpm].signed")?.ok).toBe(true);
-      // A COI signed 40 days before commitment assures only through 10 days before it: not through delivery.
+      // A COI signed 40 days before commitment assures only through 10 days before it: not through delivery — so the
+      // commitment is CONDITIONAL on a renewal by pickup (see the statutory-window test below).
       const old = signInsurerAttestation(ins, "gpm", policy, new Date(now.getTime() - 40 * 86_400_000));
-      const vOld = verifyArtifact({ ...without.artifact, insurance: { carrier: old } }, { pinnedRootKey: without.root, registryKeys: keys, insurerKeys: [insurerKey], requireInsurerAttestation: true });
-      expect(vOld.checks.find((c) => c.name === "carrier.insurer.assured-through-delivery")?.ok).toBe(false);
+      const vOld = verifyArtifact({ ...without.artifact, insurance: { carrier: old } }, { pinnedRootKey: without.root, registryKeys: keys, insurerKeys: [insurerKey], requireInsurerAttestation: true, asOf: new Date(`${LOAD.origin.windowStart.slice(0, 10)}T00:00:00.000Z`) });
+      expect(vOld.checks.find((c) => c.name === "carrier.insurer.assured-through-delivery")).toBeUndefined();
+      expect(vOld.checks.find((c) => c.name === "carrier.insurer.renewal-due")?.ok).toBe(false);
       // A COI disclosing a cancellation before delivery contradicts the commitment.
       const disclosed = signInsurerAttestation(ins, "gpm", { ...policy, cancellation: { filedDate: dayOff(-31), effectiveDate: dayOff(-1) } }, now);
       const vBad = verifyArtifact({ ...without.artifact, insurance: { carrier: disclosed } }, { pinnedRootKey: without.root, registryKeys: keys, insurerKeys: [insurerKey] });
@@ -306,6 +311,71 @@ describe("artifact carries the registry's word", () => {
       const forged = signInsurerAttestation(generateKeyPair(), "gpm", policy, now);
       const vForged = verifyArtifact({ ...without.artifact, insurance: { carrier: forged } }, { pinnedRootKey: without.root, registryKeys: keys, insurerKeys: [insurerKey] });
       expect(vForged.checks.find((c) => c.name === "carrier.insurer[gpm].signed")?.ok).toBe(false);
+    });
+  });
+
+  describe("the statutory window: conditional commitments and renewal", () => {
+    const A = generateKeyPair();
+    const keys = [{ registryId: "mirror-a", publicKey: A.publicJwk }];
+    const ins = generateKeyPair();
+    const insurerKey = { witnessId: "gpm", publicKey: ins.publicJwk };
+    const now = new Date();
+    const at = (d: number, hhmm = "13:00") => `${new Date(now.getTime() + d * 86_400_000).toISOString().slice(0, 10)}T${hhmm}:00.000Z`;
+    const policy = { usdot: CARRIER, policyNumber: "TRK-0092817-24", type: "BIPD" as const, form: "BMC-91X" as const, coverageToUsd: 1_000_000, effectiveDate: "2025-07-01" };
+    // A load picking up in 33 days and delivering in 35: beyond what a word signed today can assure (30).
+    const lateLoad = { ...LOAD, origin: { ...LOAD.origin, windowStart: at(33), windowEnd: at(33, "19:00") }, destination: { ...LOAD.destination, windowStart: at(35), windowEnd: at(35, "21:00") } };
+    const build = (coi: ReturnType<typeof signInsurerAttestation>, renewal?: { earliestSignedAt: string; dueBy: string; requiredBy: string }, load = lateLoad) =>
+      makeArtifact(A, { broker: signAttestation(A, "mirror-a", BROKER, pub(BROKER)), carrier: signAttestation(A, "mirror-a", CARRIER, pub(CARRIER), now, now) }, 60_000, { registries: keys, quorum: 1, load, insurance: { carrier: coi, renewal } });
+    const verify = (art: ReturnType<typeof build>["artifact"], root: import("../src/protocol/crypto").OkpJwk, extra: Parameters<typeof verifyArtifact>[1] = {}) => verifyArtifact(art, { pinnedRootKey: root, registryKeys: keys, insurerKeys: [insurerKey], requireInsurerAttestation: true, ...extra });
+    const named = (v: ReturnType<typeof verifyArtifact>, n: string) => v.checks.find((c) => c.name === `carrier.insurer.${n}`);
+
+    it("renewal arithmetic: a word signed at S reaches delivery D only if S ≥ D − notice, and must be on file by pickup", () => {
+      const coi = signInsurerAttestation(ins, "gpm", policy, now);
+      const w = renewalWindow(coi, new Date(lateLoad.origin.windowStart), new Date(lateLoad.destination.windowEnd));
+      expect(w.reachesDelivery).toBe(false);
+      expect(w.earliestSignedAt.slice(0, 10)).toBe(at(5).slice(0, 10));
+      expect(w.dueBy).toBe(lateLoad.origin.windowStart);
+      expect(w.possible).toBe(true);
+      // Transit longer than the notice period: no word signed before pickup can help.
+      const w2 = renewalWindow(coi, new Date(at(3)), new Date(at(40)));
+      expect(w2.possible).toBe(false);
+      const early = signInsurerAttestation(ins, "gpm", policy, new Date(now.getTime() + 2 * 86_400_000));
+      const inWindow = signInsurerAttestation(ins, "gpm", policy, new Date(now.getTime() + 6 * 86_400_000));
+      expect(satisfiesRenewal(early, w, new Date(lateLoad.destination.windowEnd))).toBe(false);
+      expect(satisfiesRenewal(inWindow, w, new Date(lateLoad.destination.windowEnd))).toBe(true);
+    });
+
+    it("before pickup: PENDING; after pickup without a renewal: NOT_PRESENTED; with one: assured; disclosing a cancellation: contradicts", () => {
+      const coi = signInsurerAttestation(ins, "gpm", policy, now);
+      const cond = { earliestSignedAt: at(5), dueBy: lateLoad.origin.windowStart, requiredBy: "broker-1" };
+      const { artifact, root } = build(coi, cond);
+      const pending = verify(artifact, root, { asOf: new Date(at(10)) });
+      expect(named(pending, "renewal-due")?.ok).toBe(false);
+      expect(pending.reasonCode).toBe("INSURANCE_RENEWAL_PENDING");
+      const late = verify(artifact, root, { asOf: new Date(at(34)) });
+      expect(late.reasonCode).toBe("INSURANCE_RENEWAL_NOT_PRESENTED");
+      const renewal = signInsurerAttestation(ins, "gpm", policy, new Date(now.getTime() + 6 * 86_400_000));
+      const renewed = verify(artifact, root, { asOf: new Date(at(34)), renewals: [renewal] });
+      expect(named(renewed, "assured-through-delivery")?.ok, JSON.stringify(renewed.checks.filter((c) => !c.ok))).toBe(true);
+      expect(renewed.checks.filter((c) => c.name.startsWith("carrier.insurer") && !c.ok)).toEqual([]);
+      // Too early to reach delivery: still pending.
+      const tooEarly = signInsurerAttestation(ins, "gpm", policy, new Date(now.getTime() + 2 * 86_400_000));
+      expect(verify(artifact, root, { asOf: new Date(at(10)), renewals: [tooEarly] }).reasonCode).toBe("INSURANCE_RENEWAL_PENDING");
+      // The renewal is where the insurer gets to say no.
+      const disclosing = signInsurerAttestation(ins, "gpm", { ...policy, cancellation: { filedDate: at(5).slice(0, 10), effectiveDate: at(34).slice(0, 10) } }, new Date(now.getTime() + 6 * 86_400_000));
+      expect(verify(artifact, root, { asOf: new Date(at(10)), renewals: [disclosing] }).reasonCode).toBe("INSURER_CONTRADICTS_COMMITMENT");
+      // A renewal recorded on the ledger counts the same as one supplied.
+      const entry = { seq: 9, prevHash: "", hash: "", ts: at(7), type: "INSURANCE_RENEWAL" as const, payload: { commitmentId: artifact.commitmentId, attestation: renewal }, kid: "", signature: "" };
+      expect(named(verify(artifact, root, { asOf: new Date(at(34)), ledger: [entry as never] }), "assured-through-delivery")?.ok).toBe(true);
+      // A verifier that does not require the origin's word sees the venue's own condition and reports it.
+      const unrequired = verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: keys, insurerKeys: [insurerKey], asOf: new Date(at(10)) });
+      expect(unrequired.reasonCode).toBe("INSURANCE_RENEWAL_PENDING");
+    });
+
+    it("no renewal can help when transit outruns the notice period", () => {
+      const coi = signInsurerAttestation(ins, "gpm", policy, now);
+      const { artifact, root } = build(coi, undefined, { ...LOAD, origin: { ...LOAD.origin, windowStart: at(3), windowEnd: at(3, "19:00") }, destination: { ...LOAD.destination, windowStart: at(40), windowEnd: at(40, "21:00") } });
+      expect(verify(artifact, root).reasonCode).toBe("INSURANCE_NOT_ASSURED_THROUGH_DELIVERY");
     });
   });
 });

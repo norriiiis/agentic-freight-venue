@@ -24,7 +24,11 @@ export interface MandateLimits {
   maxDailyExposureUsd: number;
   /** If true, the agent may only commit when a venue guarantee attaches. */
   requireGuarantee: boolean;
-  /** If true, the counterparty's own insurer must have attested coverage assured through the delivery window (no set of registry mirrors can forge that). */
+  /**
+   * If true, the counterparty's own insurer must have attested coverage (no set of registry mirrors can forge that).
+   * A word that falls short of delivery is allowed only if a renewal signed within the statutory window can still be
+   * presented by pickup; the venue then binds the commitment to that renewal and voids it at pickup if none arrives.
+   */
   requireInsurerAttestation?: boolean;
   /** May this agent tender loads to others (i.e. act as a broker)? Carriers: false. */
   mayTender: boolean;
@@ -74,6 +78,9 @@ export type MandateAction =
       counterpartyInsuranceUsd: number;
       /** Through when the counterparty's own insurer has assured coverage (its signed word), if on file. */
       counterpartyInsuranceAssuredThrough?: string;
+      /** The insurer's statutory notice period (default 30 days): a renewal signed at or after delivery − notice can reach delivery. */
+      counterpartyInsuranceNoticeDays?: number;
+      pickupWindowStart?: string;
       deliveryWindowEnd?: string;
       guaranteeAvailable: boolean;
       day: string; // YYYY-MM-DD for the daily exposure bucket

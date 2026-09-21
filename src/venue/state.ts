@@ -78,6 +78,8 @@ export interface CommitmentRecord {
   guaranteeId?: string;
   artifact: CommitmentArtifact;
   voided?: { at: string; reasonCode: ReasonCode; evidence: Record<string, unknown> };
+  /** A conditional commitment: the carrier's insurer must re-attest coverage through delivery, signed within the window, by pickup. */
+  renewal?: { earliestSignedAt: string; dueBy: string; satisfied?: { attestation: InsurerAttestation; assuredThrough: string; ledgerSeq: number; at: string } };
 }
 
 /** A notice the venue owes an agent. Persisted until delivered (at-least-once); agents dedupe by messageId. */
@@ -109,7 +111,7 @@ export interface VoidJournal {
   reasonCode: ReasonCode;
   evidence: Record<string, unknown>;
   /** What triggered the void (audit event name). */
-  origin?: "pre-pickup-check" | "compromise-void";
+  origin?: "pre-pickup-check" | "compromise-void" | "renewal-check";
 }
 export interface KeyRotationJournal {
   kind: "KEY_ROTATION";

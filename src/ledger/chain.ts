@@ -23,6 +23,7 @@ export type LedgerEntryType =
   | "GENESIS"        // carries the root establishment event and the first operational key certificate
   | "ROOT_ROTATION"  // carries a root event (pre-rotation): the new root's authority is the previous root's commitment
   | "COMMITMENT"
+  | "INSURANCE_RENEWAL" // a conditional commitment's insurer-renewal condition satisfied: carries the insurer's signed word
   | "VOID"
   | "KEY_ROTATION"   // carries the successor's root-signed certificate (+ revocation of the predecessor); signed by the SUCCESSOR
   | "RESEAL"         // after a compromise: the new key affirms a range of earlier entries as genuine
