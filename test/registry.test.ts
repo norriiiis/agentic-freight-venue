@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { generateKeyPair, signJws } from "../src/protocol/crypto";
-import { attestationFreshAt, contradictedBy, coverageAssuredThrough, filingsShownBy, insurerContradictedBy, insurerOfRecord, insurerStanding, renewalWindow, satisfiesRenewal, signAttestation, signInsurerAttestation, standing, verifyAttestation, verifyInsurerAttestation, type RegistryAttestation, type RegistryRecord } from "../src/protocol/registry";
+import { attestationFreshAt, contradictedBy, coverageAssuredThrough, filerContradictedBy, filerKeyAt, filerKeyOfRecord, filingsShownBy, insurerContradictedBy, insurerOfRecord, insurerStanding, keyEventsShownBy, renewalWindow, satisfiesRenewal, signAttestation, signFilerAttestation, signInsurerAttestation, standing, verifyAttestation, verifyFilerAttestation, verifyInsurerAttestation, type InsurerRegistration, type RegistryAttestation, type RegistryRecord } from "../src/protocol/registry";
 import { buildArtifact, verifyArtifact } from "../src/ledger/artifact";
 import { signCert } from "../src/protocol/venue-keys";
 import { buildMessage, signMessage } from "../src/protocol/envelope";
@@ -432,6 +432,71 @@ describe("artifact carries the registry's word", () => {
       expect(verifyArtifact(a1.artifact, { pinnedRootKey: a1.root, registryKeys: keys, insurerKeys: [gpmKey], requireInsurerUndertaking: true })).toMatchObject({ ok: false, reasonCode: "INSURER_UNDERTAKING_MISSING" });
       expect(verifyArtifact(a1.artifact, { pinnedRootKey: a1.root, registryKeys: keys, insurerKeys: [gpmKey], requireInsurerAttestation: true }).ok).toBe(true);
       expect(verifyArtifact(a2.artifact, { pinnedRootKey: a2.root, registryKeys: keys, insurerKeys: [gpmKey], requireInsurerUndertaking: true }).ok).toBe(true);
+    });
+  });
+
+  describe("whose key is the insurer's: the registries' filer directory", () => {
+    const A = generateKeyPair(), B = generateKeyPair();
+    const keys = [{ registryId: "mirror-a", publicKey: A.publicJwk }, { registryId: "mirror-b", publicKey: B.publicJwk }];
+    const k1 = generateKeyPair(), k2 = generateKeyPair(), impostor = generateKeyPair();
+    const now = new Date();
+    const t = (ms: number) => new Date(now.getTime() + ms);
+    const reg = (keysOf: InsurerRegistration["keys"]): InsurerRegistration => ({ insurerId: "gpm", legalName: "Great Plains Mutual Insurance Co", keys: keysOf, registeredAt: t(-86_400_000).toISOString() });
+    const K1 = { kid: k1.kid, publicKey: k1.publicJwk, validFrom: t(-86_400_000).toISOString() };
+    const K1revoked = { ...K1, revokedAt: t(-3_600_000).toISOString(), reason: "ROTATION" as const };
+    const K2 = { kid: k2.kid, publicKey: k2.publicJwk, validFrom: t(-3_600_000).toISOString() };
+    const policy = { usdot: CARRIER, policyNumber: "TRK-0092817-24", type: "BIPD" as const, form: "BMC-91X" as const, coverageToUsd: 1_000_000, effectiveDate: "2025-07-01" };
+    const word = (kp: ReturnType<typeof generateKeyPair>, id: string, r: InsurerRegistration | null, at = now) => signFilerAttestation(kp, id, "gpm", r, at, at);
+
+    it("filer attestations sign the registration, and a key is the filer's only within its validity", () => {
+      const fa = word(A, "mirror-a", reg([K1revoked, K2]));
+      expect(verifyFilerAttestation(fa, A.publicJwk)).toBe(true);
+      expect(verifyFilerAttestation(fa, B.publicJwk)).toBe(false);
+      expect(filerKeyAt(fa.registration, k1.kid, t(-7_200_000))?.kid).toBe(k1.kid);   // before revocation
+      expect(filerKeyAt(fa.registration, k1.kid, now)).toBeUndefined();                // after
+      expect(filerKeyAt(fa.registration, k2.kid, now)?.kid).toBe(k2.kid);
+      expect(filerKeyAt(fa.registration, k2.kid, t(-7_200_000))).toBeUndefined();      // not yet valid
+      expect(filerKeyAt(fa.registration, impostor.kid, now)).toBeUndefined();
+    });
+
+    it("unanimity on the key: a mirror still showing a revoked key blocks, and is convicted if it claims a later sync", () => {
+      const honest = word(A, "mirror-a", reg([K1revoked, K2]));
+      const stale = word(B, "mirror-b", reg([K1, K2]));           // claims sync now, shows K1 unrevoked
+      const r = filerKeyOfRecord([honest, stale], k1.kid, now);
+      expect(r.ok).toBe(false);
+      expect(r.showing).toEqual(["mirror-b"]);
+      expect(r.why).toContain("revoked");
+      expect(filerKeyOfRecord([honest, stale], k2.kid, now).ok).toBe(true);
+      expect(filerContradictedBy(stale, keyEventsShownBy(honest))).toMatchObject({ registryId: "mirror-b", missing: { kid: k1.kid } });
+      expect(filerContradictedBy(honest, keyEventsShownBy(honest))).toBeUndefined();
+      // An honestly stale mirror (sync claim before the revocation) is not contradicted.
+      const honestlyStale = word(B, "mirror-b", reg([K1, K2]), t(-7_200_000));
+      expect(filerContradictedBy(honestlyStale, keyEventsShownBy(honest))).toBeUndefined();
+    });
+
+    it("the verifier derives the insurer's key from the registries' word in the artifact — no insurer key pinned", () => {
+      const coi = signInsurerAttestation(k1, "gpm", policy, t(-7_200_000), "Great Plains Mutual Insurance Co");
+      const filers = [word(A, "mirror-a", reg([K1]), t(-7_200_000)), word(B, "mirror-b", reg([K1]), t(-7_200_000))];
+      const m = makeArtifact(A, { broker: [signAttestation(A, "mirror-a", BROKER, pub(BROKER)), signAttestation(B, "mirror-b", BROKER, pub(BROKER))], carrier: [signAttestation(A, "mirror-a", CARRIER, pub(CARRIER), now, now), signAttestation(B, "mirror-b", CARRIER, pub(CARRIER), now, now)] }, 3 * 3_600_000, { registries: keys, quorum: 2, insurance: { carrier: coi, filers: { carrier: filers } } });
+      const v = verifyArtifact(m.artifact, { pinnedRootKey: m.root, registryKeys: keys, requireInsurerAttestation: true });
+      expect(v.ok, JSON.stringify(v.checks.filter((c) => !c.ok))).toBe(true);
+      // The impostor's COI: a key no registry lists for the filer, whatever any venue configured.
+      const forged = signInsurerAttestation(impostor, "gpm", policy, t(-7_200_000), "Great Plains Mutual Insurance Co");
+      const bad = { ...m.artifact, insurance: { carrier: forged, filers: { carrier: filers } } };
+      expect(verifyArtifact(bad, { pinnedRootKey: m.root, registryKeys: keys, requireInsurerAttestation: true })).toMatchObject({ ok: false, reasonCode: "INSURER_KEY_NOT_OF_RECORD" });
+      // Pinned out of band and disagreeing with the registries: a conflict, not a substitute.
+      const conflict = verifyArtifact(m.artifact, { pinnedRootKey: m.root, registryKeys: keys, requireInsurerAttestation: true, insurerKeys: [{ insurerId: "gpm", publicKey: impostor.publicJwk }] });
+      expect(conflict.reasonCode).toBe("INSURER_KEY_NOT_OF_RECORD");
+      // Too few registries vouch for the filer: the artifact does not establish whose key signed.
+      const thin = { ...m.artifact, insurance: { carrier: coi, filers: { carrier: [filers[0]!] } } };
+      expect(verifyArtifact(thin, { pinnedRootKey: m.root, registryKeys: keys, requireInsurerAttestation: true }).reasonCode).toBe("INSURER_KEY_NOT_OF_RECORD");
+      expect(verifyArtifact(thin, { pinnedRootKey: m.root, registryKeys: keys, requireInsurerAttestation: true, minRegistries: 1 }).checks.find((c) => c.name === "carrier.insurer[gpm].key-of-record")?.ok).toBe(true);
+      // The registries' word TODAY: a compromise declared as of before the signature voids it; a rotation after it does not.
+      const rotated = [word(A, "mirror-a", reg([K1revoked, K2])), word(B, "mirror-b", reg([K1revoked, K2]))];
+      expect(verifyArtifact(m.artifact, { pinnedRootKey: m.root, registryKeys: keys, requireInsurerAttestation: true, currentFilerAttestations: rotated }).ok).toBe(true);
+      const comp = { ...K1, revokedAt: t(-10_800_000).toISOString(), declaredAt: now.toISOString(), reason: "COMPROMISE" as const };
+      const compromised = [word(A, "mirror-a", reg([comp, K2])), word(B, "mirror-b", reg([comp, K2]))];
+      expect(verifyArtifact(m.artifact, { pinnedRootKey: m.root, registryKeys: keys, requireInsurerAttestation: true, currentFilerAttestations: compromised }).reasonCode).toBe("INSURER_KEY_NOT_OF_RECORD");
     });
   });
 });

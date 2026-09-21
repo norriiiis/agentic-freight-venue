@@ -27,7 +27,7 @@ import { AuditLog, type Component } from "../protocol/audit";
 import { rpcCall, RpcRefusal } from "../protocol/rpc";
 import type { Credential, MandateEnvelope, RotationAuthorization, RotationClaims } from "../protocol/types";
 import { RegistryMirror, RegistryUnavailable, type RegistrySource } from "../identity/registry-mirror";
-import { coverageAssuredThrough, filingsShownBy, hasBrokerAuthority, insuranceStatus, insurerContradictedBy, insurerOfRecord, insurerStanding, renewalWindow, satisfiesRenewal, verifyInsurerAttestation, type InsurerAttestation, type RegistryAttestation } from "../protocol/registry";
+import { coverageAssuredThrough, filerContradictedBy, filerKeyOfRecord, filingsShownBy, hasBrokerAuthority, insuranceStatus, insurerContradictedBy, insurerOfRecord, insurerStanding, keyEventsShownBy, renewalWindow, satisfiesRenewal, verifyInsurerAttestation, type FilerAttestation, type InsurerAttestation, type RegistryAttestation } from "../protocol/registry";
 import { StubVettingProvider } from "../identity/vetting";
 import { CredentialIssuer } from "../identity/issuer";
 import { liveCheck, signatureTrustedAt, verifyCredential, verifyPresentation, type LiveCheckResult } from "../identity/verifier";
@@ -141,8 +141,12 @@ export class VenueService {
    */
   private live(cred: Credential, opts: Parameters<typeof liveCheck>[2] = {}): LiveCheckResult {
     const insurer = this.state.agents.get(cred.subject.agentId)?.insurerAttestation;
-    const insurerName = insurer ? this.state.noticeSources.find((x) => x.sourceId === insurer.insurerId)?.insurerName : undefined;
-    const r = liveCheck(this.registry, cred, { ...opts, insurer, insurerName });
+    // The name the insurer files under, and its key, per the registries' filer directory (mirrored at presentation).
+    const filer = insurer ? this.registry.filerAttestations(insurer.insurerId) : [];
+    const keyOfRecord = insurer ? filerKeyOfRecord(filer, insurer.kid, new Date(insurer.asOf)) : undefined;
+    const insurerName = keyOfRecord?.legalName ?? insurer?.insurerName;
+    const r = liveCheck(this.registry, cred, { ...opts, insurer: keyOfRecord && !keyOfRecord.ok ? undefined : insurer, insurerName });
+    if (insurer && keyOfRecord && !keyOfRecord.ok) r.evidence.insurerKeyNotOfRecord = keyOfRecord.why;
     if (r.insurerFalse) this.audit.writeOnce(`insurer-false-attestation:${r.insurerFalse.insurerId}:${r.insurerFalse.usdot}:${r.insurerFalse.signedAt}`, { component: "venue.identity", event: "insurer-false-attestation", outcome: "INFO", reasonCode: "INSURER_FALSE_ATTESTATION", subject: r.insurerFalse.insurerId, evidence: { usdot: r.insurerFalse.usdot, signedAt: r.insurerFalse.signedAt, missing: r.insurerFalse.missing, kid: r.insurerFalse.attestation.kid } });
     if (r.falseAttestations?.length) {
       for (const f of r.falseAttestations) this.audit.writeOnce(`false-attestation:${f.registryId}:${f.usdot}:${f.claimedSyncAt}`, { component: "venue.identity", event: "registry-false-attestation", outcome: "INFO", reasonCode: "REGISTRY_FALSE_ATTESTATION", subject: f.registryId, evidence: { usdot: f.usdot, claimedSyncAt: f.claimedSyncAt, missing: f.missing, kid: f.attestation.kid } });
@@ -258,6 +262,13 @@ export class VenueService {
   private noticeSourceKeys(n: StatusNotice): OkpJwk[] {
     const registered = this.state.noticeSources.find((x) => x.sourceId === n.sourceId);
     if (registered) return [registered.publicKey];
+    // A registered filer (an insurer) may notify under any key the registries list for it as valid now.
+    const filer = this.registry.filerAttestations(n.sourceId);
+    if (filer.length) {
+      const now = new Date();
+      const kids = new Set(filer.flatMap((f) => f.registration?.keys.map((k) => k.kid) ?? []));
+      return [...kids].map((kid) => filerKeyOfRecord(filer, kid, now)).filter((k) => k.ok).map((k) => k.key!.publicKey);
+    }
     // A principal may notify about its own agent: its key is the one registered in the agent's mandate envelope.
     const agentId = n.subject.agentId ?? (n.subject.credentialId ? this.state.agentByCredential(n.subject.credentialId)?.agentId : undefined);
     const env = agentId ? this.state.agents.get(agentId)?.envelope : undefined;
@@ -361,19 +372,47 @@ export class VenueService {
   }
 
   /**
-   * The insurer's own signed word about a party's filing — a COI, presented by the party. Verified under the insurer's
-   * registered key (insurers register as notice sources) and against the party's entity; kept on file and used in
-   * every standing check as one more statement that must agree, and the one no registry mirror can forge.
+   * Which key is the insurer's is the registries' word, not this operator's: the filer directory, attested by every
+   * mirror under the same quorum, unanimity and freshness as any record. Returns the filer attestations relied on and
+   * the key valid at `at`, or why there is none.
    */
-  private checkInsurerAttestation(a: InsurerAttestation, usdot: string): { reasonCode: ReasonCode; evidence: Record<string, unknown> } | undefined {
-    const src = this.state.noticeSources.find((x) => x.sourceId === a.insurerId);
-    if (!src) return { reasonCode: "INSURER_ATTESTATION_INVALID", evidence: { error: "insurer is not a registered source", insurerId: a.insurerId } };
-    if (!verifyInsurerAttestation(a, src.publicKey)) return { reasonCode: "INSURER_ATTESTATION_INVALID", evidence: { error: "insurer attestation does not verify under the registered key", insurerId: a.insurerId } };
+  private async filerKey(insurerId: string, kid: string, at: Date, maxAgeMs = this.config.registryMaxAgeMs): Promise<{ ok: true; key: OkpJwk; legalName: string; attestations: FilerAttestation[] } | { ok: false; reasonCode: ReasonCode; evidence: Record<string, unknown>; attestations: FilerAttestation[] }> {
+    let atts: FilerAttestation[];
+    try {
+      atts = await this.registry.refreshFiler(insurerId, maxAgeMs);
+    } catch (e) {
+      const u = e as RegistryUnavailable;
+      return { ok: false, reasonCode: "REGISTRY_UNAVAILABLE", evidence: { insurerId, error: u.why ?? u.message, registries: u.perRegistry ?? {} }, attestations: [] };
+    }
+    // Accountability for the mirrors here too: a mirror claiming a sync after a revocation it does not show.
+    const events = atts.flatMap(keyEventsShownBy);
+    for (const x of atts) {
+      const proof = filerContradictedBy(x, events);
+      if (proof) this.audit.writeOnce(`false-attestation:${proof.registryId}:filer:${proof.insurerId}:${proof.claimedSyncAt}`, { component: "venue.identity", event: "registry-false-attestation", outcome: "INFO", reasonCode: "REGISTRY_FALSE_ATTESTATION", subject: proof.registryId, evidence: { filer: proof.insurerId, claimedSyncAt: proof.claimedSyncAt, missing: proof.missing, kid: x.kid } });
+    }
+    const k = filerKeyOfRecord(atts, kid, at);
+    if (!k.ok) return { ok: false, reasonCode: "INSURER_KEY_NOT_OF_RECORD", evidence: { insurerId, kid, at: at.toISOString(), error: k.why, registriesShowingKey: k.showing, registriesDissenting: k.dissenting, rule: atts.length > 1 ? "unanimity: any registry's word against the key blocks" : undefined }, attestations: atts };
+    return { ok: true, key: k.key!.publicKey, legalName: k.legalName!, attestations: atts };
+  }
+
+  /**
+   * The insurer's own signed word about a party's filing — a COI, presented by the party. Verified under the key the
+   * REGISTRIES list for that filer at signing time (never a key this operator configured), and against the party's
+   * entity and the filing of record; kept on file and used in every standing check as one more statement that must
+   * agree, and the one no registry mirror can forge.
+   */
+  private async checkInsurerAttestation(a: InsurerAttestation, usdot: string): Promise<{ reasonCode: ReasonCode; evidence: Record<string, unknown> } | undefined> {
+    const fk = await this.filerKey(a.insurerId, a.kid, new Date(a.asOf));
+    // An operator-registered key for this insurer that differs from the registries' is the operator's error (or worse); the registries win.
+    const configured = this.state.noticeSources.find((x) => x.sourceId === a.insurerId);
+    if (configured && fk.ok && configured.publicKey.x !== fk.key.x) this.audit.writeOnce(`insurer-key-conflict:${a.insurerId}:${configured.publicKey.kid}`, { component: "venue.identity", event: "insurer-key-conflict", outcome: "INFO", reasonCode: "INSURER_KEY_NOT_OF_RECORD", subject: a.insurerId, evidence: { configuredKid: configured.publicKey.kid, registriesKid: fk.key.kid, registries: fk.attestations.map((x) => x.registryId), note: "the operator's configuration is subordinate to the registries' filer directory" } });
+    if (!fk.ok) return { reasonCode: fk.reasonCode, evidence: { ...fk.evidence, configuredKeyForThisInsurer: configured ? configured.publicKey.kid : null, note: configured && configured.publicKey.kid === a.kid ? "the key that signed is one this venue's operator configured for the insurer — and the registries do not list it: the operator's binding does not count" : undefined } };
+    if (!verifyInsurerAttestation(a, fk.key)) return { reasonCode: "INSURER_ATTESTATION_INVALID", evidence: { error: "insurer attestation does not verify under the key the registries list for this filer", insurerId: a.insurerId, kid: a.kid } };
     if (a.usdot !== usdot) return { reasonCode: "INSURER_ATTESTATION_INVALID", evidence: { error: "insurer attestation is about another entity", attested: a.usdot, entity: usdot } };
     // Of record: the registry's filing names the insurer and the policy. Anyone else's signature is not the origin's word.
     const atts = this.registry.attestations(usdot);
-    const rec = insurerOfRecord(a, atts.map((x) => x.record), src.insurerName ?? a.insurerName);
-    if (!rec.ok) return { reasonCode: "INSURER_NOT_OF_RECORD", evidence: { error: rec.why, insurerId: a.insurerId, insurerName: src.insurerName ?? a.insurerName ?? null, policyNumber: a.policyNumber, registries: atts.map((x) => x.registryId), filingsOnRecord: atts.flatMap((x) => x.record?.insurance.map((f) => ({ insurer: f.insurer, policyNumber: f.policyNumber, type: f.type })) ?? []) } };
+    const rec = insurerOfRecord(a, atts.map((x) => x.record), fk.legalName);
+    if (!rec.ok) return { reasonCode: "INSURER_NOT_OF_RECORD", evidence: { error: rec.why, insurerId: a.insurerId, insurerName: fk.legalName, policyNumber: a.policyNumber, registries: atts.map((x) => x.registryId), filingsOnRecord: atts.flatMap((x) => x.record?.insurance.map((f) => ({ insurer: f.insurer, policyNumber: f.policyNumber, type: f.type })) ?? []) } };
     // Symmetric with the mirrors: the origin signed after the registry received its own filing and did not disclose it.
     const proof = insurerContradictedBy(a, atts.flatMap(filingsShownBy));
     if (proof) {
@@ -390,7 +429,7 @@ export class VenueService {
     // The registry's word must be fresh to say who the insurer of record is.
     const fresh = await this.freshen([cred.subject.entity.usdot]);
     if (!fresh.ok) throw new Refusal("REGISTRY_UNAVAILABLE", "venue.identity", fresh.evidence);
-    const bad = this.checkInsurerAttestation(params.attestation, cred.subject.entity.usdot);
+    const bad = await this.checkInsurerAttestation(params.attestation, cred.subject.entity.usdot);
     if (bad) {
       this.audit.write({ component: "venue.identity", event: "present-insurance", outcome: "REFUSED", reasonCode: bad.reasonCode, subject: params.agentId, evidence: bad.evidence });
       throw new Refusal(bad.reasonCode, "venue.identity", bad.evidence);
@@ -482,7 +521,7 @@ export class VenueService {
     }
     let insurerAttestation: InsurerAttestation | undefined;
     if (params.insurerAttestation) {
-      const bad = this.checkInsurerAttestation(params.insurerAttestation, params.claimed.usdot);
+      const bad = await this.checkInsurerAttestation(params.insurerAttestation, params.claimed.usdot);
       if (bad) {
         this.audit.write({ component: "venue.identity", event: "present-insurance", outcome: "REFUSED", reasonCode: bad.reasonCode, subject: agentId, evidence: bad.evidence });
         throw new Refusal(bad.reasonCode, "venue.identity", bad.evidence);
@@ -1144,10 +1183,28 @@ export class VenueService {
       }
     }
     const registryAtt = { broker: fresh.attestations[terms.brokerEntity.usdot]!, carrier: fresh.attestations[terms.carrierEntity.usdot]! };
+    // The registries' word on each insurer's key, obtained NOW: a word on file whose key the registries no longer
+    // list at its signing time counts for nothing — refused if the principal requires the origin's word, else dropped.
+    const filers: { broker?: FilerAttestation[]; carrier?: FilerAttestation[] } = {};
+    const insurance: { broker?: InsurerAttestation; carrier?: InsurerAttestation } = {};
+    for (const [side, reg] of [["broker", brokerReg], ["carrier", carrierReg]] as const) {
+      const att = reg.insurerAttestation;
+      if (!att) continue;
+      const fk = await this.filerKey(att.insurerId, att.kid, new Date(att.asOf), 0);
+      if (!fk.ok) {
+        if (side === "carrier" && (brokerReg.envelope?.limits.requireInsurerAttestation || brokerReg.envelope?.limits.requireInsurerUndertaking)) {
+          await this.fail(t, fk.reasonCode, "venue.identity", { stage: "commit", agentId: reg.agentId, ...fk.evidence }, undefined, undefined);
+          return;
+        }
+        continue;
+      }
+      filers[side] = fk.attestations;
+      insurance[side] = att;
+    }
     // The statutory window: if the broker requires the carrier's insurer's word and the word on file falls short of
     // delivery, the commitment is CONDITIONAL on a renewal signed within the window and presented by pickup.
-    const rw = renewalWindow(carrierReg.insurerAttestation, new Date(terms.pickup.windowStart), new Date(terms.delivery.windowEnd));
-    const renewal = brokerReg.envelope?.limits.requireInsurerAttestation && carrierReg.insurerAttestation && !rw.reachesDelivery ? { earliestSignedAt: rw.earliestSignedAt, dueBy: rw.dueBy, requiredBy: brokerReg.agentId } : undefined;
+    const rw = renewalWindow(insurance.carrier, new Date(terms.pickup.windowStart), new Date(terms.delivery.windowEnd));
+    const renewal = (brokerReg.envelope?.limits.requireInsurerAttestation || brokerReg.envelope?.limits.requireInsurerUndertaking) && insurance.carrier && !rw.reachesDelivery ? { earliestSignedAt: rw.earliestSignedAt, dueBy: rw.dueBy, requiredBy: brokerReg.agentId } : undefined;
     const quote = this.quoteFor(t, terms);
     const requireGuarantee = !!brokerReg.envelope?.limits.requireGuarantee || !!carrierReg.envelope?.limits.requireGuarantee;
     if (quote.decision === "DECLINED" && requireGuarantee) {
@@ -1164,7 +1221,7 @@ export class VenueService {
         acceptances: { broker: t.acceptances[t.brokerAgentId]!, carrier: t.acceptances[t.carrierAgentId]! },
         credentials: { broker: brokerCred, carrier: carrierCred },
         registry: { registries: this.registry.pinned, attestations: registryAtt, policy: { maxAgeMs: this.config.registryMaxAgeMs, quorum: this.config.registryQuorum } },
-        insurance: { broker: brokerReg.insurerAttestation, carrier: carrierReg.insurerAttestation, renewal },
+        insurance: { ...insurance, renewal, filers },
         underwriting: quote.decision === "GUARANTEED" ? { decision: "GUARANTEED", riskScore: quote.assessment.probabilityOfLoss, guarantee: quote.guarantee } : { decision: "UNGUARANTEED", riskScore: quote.assessment.probabilityOfLoss, reasonCode: quote.reasonCode },
         ledger: { seq: head.seq + 1, prevHash: head.hash },
       },

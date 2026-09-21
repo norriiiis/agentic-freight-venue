@@ -53,6 +53,16 @@
  * the date it assures — and a principal or verifier can accept nothing
  * less. The protocol cannot make an insurer pay; it can make sure the only
  * word that satisfies the policy is one the insurer is liable for.
+ *
+ * Which key is the insurer's is a registry fact too. An insurer that files
+ * with the registry is a registered FILER, and its filer registration —
+ * legal name and signing keys, with their validity and any revocation — is
+ * attested by the same mirrors under the same quorum, unanimity, freshness
+ * and accountability as any record. So the binding of a key to the name on
+ * a filing is nobody's configuration: not the venue operator's, who can be
+ * fooled or dishonest, and not the verifier's, who need pin nothing beyond
+ * the registries. A key the registries do not list for that filer at that
+ * time signs nothing the origin said (INSURER_KEY_NOT_OF_RECORD).
  */
 import { hashObject } from "./canonical";
 import { importPublicKey, signJws, verifyJws, type KeyPair, type OkpJwk } from "./crypto";
@@ -292,10 +302,110 @@ export function verifyAttestation(a: RegistryAttestation, key: OkpJwk): boolean 
  * reliedAt — later filings were invisible to it — and its signing clock
  * (`asOf`) no further in the future than skewMs, or a clock is wrong.
  */
-export function attestationFreshAt(a: RegistryAttestation, reliedAt: Date, maxAgeMs: number, skewMs = 60_000): { ok: boolean; ageMs: number } {
+export function attestationFreshAt(a: { asOf: string; upstreamAsOf?: string }, reliedAt: Date, maxAgeMs: number, skewMs = 60_000): { ok: boolean; ageMs: number } {
   const ageMs = reliedAt.getTime() - new Date(a.upstreamAsOf ?? a.asOf).getTime();
   const signedAhead = new Date(a.asOf).getTime() - reliedAt.getTime();
   return { ok: ageMs <= maxAgeMs && ageMs >= -skewMs && signedAhead <= skewMs, ageMs };
+}
+
+// ------------------------------------------------------- filer directory
+
+/** A key an insurer files (and signs attestations) under: valid from a moment, until revoked. */
+export interface FilerKey {
+  kid: string;
+  publicKey: OkpJwk;
+  validFrom: string;
+  /** From when the key is no longer the filer's (for COMPROMISE, possibly in the past: signatures after it are suspect). */
+  revokedAt?: string;
+  /** When the registry recorded the revocation — what a mirror synced later is accountable for. Defaults to revokedAt. */
+  declaredAt?: string;
+  reason?: "ROTATION" | "COMPROMISE";
+}
+
+/** An insurer's registration with the registry: the name it files under and the keys it has signed under. */
+export interface InsurerRegistration {
+  insurerId: string;
+  legalName: string;
+  keys: FilerKey[];
+  registeredAt: string;
+}
+
+/** The registry's signed word about a filer, on the same terms as its word about an entity. */
+export interface FilerAttestation {
+  schema: "freight-venue/filer-attestation/v1";
+  registryId: string;
+  insurerId: string;
+  asOf: string;
+  upstreamAsOf?: string;
+  registration: InsurerRegistration | null;
+  recordHash: string;
+  kid: string;
+  signature: string;
+}
+
+export function signFilerAttestation(registry: KeyPair, registryId: string, insurerId: string, registration: InsurerRegistration | null, now = new Date(), upstreamAsOf: Date = now): FilerAttestation {
+  const unsigned: Omit<FilerAttestation, "signature"> = { schema: "freight-venue/filer-attestation/v1", registryId, insurerId, asOf: now.toISOString(), upstreamAsOf: upstreamAsOf.toISOString(), registration, recordHash: registration ? hashObject(registration) : "", kid: registry.kid };
+  return { ...unsigned, signature: signJws(unsigned, registry, { typ: "filer-attestation+jws" }, true) };
+}
+
+export function verifyFilerAttestation(a: FilerAttestation, key: OkpJwk): boolean {
+  if (a.schema !== "freight-venue/filer-attestation/v1") return false;
+  const { signature, ...unsigned } = a;
+  if ((a.registration ? hashObject(a.registration) : "") !== a.recordHash) return false;
+  if (a.registration && a.registration.insurerId !== a.insurerId) return false;
+  try {
+    return verifyJws(signature, importPublicKey(key), unsigned).ok;
+  } catch {
+    return false;
+  }
+}
+
+/** The filer's key `kid` as valid at `at`: registered by then and not revoked at or before it. */
+export function filerKeyAt(reg: InsurerRegistration | null, kid: string, at: Date): FilerKey | undefined {
+  return reg?.keys.find((k) => k.kid === kid && new Date(k.validFrom) <= at && !(k.revokedAt && new Date(k.revokedAt) <= at));
+}
+
+/**
+ * Which key is the filer's, per the registries: every attestation must
+ * show `kid` valid at `at` — unanimity, as for standing, because a
+ * revocation is news that cannot be un-known. Names the dissent.
+ */
+export function filerKeyOfRecord(atts: FilerAttestation[], kid: string, at: Date): { ok: boolean; key?: FilerKey; legalName?: string; why?: string; showing: string[]; dissenting: string[] } {
+  const showing: string[] = [];
+  const dissenting: string[] = [];
+  let key: FilerKey | undefined;
+  let legalName: string | undefined;
+  for (const a of atts) {
+    const k = filerKeyAt(a.registration, kid, at);
+    if (k) { showing.push(a.registryId); key ??= k; legalName ??= a.registration!.legalName; } else dissenting.push(a.registryId);
+  }
+  if (atts.length === 0) return { ok: false, why: "no registry word about this filer", showing, dissenting };
+  if (dissenting.length) {
+    const first = atts.find((a) => a.registryId === dissenting[0])!;
+    const known = first.registration?.keys.find((k) => k.kid === kid);
+    return { ok: false, key, legalName: legalName ?? first.registration?.legalName, why: !first.registration ? `${dissenting.join(", ")}: no such filer` : !known ? `${dissenting.join(", ")}: key ${kid.slice(0, 12)}… is not a key this filer registered` : known.revokedAt && new Date(known.revokedAt) <= at ? `${dissenting.join(", ")}: key ${kid.slice(0, 12)}… revoked ${known.revokedAt} (${known.reason ?? "revoked"}), signature at ${at.toISOString()}` : `${dissenting.join(", ")}: key ${kid.slice(0, 12)}… not yet valid at ${at.toISOString()} (from ${known.validFrom})`, showing, dissenting };
+  }
+  return { ok: true, key, legalName, showing, dissenting };
+}
+
+/** A key event somebody's signed word shows: a mirror claiming a later sync cannot honestly lack a revocation. */
+export interface KeyEventEvidence { source: string; insurerId: string; kid: string; revokedAt: string; declaredAt: string; asOf: string }
+
+export function keyEventsShownBy(a: FilerAttestation): KeyEventEvidence[] {
+  return (a.registration?.keys ?? []).filter((k) => k.revokedAt).map((k) => ({ source: a.registryId, insurerId: a.insurerId, kid: k.kid, revokedAt: k.revokedAt!, declaredAt: k.declaredAt ?? k.revokedAt!, asOf: a.upstreamAsOf ?? a.asOf }));
+}
+
+/** A mirror that claims a sync after a revocation was DECLARED and still shows the key unrevoked has signed a falsehood. */
+export function filerContradictedBy(x: FilerAttestation, evidence: KeyEventEvidence[]): { registryId: string; insurerId: string; claimedSyncAt: string; attestation: FilerAttestation; missing: KeyEventEvidence } | undefined {
+  const sync = new Date(x.upstreamAsOf ?? x.asOf);
+  for (const e of evidence) {
+    if (e.insurerId !== x.insurerId || (e.source === x.registryId && e.asOf === (x.upstreamAsOf ?? x.asOf))) continue;
+    if (new Date(e.declaredAt) >= sync) continue;
+    const own = x.registration?.keys.find((k) => k.kid === e.kid);
+    if (!own || (own.revokedAt && new Date(own.revokedAt) <= new Date(e.revokedAt))) continue;
+    return { registryId: x.registryId, insurerId: x.insurerId, claimedSyncAt: sync.toISOString(), attestation: x, missing: e };
+  }
+  return undefined;
 }
 
 // ------------------------------------------------------- accountability

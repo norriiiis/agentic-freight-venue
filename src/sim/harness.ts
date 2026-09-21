@@ -26,7 +26,7 @@ import type { AuditEntry } from "../protocol/audit";
 import type { NegotiationTask, CommitmentRecord } from "../venue/state";
 import type { LedgerEntry } from "../ledger/chain";
 import type { Message, Task } from "../protocol/a2a";
-import { signInsurerAttestation, type InsurerAttestation, type InsurerKey, type RegistryAttestation, type RegistryKey, type RegistryRecord } from "../protocol/registry";
+import { signInsurerAttestation, type FilerAttestation, type InsurerAttestation, type InsurerKey, type InsurerRegistration, type RegistryAttestation, type RegistryKey, type RegistryRecord } from "../protocol/registry";
 import type { LoadSpec, NegotiationPayload } from "../protocol/freight";
 import type { LocalTask } from "../agentkit/types";
 
@@ -269,6 +269,12 @@ export class RegistryHandle {
   attest(usdot: string) { return httpGet<RegistryAttestation>(`${this.url}/attest?usdot=${usdot}`); }
   /** SIM: an insurer files a cancellation / FMCSA revokes — with the REGISTRY. Nobody tells the venue. */
   update(usdot: string, patch: Partial<RegistryRecord>) { return httpPost<{ ok: boolean; recordHash: string }>(`${this.url}/admin/update`, { usdot, patch }); }
+  /** The registry's signed word about a filer, as any verifier can fetch it today. */
+  attestFiler(insurerId: string) { return httpGet<FilerAttestation>(`${this.url}/attest-filer?insurerId=${insurerId}`); }
+  filers() { return httpGet<InsurerRegistration[]>(`${this.url}/filers`); }
+  /** SIM (the upstream onboarding a filer): register an insurer's filing name and key. */
+  registerFiler(f: { insurerId: string; legalName: string; publicKey: OkpJwk; kid: string; validFrom?: string }) { return httpPost<{ ok: boolean; filer: InsurerRegistration }>(`${this.url}/admin/filers`, f); }
+  revokeFilerKey(f: { insurerId: string; kid: string; revokedAt: string; reason: "ROTATION" | "COMPROMISE" }) { return httpPost<{ ok: boolean; filer: InsurerRegistration }>(`${this.url}/admin/filers/revoke`, f); }
   /** SIM: the registry goes dark, or freezes — keeps signing the records it has. Honest: its sync claim stops advancing. `claimsCurrent`: it lies about its sync. */
   fault(f: { unavailable?: boolean; freeze?: boolean; claimsCurrent?: boolean }) { return httpPost<{ unavailable: boolean; frozen: boolean; claimsCurrent: boolean }>(`${this.url}/admin/fault`, f); }
 }
@@ -291,6 +297,16 @@ export class WitnessHandle {
   receipts() { return httpGet<WitnessReceipt[]>(`${this.url}/receipts`); }
   forks() { return httpGet<{ at: string; expected: LedgerHead; observed: LedgerHead; why: string }[]>(`${this.url}/forks`); }
   publicKeyPath() { return join(this.dir, "witness-public.jwk.json"); }
+}
+
+export interface InsurerDesk {
+  insurerId: string;
+  insurerName: string;
+  kp: KeyPair;
+  key: InsurerKey;
+  attest: (fields: Parameters<typeof signInsurerAttestation>[2], now?: Date) => InsurerAttestation;
+  /** Sign under another key (a rotated one, or a thief's). */
+  signWith: (k: KeyPair, fields: Parameters<typeof signInsurerAttestation>[2], now?: Date) => InsurerAttestation;
 }
 
 export interface HarnessOptions {
@@ -420,13 +436,23 @@ export class Harness {
   }
 
   /**
-   * An INSURER: the origin of the filing every registry mirrors. Registered with the venue like any source; signs
-   * coverage attestations (a COI) that the insured presents. The harness plays the insurer's signing desk.
+   * An INSURER: the origin of the filing every registry mirrors. It registers as a FILER with the registries — the
+   * upstream every mirror reflects — under the name it files with and the key it signs with; the venue is told nothing.
+   * Signs coverage attestations (a COI) that the insured presents. The harness plays the insurer's signing desk, and
+   * the registries' filer onboarding.
    */
-  async startInsurer(insurerId: string, insurerName?: string): Promise<{ insurerId: string; insurerName?: string; kp: KeyPair; key: InsurerKey; attest: (fields: Parameters<typeof signInsurerAttestation>[2], now?: Date) => InsurerAttestation }> {
+  async startInsurer(insurerId: string, insurerName = insurerId, opts: { registerWithRegistries?: boolean } = {}): Promise<InsurerDesk> {
     const kp = generateKeyPair();
-    await this.venue.registerNoticeSource(insurerId, kp.publicJwk, insurerName);
-    return { insurerId, insurerName, kp, key: { insurerId, publicKey: kp.publicJwk, insurerName }, attest: (fields, now) => signInsurerAttestation(kp, insurerId, fields, now, insurerName) };
+    const desk: InsurerDesk = { insurerId, insurerName, kp, key: { insurerId, publicKey: kp.publicJwk, insurerName }, attest: (fields, now) => signInsurerAttestation(kp, insurerId, fields, now, insurerName), signWith: (k, fields, now) => signInsurerAttestation(k, insurerId, fields, now, insurerName) };
+    if (opts.registerWithRegistries !== false) await this.registerFiler({ insurerId, legalName: insurerName, publicKey: kp.publicJwk, kid: kp.kid });
+    return desk;
+  }
+  /** The upstream registers a filer (or a new key for one): every mirror that is still syncing reflects it. */
+  async registerFiler(f: { insurerId: string; legalName: string; publicKey: OkpJwk; kid: string; validFrom?: string }) {
+    for (const r of this.registries) await r.registerFiler(f);
+  }
+  async revokeFilerKey(f: { insurerId: string; kid: string; revokedAt: string; reason: "ROTATION" | "COMPROMISE" }) {
+    for (const r of this.registries) await r.revokeFilerKey(f);
   }
 
   /**

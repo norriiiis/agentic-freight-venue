@@ -20,7 +20,7 @@ export const insuranceRenewal: Scenario = {
   async run({ h, say }) {
     await h.startVenue();
     await h.venue.seedHistory("2751903", CARRIER_HISTORY);
-    const insurer = await h.startInsurer("great-plains-mutual");
+    const insurer = await h.startInsurer("great-plains-mutual", "Great Plains Mutual Insurance Co");
     const policy = { usdot: "2751903", policyNumber: "TRK-0092817-24", type: "BIPD" as const, form: "BMC-91X" as const, coverageToUsd: 1_000_000, effectiveDate: "2025-07-01" };
     const coi = insurer.attest(policy);
     const broker = await h.startAgent(brokerSpec({ thinkMs: 60, limits: { ...brokerSpec().limits, requireInsurerAttestation: true } }));

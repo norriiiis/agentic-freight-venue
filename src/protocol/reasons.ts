@@ -33,6 +33,7 @@ export const REASONS = {
   INSURANCE_RENEWAL_NOT_PRESENTED: "The commitment was conditional on the counterparty's insurer re-attesting coverage through delivery by pickup; pickup arrived with no such word on file; commitment voided, guarantee released, in time to re-cover the load",
   INSURER_CONTRADICTS_COMMITMENT: "The party's own insurer's signed word shows coverage cancelled at or before the commitment, or before delivery; the venue committed against the origin of the fact",
   INSURER_NOT_OF_RECORD: "The attestation is not the word of the insurer of record: the registry's filing names a different insurer for this policy, or shows no such policy for this party — somebody's signature, not the origin's",
+  INSURER_KEY_NOT_OF_RECORD: "The key that signed the insurer's attestation is not one the registries list for that filer at that time (unregistered, not yet valid, or revoked); whoever holds it, the origin did not speak — and no venue operator's configuration can make it otherwise",
   INSURER_FALSE_ATTESTATION: "The insurer signed 'no cancellation' after the date the registry received its own cancellation filing: a signed falsehood by the origin, proven by the registries' word; an origin caught lying is not an origin",
   INSURER_UNDERTAKING_MISSING: "The insurer's attestation is a certificate, not an undertaking: it carries no signed promise not to deny a covered loss on the basis of an undisclosed lapse, and the policy accepts nothing less",
   ONBOARDING_PROOF_OF_CONTROL_FAILED: "Could not prove control of the claimed registry identity",

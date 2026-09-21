@@ -24,6 +24,9 @@ const routes: Record<string, HttpRoute> = {
   /** The registry's signed word about one entity, as of now. */
   "GET /attest": async (req) => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.attest(usdotOf(req)))),
   "GET /records": async () => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.records())),
+  /** The registry's signed word about a registered filer (an insurer), as of now. */
+  "GET /attest-filer": async (req) => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.attestFiler(new URL(req.url ?? "/", "http://localhost").searchParams.get("insurerId") ?? ""))),
+  "GET /filers": async () => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.store.allFilers())),
   /** STUB out-of-band channel (proof-of-control token, vetting flags). */
   "GET /stub/out-of-band": async (req) => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.outOfBand(usdotOf(req)) ?? null)),
 };
@@ -34,6 +37,17 @@ if (simMode) {
       const { usdot, patch } = b as { usdot: string; patch: Partial<RegistryRecord> };
       svc.store.update(usdot, patch);
       return ok({ ok: true, recordHash: svc.store.snapshotHash(usdot) });
+    },
+    /** The upstream onboards a filer, or the filer rotates / revokes a key with it. */
+    "POST /admin/filers": async (_r, b) => {
+      const f = b as { insurerId: string; legalName: string; publicKey: import("../protocol/crypto").OkpJwk; kid: string; validFrom?: string };
+      svc.store.registerFiler(f);
+      return ok({ ok: true, filer: svc.store.filer(f.insurerId) });
+    },
+    "POST /admin/filers/revoke": async (_r, b) => {
+      const f = b as { insurerId: string; kid: string; revokedAt: string; reason: "ROTATION" | "COMPROMISE" };
+      svc.store.revokeFilerKey(f.insurerId, f.kid, f.revokedAt, f.reason);
+      return ok({ ok: true, filer: svc.store.filer(f.insurerId) });
     },
     "POST /admin/fault": async (_r, b) => {
       const f = b as { unavailable?: boolean; freeze?: boolean; claimsCurrent?: boolean };

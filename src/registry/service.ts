@@ -7,7 +7,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { exportPrivateJwk, generateKeyPair, importKeyPair, type KeyPair, type OkpJwk } from "../protocol/crypto";
-import { signAttestation, type OutOfBand, type RegistryAttestation, type RegistryRecord } from "../protocol/registry";
+import { signAttestation, signFilerAttestation, type FilerAttestation, type InsurerRegistration, type OutOfBand, type RegistryAttestation, type RegistryRecord } from "../protocol/registry";
 import { MockRegistry } from "./store";
 
 export class RegistryService {
@@ -20,7 +20,7 @@ export class RegistryService {
    * mirror says so (`upstreamAsOf` stops advancing) and is merely stale; one that `claimsCurrent` signs a sync time
    * it did not have, and answers for the record it served.
    */
-  private frozen?: { records: Map<string, RegistryRecord | null>; at: Date; claimsCurrent: boolean };
+  private frozen?: { records: Map<string, RegistryRecord | null>; filers: Map<string, InsurerRegistration>; at: Date; claimsCurrent: boolean };
   private served = 0;
 
   constructor(readonly registryId: string, dataDir: string, storePath: string) {
@@ -46,9 +46,17 @@ export class RegistryService {
     return signAttestation(this.kp, this.registryId, usdot, record, now, upstreamAsOf);
   }
 
+  /** The registry's signed word about a filer — who signs under which key, since when, and until when. */
+  attestFiler(insurerId: string, now = new Date()): FilerAttestation {
+    this.served++;
+    const reg = this.frozen ? (this.frozen.filers.get(insurerId) ?? null) : this.store.filer(insurerId);
+    const upstreamAsOf = this.frozen && !this.frozen.claimsCurrent ? this.frozen.at : now;
+    return signFilerAttestation(this.kp, this.registryId, insurerId, reg ? structuredClone(reg) : null, now, upstreamAsOf);
+  }
+
   /** SIM: freeze what this mirror serves at the current records (or thaw); `claimsCurrent` makes it lie about its sync. */
   freeze(on: boolean, claimsCurrent = false) {
-    this.frozen = on ? { records: new Map(this.store.all().map((r) => [r.usdot, this.store.publicRecord(r.usdot)])), at: new Date(), claimsCurrent } : undefined;
+    this.frozen = on ? { records: new Map(this.store.all().map((r) => [r.usdot, this.store.publicRecord(r.usdot)])), filers: new Map(this.store.allFilers().map((f) => [f.insurerId, structuredClone(f)])), at: new Date(), claimsCurrent } : undefined;
   }
   get isFrozen(): boolean {
     return !!this.frozen;
