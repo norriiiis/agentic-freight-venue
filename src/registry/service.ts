@@ -15,6 +15,8 @@ export class RegistryService {
   readonly store: MockRegistry;
   /** SIM fault: the registry is unreachable (answers 503). */
   unavailable = false;
+  /** SIM fault: a mirror that stopped syncing its upstream — it keeps signing the records it had, with a fresh clock. Stale or lying: the same from outside. */
+  private frozen?: Map<string, RegistryRecord | null>;
   private served = 0;
 
   constructor(readonly registryId: string, dataDir: string, storePath: string) {
@@ -35,7 +37,16 @@ export class RegistryService {
 
   attest(usdot: string, now = new Date()): RegistryAttestation {
     this.served++;
-    return signAttestation(this.kp, this.registryId, usdot, this.store.publicRecord(usdot), now);
+    const record = this.frozen ? (this.frozen.has(usdot) ? this.frozen.get(usdot)! : null) : this.store.publicRecord(usdot);
+    return signAttestation(this.kp, this.registryId, usdot, record, now);
+  }
+
+  /** SIM: freeze what this mirror serves at the current records (or thaw). */
+  freeze(on: boolean) {
+    this.frozen = on ? new Map(this.store.all().map((r) => [r.usdot, this.store.publicRecord(r.usdot)])) : undefined;
+  }
+  get isFrozen(): boolean {
+    return !!this.frozen;
   }
 
   records(): RegistryRecord[] {
@@ -48,6 +59,6 @@ export class RegistryService {
   }
 
   status() {
-    return { registryId: this.registryId, kid: this.kp.kid, records: this.store.all().length, attestationsServed: this.served, unavailable: this.unavailable };
+    return { registryId: this.registryId, kid: this.kp.kid, records: this.store.all().length, attestationsServed: this.served, unavailable: this.unavailable, frozen: this.isFrozen };
   }
 }

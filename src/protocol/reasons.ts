@@ -23,6 +23,8 @@ export const REASONS = {
   REGISTRY_CONTRADICTS_COMMITMENT: "The registry's signed record shows a party was not in good standing when the commitment was made; the venue committed against the registry's word",
   REGISTRY_ATTESTATION_INVALID: "The registry attestation in the artifact does not verify under the pinned registry key, or is not about the committed party",
   REGISTRY_ATTESTATION_MISSING: "The artifact carries no signed registry attestation for a party: the venue's claim to have checked standing is unverifiable",
+  REGISTRY_QUORUM_NOT_MET: "Fewer pinned registries vouch for a party in the artifact than the verifier requires, or a registry the verifier names is absent; a venue cannot conjure a registry's signature, and one it quietly dropped is one it did not want heard",
+  REGISTRY_DISAGREEMENT: "The registries the venue relied on differ on the facts standing rests on (authorities, filings, operating status); at least one mirror is stale or wrong, and which is unknown",
   ONBOARDING_PROOF_OF_CONTROL_FAILED: "Could not prove control of the claimed registry identity",
   ONBOARDING_ENTITY_NOT_FOUND: "Claimed USDOT/MC not found in registry",
   ONBOARDING_KEY_ALREADY_BOUND: "A live credential already binds this entity to a different key",

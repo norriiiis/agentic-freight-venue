@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { importPublicKey, jwkThumbprint, signJws, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import type { Credential, CredentialStatusEntry, RotationAuthorization, RotationClaims } from "../protocol/types";
 import type { ReasonCode } from "../protocol/reasons";
-import { authorityActive, insuranceStatus, type RegistryRecord, type RegistryView } from "../protocol/registry";
+import { authorityActive, insuranceStatus, registryRef, type RegistryRecord, type RegistryView } from "../protocol/registry";
 import type { VettingProvider } from "./vetting";
 
 export interface IssueRequest {
@@ -131,10 +131,10 @@ export class CredentialIssuer {
     return { ok: true, credential };
   }
 
-  /** The signed registry word a credential was issued against (a mirror); absent for a bare store. */
-  private registryRef(usdot: string): Credential["evidence"]["registry"] {
-    const a = this.registry.attestation?.(usdot);
-    return a ? { registryId: a.registryId, kid: a.kid, asOf: a.asOf } : undefined;
+  /** The signed registry word a credential was issued against (a mirror, one per registry); absent for a bare store. */
+  private registryRefs(usdot: string): Credential["evidence"]["registries"] {
+    const atts = this.registry.attestations?.(usdot) ?? [];
+    return atts.length ? atts.map(registryRef) : undefined;
   }
 
   private mint(agentId: string, rec: RegistryRecord, publicKey: OkpJwk, ev: { insuranceCheckedAt: string; vettingProvider: string; vettingFlags: string[]; proofOfControl: string }, now: Date, supersedes?: string): Credential {
@@ -152,7 +152,7 @@ export class CredentialIssuer {
       signedAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + this.validityDays * 86_400_000).toISOString(),
       supersedes,
-      evidence: { registrySnapshotHash: this.registry.snapshotHash(rec.usdot), registryCheckedAt: now.toISOString(), registry: this.registryRef(rec.usdot), ...ev },
+      evidence: { registrySnapshotHash: this.registry.snapshotHash(rec.usdot), registryCheckedAt: now.toISOString(), registries: this.registryRefs(rec.usdot), ...ev },
     };
     return { ...unsigned, issuerSignature: signJws(unsigned, this.kp, { typ: "agent-credential+jws" }, true) };
   }

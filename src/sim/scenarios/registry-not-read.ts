@@ -28,7 +28,7 @@ export const registryNotRead: Scenario = {
     const c0 = await negotiate(h, broker, carrier, LOAD);
     const art0 = artifactOf(c0.task!.commitmentId!);
     const v0 = verifyArtifact(art0, { pinnedRootKey: root, registryKeys: [registryKey] });
-    say(`control: ${c0.task!.status} ${art0.commitmentId.slice(0, 16)}… — artifact embeds registry ${art0.registry?.registryId} attestations for both parties (policy ${art0.registry?.policy.maxAgeMs}ms); verifier pinning the registry key → ${v0.ok ? "VERIFIED" : v0.reasonCode}: ${v0.checks.find((c) => c.name === "carrier.registry.fresh-at-commitment")?.detail}`);
+    say(`control: ${c0.task!.status} ${art0.commitmentId.slice(0, 16)}… — artifact embeds registry ${art0.registry?.registries.map((r) => r.registryId).join(", ")} attestations for both parties (policy ${art0.registry?.policy.maxAgeMs}ms); verifier pinning the registry key → ${v0.ok ? "VERIFIED" : v0.reasonCode}: ${v0.checks.find((c) => c.name === "carrier.registry.fresh-at-commitment")?.detail}`);
     if (!v0.ok || !art0.registry) throw new Error("control: honest artifact did not verify with the registry key");
 
     // ---- The event nobody reports to the venue.
@@ -60,13 +60,13 @@ export const registryNotRead: Scenario = {
     const v2 = verifyArtifact(art2, { pinnedRootKey: root, registryKeys: [registryKey] });
     const current = await h.registry.attest("1984411");
     const v2b = verifyArtifact(art2, { pinnedRootKey: root, registryKeys: [registryKey], currentAttestations: [current] });
-    say(`   venue COMMITS ${art2.commitmentId.slice(0, 16)}… with guarantee ${art2.underwriting.decision === "GUARANTEED" ? "ATTACHED" : "none"}; the artifact's registry word on the carrier is as of ${art2.registry?.attestations.carrier.asOf.slice(11, 23)}Z, commitment at ${art2.createdAt.slice(11, 23)}Z`);
+    say(`   venue COMMITS ${art2.commitmentId.slice(0, 16)}… with guarantee ${art2.underwriting.decision === "GUARANTEED" ? "ATTACHED" : "none"}; the artifact's registry word on the carrier is as of ${art2.registry?.attestations.carrier[0]?.asOf.slice(11, 23)}Z, commitment at ${art2.createdAt.slice(11, 23)}Z`);
     say(`   verifier pinning the registry key → ${v2.reasonCode ?? "VERIFIED"}: ${v2.checks.find((c) => c.name === "carrier.registry.fresh-at-commitment")?.detail}`);
     say(`   verifier who also fetches the registry's word TODAY (as of ${current.asOf.slice(11, 23)}Z) → ${v2b.reasonCode ?? "VERIFIED"}: ${v2b.checks.find((c) => c.name === "carrier.registry.standing-per-current-record")?.detail?.slice(0, 160)}`);
     if (v2.reasonCode !== "REGISTRY_STALE" || v2b.reasonCode !== "REGISTRY_CONTRADICTS_COMMITMENT" || art2.underwriting.decision !== "GUARANTEED") throw new Error("part 2: stale registry word not caught");
     await h.venue.fault(null);
     findings.push(
-      { label: "part 2: read once, never again", reasonCode: "REGISTRY_STALE", by: "ledger/verify", detail: `the artifact must carry the registry's signed word the venue relied on; here it is ${Math.round((new Date(art2.createdAt).getTime() - new Date(art2.registry!.attestations.carrier.asOf).getTime()) / 100) / 10}s old at commitment against the ${art2.registry!.policy.maxAgeMs / 1000}s policy the venue itself declares in the artifact. The venue did not ask — and cannot say it did` },
+      { label: "part 2: read once, never again", reasonCode: "REGISTRY_STALE", by: "ledger/verify", detail: `the artifact must carry the registry's signed word the venue relied on; here it is ${Math.round((new Date(art2.createdAt).getTime() - new Date(art2.registry!.attestations.carrier[0]!.asOf).getTime()) / 100) / 10}s old at commitment against the ${art2.registry!.policy.maxAgeMs / 1000}s policy the venue itself declares in the artifact. The venue did not ask — and cannot say it did` },
       { label: "part 2: the registry's word today settles it", reasonCode: "REGISTRY_CONTRADICTS_COMMITMENT", by: "ledger/verify", detail: "cancellation dates are history: today's signed record shows the filing was already cancelled at the commitment time in the artifact. This needs nothing from the venue — only the registry key and the artifact" },
     );
 
@@ -76,7 +76,7 @@ export const registryNotRead: Scenario = {
     if (p3.task!.status !== "COMMITTED") throw new Error(`part 3: expected the dishonest venue to commit, got ${p3.task!.status} ${p3.task!.outcome?.reasonCode}`);
     const art3 = artifactOf(p3.task!.commitmentId!);
     const v3 = verifyArtifact(art3, { pinnedRootKey: root, registryKeys: [registryKey] });
-    say(`part 3: venue re-reads the registry (word as of ${art3.registry?.attestations.carrier.asOf.slice(11, 23)}Z says LAPSED), reports $1,000,000 BIPD to the broker, and COMMITS ${art3.commitmentId.slice(0, 16)}… with guarantee ${art3.underwriting.decision === "GUARANTEED" ? "ATTACHED" : "none"}`);
+    say(`part 3: venue re-reads the registry (word as of ${art3.registry?.attestations.carrier[0]?.asOf.slice(11, 23)}Z says LAPSED), reports $1,000,000 BIPD to the broker, and COMMITS ${art3.commitmentId.slice(0, 16)}… with guarantee ${art3.underwriting.decision === "GUARANTEED" ? "ATTACHED" : "none"}`);
     say(`   verifier → ${v3.reasonCode ?? "VERIFIED"}: ${v3.checks.find((c) => c.name === "carrier.registry.standing-at-commitment")?.detail?.slice(0, 160)}`);
     if (v3.reasonCode !== "REGISTRY_CONTRADICTS_COMMITMENT") throw new Error("part 3: contradiction not caught");
     await h.venue.fault(null);
@@ -100,7 +100,7 @@ export const registryNotRead: Scenario = {
       outcome: "REFUSED",
       reasonCode: "REGISTRY_STALE",
       refusedBy: "ledger/verify",
-      evidence: { commitmentId: art2.commitmentId, createdAt: art2.createdAt, registryWordAsOf: art2.registry!.attestations.carrier.asOf, venuePolicyMaxAgeMs: art2.registry!.policy.maxAgeMs, failedChecks: failing(v2), withCurrentRegistryWord: failing(v2b).filter((c) => c.includes("per-current-record")) },
+      evidence: { commitmentId: art2.commitmentId, createdAt: art2.createdAt, registryWordAsOf: art2.registry!.attestations.carrier[0]!.asOf, venuePolicyMaxAgeMs: art2.registry!.policy.maxAgeMs, failedChecks: failing(v2), withCurrentRegistryWord: failing(v2b).filter((c) => c.includes("per-current-record")) },
       guaranteeWouldHavePaid: "The guarantee was attached on the venue's say-so, and the artifact shows that say-so rested on registry word older than the venue's own policy. The venue's evidence indicts it; the broker's claim is against the venue, and an insurer backing the guarantee has the artifact to deny reinsurance on.",
       taskId: p2.task!.task.id,
       commitmentId: art2.commitmentId,

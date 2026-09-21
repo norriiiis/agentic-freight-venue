@@ -38,6 +38,8 @@ export function guaranteeWouldHavePaid(code: ReasonCode): string {
     case "REGISTRY_STALE":
     case "REGISTRY_CONTRADICTS_COMMITMENT":
     case "REGISTRY_ATTESTATION_MISSING":
+    case "REGISTRY_QUORUM_NOT_MET":
+    case "REGISTRY_DISAGREEMENT":
       return "The guarantee was attached on the venue's say-so, and the artifact shows that say-so was not backed by the registry's word at the time. The venue's own evidence indicts it: a claim against the venue, not against the guarantee's exclusions.";
     case "NEGOTIATION_MAX_ROUNDS":
     case "NEGOTIATION_WALKAWAY":

@@ -17,6 +17,15 @@
  * question — "was this carrier insured when the deal was struck?" — is then
  * answerable from the registry's word alone, by anyone, with no cooperation
  * from the venue. The venue's evidence shows what it knew and when.
+ *
+ * One signer is one party to trust. Several vetting providers mirror the
+ * same upstream independently of each other and of the venue; the venue
+ * asks all it is configured with, needs a quorum to have answered, and
+ * requires them to be UNANIMOUS that the party is in standing — a
+ * cancellation is news that cannot be un-known, so the one mirror that has
+ * the filing outranks the two that do not. A mirror that is stale or lying
+ * can therefore only block, never cause, a commitment; and its signed word
+ * beside its peers' signed word is the evidence it answers for.
  */
 import { hashObject } from "./canonical";
 import { importPublicKey, signJws, verifyJws, type KeyPair, type OkpJwk } from "./crypto";
@@ -201,6 +210,27 @@ export interface RegistryKey {
   publicKey: OkpJwk;
 }
 
+/** Which registry said what, and when — the reference a verdict or an attachment carries. */
+export interface RegistryRef {
+  registryId: string;
+  kid: string;
+  asOf: string;
+}
+
+export function registryRef(a: RegistryAttestation): RegistryRef {
+  return { registryId: a.registryId, kid: a.kid, asOf: a.asOf };
+}
+
+/**
+ * The facts standing depends on. Independent mirrors of one upstream may
+ * differ in fields that do not matter here (an MCS-150 date, a fleet count);
+ * they must not differ in these.
+ */
+export function standingProjection(rec: RegistryRecord | null): string {
+  if (!rec) return "";
+  return hashObject({ entityType: rec.entityType, operatingStatus: rec.operatingStatus, outOfServiceDate: rec.outOfServiceDate ?? null, authorities: rec.authorities, insurance: rec.insurance });
+}
+
 export function signAttestation(registry: KeyPair, registryId: string, usdot: string, record: RegistryRecord | null, now = new Date()): RegistryAttestation {
   const unsigned: Omit<RegistryAttestation, "signature"> = { schema: "freight-venue/registry-attestation/v1", registryId, usdot, asOf: now.toISOString(), record, recordHash: recordHash(record), kid: registry.kid };
   return { ...unsigned, signature: signJws(unsigned, registry, { typ: "registry-attestation+jws" }, true) };
@@ -230,14 +260,15 @@ export function attestationFreshAt(a: RegistryAttestation, reliedAt: Date, maxAg
 
 /**
  * How the venue sees the registry: a store (the mock authority, in tests) or
- * a mirror of verified attestations (the venue process). `refresh` obtains a
- * signed attestation no older than `maxAgeMs` or throws — a venue that cannot
- * reach the registry cannot verify, and must not commit.
+ * a mirror of verified attestations from every registry it is configured
+ * with (the venue process). `refresh` obtains signed attestations no older
+ * than `maxAgeMs` from at least a quorum of them or throws — a venue that
+ * cannot reach the registry cannot verify, and must not commit.
  */
 export interface RegistryView {
   get(usdot: string): (RegistryRecord & OutOfBand) | undefined;
   snapshotHash(usdot: string): string;
-  /** The latest verified attestation held for this entity (a store attests nothing). */
-  attestation?(usdot: string): RegistryAttestation | undefined;
-  refresh?(usdot: string, maxAgeMs: number, now?: Date): Promise<RegistryAttestation>;
+  /** The verified attestations relied on for this entity, one per registry (a store attests nothing). */
+  attestations?(usdot: string): RegistryAttestation[];
+  refresh?(usdot: string, maxAgeMs: number, now?: Date): Promise<RegistryAttestation[]>;
 }

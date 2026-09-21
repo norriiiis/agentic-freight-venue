@@ -26,7 +26,7 @@ import { REASONS, type ReasonCode } from "../protocol/reasons";
 import { AuditLog, type Component } from "../protocol/audit";
 import { rpcCall, RpcRefusal } from "../protocol/rpc";
 import type { Credential, MandateEnvelope, RotationAuthorization, RotationClaims } from "../protocol/types";
-import { RegistryMirror, RegistryUnavailable } from "../identity/registry-mirror";
+import { RegistryMirror, RegistryUnavailable, type RegistrySource } from "../identity/registry-mirror";
 import { hasBrokerAuthority, insuranceStatus, type RegistryAttestation, type RegistryKey } from "../protocol/registry";
 import { StubVettingProvider } from "../identity/vetting";
 import { CredentialIssuer } from "../identity/issuer";
@@ -45,11 +45,11 @@ import { guaranteeWouldHavePaid } from "./guarantee-outcome";
 export interface VenueConfig {
   venueId: string;
   dataDir: string;
-  /** The registry process (mock FMCSA L&I / vetting-provider signer). The venue holds only what it signs. */
-  registryUrl: string;
-  /** Operator-pinned registry key; absent = trust on first use from the registry's well-known document. */
-  registryKey?: RegistryKey;
-  /** Freshness policy: the registry's signed word relied on at any step may be at most this old. Embedded in every artifact. */
+  /** The registries (mock FMCSA L&I / vetting-provider signers), independent of each other and of the venue. The venue holds only what they sign. */
+  registries: RegistrySource[];
+  /** How many registries must have answered fresh before standing can be judged at all. Standing itself requires all that answered to agree. */
+  registryQuorum: number;
+  /** Freshness policy: a registry's signed word relied on at any step may be at most this old. Embedded in every artifact. */
   registryMaxAgeMs: number;
   port: number;
   maxRounds: number;
@@ -89,7 +89,7 @@ export class VenueService {
     mkdirSync(config.dataDir, { recursive: true });
     this.keys = new VenueKeyRing(config.dataDir, config.venueId);
     this.url = `http://127.0.0.1:${config.port}`;
-    this.registry = new RegistryMirror(config.registryUrl, config.dataDir);
+    this.registry = new RegistryMirror(config.registries, config.dataDir, config.registryQuorum);
     this.issuer = new CredentialIssuer(config.venueId, () => this.keys.signer(), this.registry, new StubVettingProvider(this.registry), config.dataDir, undefined, undefined, config.registryMaxAgeMs);
     this.ledger = new Ledger(join(config.dataDir, "ledger.jsonl"), () => this.keys.signer(), this.keys.currentCert(), this.keys.currentRootEvent());
     this.underwriting = new UnderwritingEngine(config.dataDir, { ...DEFAULT_PARAMS, ...config.underwriting });
@@ -99,29 +99,33 @@ export class VenueService {
     for (const src of config.noticeSources ?? []) this.registerNoticeSource(src);
   }
 
-  /** Pin the registry key (configured, or TOFU from its well-known document). Must complete before serving. */
+  /** Pin every registry's key (configured, or TOFU from its well-known document). Must complete before serving. */
   async init(): Promise<void> {
-    const k = await this.registry.init(this.config.registryKey);
-    this.audit.writeOnce(`registry-pinned:${k.registryId}:${k.publicKey.kid}`, { component: "venue.identity", event: "registry-pinned", outcome: "INFO", evidence: { registryId: k.registryId, kid: k.publicKey.kid, source: this.config.registryKey ? "operator-config" : "tofu", registryUrl: this.config.registryUrl } });
+    const keys = await this.registry.init();
+    for (const k of keys) {
+      const src = this.config.registries.find((r) => r.registryId === k.registryId)!;
+      this.audit.writeOnce(`registry-pinned:${k.registryId}:${k.publicKey.kid}`, { component: "venue.identity", event: "registry-pinned", outcome: "INFO", evidence: { registryId: k.registryId, kid: k.publicKey.kid, source: src.publicKey ? "operator-config" : "tofu", url: src.url, quorum: this.config.registryQuorum, of: keys.length } });
+    }
   }
 
   // ------------------------------------------------------------ registry
   //
   // Nobody is obliged to tell the venue that an insurer cancelled or FMCSA
   // revoked: the registry is where those facts live. So before every step
-  // that relies on a party's standing, the venue obtains the registry's SIGNED
-  // word no older than its freshness policy — or refuses. What it relied on
-  // goes into the artifact, where a verifier holds it to the same policy.
+  // that relies on a party's standing, the venue obtains the registries'
+  // SIGNED word no older than its freshness policy from at least a quorum of
+  // them — or refuses. What it relied on goes into the artifact, where a
+  // verifier holds it to the same policy, and to the same registries.
 
-  /** Obtain a fresh attestation for each entity, or say which one could not be had. */
-  private async freshen(usdots: string[], now = new Date(), maxAgeMs = this.config.registryMaxAgeMs): Promise<{ ok: true; attestations: RegistryAttestation[] } | { ok: false; usdot: string; evidence: Record<string, unknown> }> {
-    const attestations: RegistryAttestation[] = [];
+  /** Obtain fresh attestations for each entity from a quorum of registries, or say which entity could not be judged. */
+  private async freshen(usdots: string[], now = new Date(), maxAgeMs = this.config.registryMaxAgeMs): Promise<{ ok: true; attestations: Record<string, RegistryAttestation[]> } | { ok: false; usdot: string; evidence: Record<string, unknown> }> {
+    const attestations: Record<string, RegistryAttestation[]> = {};
     for (const usdot of [...new Set(usdots)]) {
       try {
-        attestations.push(await this.registry.refresh(usdot, maxAgeMs, now));
+        attestations[usdot] = await this.registry.refresh(usdot, maxAgeMs, now);
       } catch (e) {
         const u = e as RegistryUnavailable;
-        const evidence = { usdot, error: u.why ?? u.message, lastAttestationAsOf: u.lastAsOf ?? this.registry.attestation(usdot)?.asOf ?? null, registryMaxAgeMs: this.config.registryMaxAgeMs, registryUrl: this.config.registryUrl };
+        const evidence = { usdot, error: u.why ?? u.message, registries: u.perRegistry ?? {}, lastAttestationAsOf: u.lastAsOf ?? null, registryMaxAgeMs: this.config.registryMaxAgeMs, registryQuorum: this.config.registryQuorum };
         this.audit.write({ component: "venue.identity", event: "registry-refresh", outcome: "REFUSED", reasonCode: "REGISTRY_UNAVAILABLE", subject: usdot, evidence });
         return { ok: false, usdot, evidence };
       }
@@ -1011,7 +1015,7 @@ export class VenueService {
         return;
       }
     }
-    const registryAtt = { broker: this.registry.attestation(terms.brokerEntity.usdot)!, carrier: this.registry.attestation(terms.carrierEntity.usdot)! };
+    const registryAtt = { broker: fresh.attestations[terms.brokerEntity.usdot]!, carrier: fresh.attestations[terms.carrierEntity.usdot]! };
     const quote = this.quoteFor(t, terms);
     const requireGuarantee = !!brokerReg.envelope?.limits.requireGuarantee || !!carrierReg.envelope?.limits.requireGuarantee;
     if (quote.decision === "DECLINED" && requireGuarantee) {
@@ -1027,7 +1031,7 @@ export class VenueService {
         termsHash: termsHash(terms),
         acceptances: { broker: t.acceptances[t.brokerAgentId]!, carrier: t.acceptances[t.carrierAgentId]! },
         credentials: { broker: brokerCred, carrier: carrierCred },
-        registry: { registryId: this.registry.pinned!.registryId, publicKey: this.registry.pinned!.publicKey, attestations: registryAtt, policy: { maxAgeMs: this.config.registryMaxAgeMs } },
+        registry: { registries: this.registry.pinned, attestations: registryAtt, policy: { maxAgeMs: this.config.registryMaxAgeMs, quorum: this.config.registryQuorum } },
         underwriting: quote.decision === "GUARANTEED" ? { decision: "GUARANTEED", riskScore: quote.assessment.probabilityOfLoss, guarantee: quote.guarantee } : { decision: "UNGUARANTEED", riskScore: quote.assessment.probabilityOfLoss, reasonCode: quote.reasonCode },
         ledger: { seq: head.seq + 1, prevHash: head.hash },
       },
@@ -1221,7 +1225,7 @@ export class VenueService {
   }
 
   /** SIM-ONLY fault injection: die at a named point inside a commit. Never present in a deployed venue. */
-  simFault?: { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number }; suppressNotices?: boolean; dropNotices?: boolean; registryStale?: boolean; ignoreRegistry?: boolean };
+  simFault?: { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number }; suppressNotices?: boolean; dropNotices?: boolean; registryStale?: boolean; ignoreRegistry?: boolean; hideRegistries?: string[] };
   /** SIM-ONLY: receipts the fooled witness gave for heads of the fork view — the venue's second book. */
   private forkReceipts: Record<string, WitnessReceipt[]> = {};
 
@@ -1330,7 +1334,7 @@ export class VenueService {
         publicKey: fromCred.subject.publicKey,
         insurance: { bipdUsd: fromLive.insurance?.bipdCoverageUsd ?? 0, cargoUsd: fromLive.insurance?.cargoCoverageUsd ?? 0, bondUsd: fromLive.insurance?.bondUsd ?? 0 },
         verifiedAt: new Date().toISOString(),
-        registry: fromLive.registry,
+        registries: fromLive.registries,
       },
       guaranteeAvailable,
     };

@@ -3,9 +3,12 @@
  * venue never receives or reads either agent's data directory.
  *
  *   VENUE_DATA_DIR       own state dir
- *   VENUE_REGISTRY_URL   the registry process (mock FMCSA L&I signer); the venue holds only what it signs
- *   VENUE_REGISTRY_KEY   JSON { registryId, publicKey } pinned by the operator (default: trust on first use)
- *   VENUE_REGISTRY_MAX_AGE_MS  freshness policy for the registry's word at every standing check (default 5 min)
+ *   VENUE_REGISTRIES     JSON [{ registryId, url, publicKey? }] — the registry processes (mock FMCSA L&I signers), keys
+ *                        pinned by the operator (absent = trust on first use); the venue holds only what they sign
+ *   VENUE_REGISTRY_URL   single-registry shorthand for the above (default http://127.0.0.1:4400, id fmcsa-li-mock)
+ *   VENUE_REGISTRY_QUORUM      how many registries must answer fresh before standing can be judged (default 1);
+ *                        standing itself needs every registry that answered to agree
+ *   VENUE_REGISTRY_MAX_AGE_MS  freshness policy for a registry's word at every standing check (default 5 min)
  *   VENUE_PORT           listen port (127.0.0.1)
  *   VENUE_ID             venue identifier
  *   VENUE_MAX_ROUNDS     protocol bound on negotiation rounds
@@ -21,8 +24,8 @@ import type { OkpJwk } from "../protocol/crypto";
 const config = {
   venueId: process.env.VENUE_ID ?? "venue-local",
   dataDir: process.env.VENUE_DATA_DIR ?? ".data/venue",
-  registryUrl: process.env.VENUE_REGISTRY_URL ?? "http://127.0.0.1:4400",
-  registryKey: process.env.VENUE_REGISTRY_KEY ? JSON.parse(process.env.VENUE_REGISTRY_KEY) : undefined,
+  registries: process.env.VENUE_REGISTRIES ? JSON.parse(process.env.VENUE_REGISTRIES) : [{ registryId: process.env.VENUE_REGISTRY_ID ?? "fmcsa-li-mock", url: process.env.VENUE_REGISTRY_URL ?? "http://127.0.0.1:4400", publicKey: process.env.VENUE_REGISTRY_KEY ? JSON.parse(process.env.VENUE_REGISTRY_KEY).publicKey : undefined }],
+  registryQuorum: Number(process.env.VENUE_REGISTRY_QUORUM ?? 1),
   registryMaxAgeMs: Number(process.env.VENUE_REGISTRY_MAX_AGE_MS ?? 5 * 60_000),
   port: Number(process.env.VENUE_PORT ?? 4100),
   maxRounds: Number(process.env.VENUE_MAX_ROUNDS ?? 8),
@@ -67,7 +70,7 @@ if (simMode) {
   // ---- SIM-ONLY. Never present in a deployed venue. ----
   const admin: Record<string, HttpRoute> = {
     /** What the venue holds of the registry's word: the attestations it last verified. */
-    "GET /admin/registry-mirror": async () => ok({ pinned: venue.registry.pinned ?? null, stale: venue.registry.stale, attestations: venue.registry.all().map((a) => ({ usdot: a.usdot, asOf: a.asOf, recordHash: a.recordHash, kid: a.kid })) }),
+    "GET /admin/registry-mirror": async () => ok({ pinned: venue.registry.pinned, quorum: config.registryQuorum, stale: venue.registry.stale, hidden: venue.registry.hidden, attestations: venue.registry.all().map((a) => ({ registryId: a.registryId, usdot: a.usdot, asOf: a.asOf, recordHash: a.recordHash, kid: a.kid })) }),
     "POST /admin/credential/revoke": async (_r, b) => {
       const { agentId, reason, evidence } = b as { agentId: string; reason: string; evidence?: Record<string, unknown> };
       const entry = venue.revokeCredential(agentId, reason, evidence);
@@ -87,11 +90,12 @@ if (simMode) {
     },
     /** Crash the venue process at a named point inside the next commit (after-journal | after-ledger-append | after-apply). */
     "POST /admin/fault": async (_r, b) => {
-      const { crashAt, holdOutbox, equivocate, suppressNotices, dropNotices, registryStale, ignoreRegistry } = b as { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number }; suppressNotices?: boolean; dropNotices?: boolean; registryStale?: boolean; ignoreRegistry?: boolean };
-      venue.simFault = crashAt || holdOutbox || equivocate || suppressNotices || dropNotices || registryStale || ignoreRegistry ? { crashAt: crashAt || undefined, holdOutbox: !!holdOutbox, equivocate, suppressNotices: !!suppressNotices, dropNotices: !!dropNotices, registryStale: !!registryStale, ignoreRegistry: !!ignoreRegistry } : undefined;
-      // A venue that read the registry once and never again: the mirror serves what it has.
+      const { crashAt, holdOutbox, equivocate, suppressNotices, dropNotices, registryStale, ignoreRegistry, hideRegistries } = b as { crashAt?: string; holdOutbox?: boolean; equivocate?: { witnessIds: string[]; fromSeq: number }; suppressNotices?: boolean; dropNotices?: boolean; registryStale?: boolean; ignoreRegistry?: boolean; hideRegistries?: string[] };
+      venue.simFault = crashAt || holdOutbox || equivocate || suppressNotices || dropNotices || registryStale || ignoreRegistry || hideRegistries?.length ? { crashAt: crashAt || undefined, holdOutbox: !!holdOutbox, equivocate, suppressNotices: !!suppressNotices, dropNotices: !!dropNotices, registryStale: !!registryStale, ignoreRegistry: !!ignoreRegistry, hideRegistries } : undefined;
+      // A venue that read the registry once and never again: the mirror serves what it has. A venue that picks its registries: the mirror ignores the rest.
       venue.registry.stale = !!registryStale;
-      venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null, holdOutbox: !!holdOutbox, equivocate: equivocate ?? null, suppressNotices: !!suppressNotices, dropNotices: !!dropNotices, registryStale: !!registryStale, ignoreRegistry: !!ignoreRegistry } });
+      venue.registry.hidden = hideRegistries ?? [];
+      venue.audit.write({ component: "sim", event: "fault-armed", outcome: "INFO", evidence: { crashAt: crashAt ?? null, holdOutbox: !!holdOutbox, equivocate: equivocate ?? null, suppressNotices: !!suppressNotices, dropNotices: !!dropNotices, registryStale: !!registryStale, ignoreRegistry: !!ignoreRegistry, hideRegistries: hideRegistries ?? null } });
       return ok({ ok: true, fault: venue.simFault ?? null });
     },
     "POST /admin/flush-outbox": async () => { await venue.flushOutbox(); return ok({ pending: venue.state.outbox.length, deadLetter: venue.state.deadLetter.length }); },

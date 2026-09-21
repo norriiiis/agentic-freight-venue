@@ -74,7 +74,7 @@ function cred(venue: ReturnType<typeof generateKeyPair>, agent: ReturnType<typeo
   return { ...unsigned, issuerSignature: signJws(unsigned, venue, { typ: "agent-credential+jws" }, true) };
 }
 
-function makeArtifact(registry: ReturnType<typeof generateKeyPair>, atts: { broker: RegistryAttestation; carrier: RegistryAttestation }, policyMs = 60_000) {
+function makeArtifact(registry: ReturnType<typeof generateKeyPair>, atts: { broker: RegistryAttestation | RegistryAttestation[]; carrier: RegistryAttestation | RegistryAttestation[] }, policyMs = 60_000, opts: { registries?: { registryId: string; publicKey: import("../src/protocol/crypto").OkpJwk }[]; quorum?: number } = {}) {
   const root = generateKeyPair();
   const venue = generateKeyPair();
   const cert = signCert(root, venue.publicJwk, 0, "INITIAL", new Date(T.getTime() - 2 * 86_400_000));
@@ -86,7 +86,7 @@ function makeArtifact(registry: ReturnType<typeof generateKeyPair>, atts: { brok
   const accept = (kp: ReturnType<typeof generateKeyPair>, agentId: string, credentialId: string) =>
     signMessage(buildMessage({ role: "user", data: { type: "ACCEPT", loadRef: terms.loadRef, round: 3, terms, termsHash: termsHash(terms), from: { agentId, usdot: "x" } }, taskId: "t", contextId: "c", senderAgentId: agentId, credentialId }), kp);
   const a = buildArtifact(
-    { venue: { venueId: "v", rootPublicKey: root.publicJwk, certs: [cert] }, terms, termsHash: termsHash(terms), acceptances: { broker: accept(b, "broker-1", bc.credentialId), carrier: accept(c, "carrier-1", cc.credentialId) }, credentials: { broker: bc, carrier: cc }, registry: { registryId: "fmcsa-li-mock", publicKey: registry.publicJwk, attestations: atts, policy: { maxAgeMs: policyMs } }, underwriting: { decision: "GUARANTEED", riskScore: 0.01, guarantee: { guaranteeId: "g", coveredAmountUsd: 2215, premiumUsd: 40, scope: [], exclusions: [], conditions: [] } }, ledger: { seq: 1, prevHash: "0".repeat(64) } },
+    { venue: { venueId: "v", rootPublicKey: root.publicJwk, certs: [cert] }, terms, termsHash: termsHash(terms), acceptances: { broker: accept(b, "broker-1", bc.credentialId), carrier: accept(c, "carrier-1", cc.credentialId) }, credentials: { broker: bc, carrier: cc }, registry: { registries: opts.registries ?? [{ registryId: "fmcsa-li-mock", publicKey: registry.publicJwk }], attestations: { broker: [atts.broker].flat(), carrier: [atts.carrier].flat() }, policy: { maxAgeMs: policyMs, quorum: opts.quorum ?? 1 } }, underwriting: { decision: "GUARANTEED", riskScore: 0.01, guarantee: { guaranteeId: "g", coveredAmountUsd: 2215, premiumUsd: 40, scope: [], exclusions: [], conditions: [] } }, ledger: { seq: 1, prevHash: "0".repeat(64) } },
     venue,
   );
   // buildArtifact stamps createdAt with the wall clock; the attestations are relative to it.
@@ -156,5 +156,67 @@ describe("artifact carries the registry's word", () => {
     expect(v.checks.find((c) => c.name === "registry.attestations-present")?.ok).toBe(false);
     // A verifier that pins no registry runs no registry checks on an artifact that carries none (pre-attestation artifacts).
     expect(verifyArtifact(stripped, { pinnedRootKey: root }).checks.some((c) => c.name.startsWith("registry.") || c.name.includes(".registry."))).toBe(false);
+  });
+
+  describe("several registries", () => {
+    const A = generateKeyPair(), B = generateKeyPair(), C = generateKeyPair();
+    const keys = [{ registryId: "mirror-a", publicKey: A.publicJwk }, { registryId: "mirror-b", publicKey: B.publicJwk }, { registryId: "mirror-c", publicKey: C.publicJwk }];
+    const word = (kp: ReturnType<typeof generateKeyPair>, id: string, usdot: string, rec = pub(usdot), ageMs = 0) => signAttestation(kp, id, usdot, rec, new Date(Date.now() - ageMs));
+    const three = (usdot: string, recs: [RegistryRecord, RegistryRecord, RegistryRecord] = [pub(usdot), pub(usdot), pub(usdot)]) => [word(A, "mirror-a", usdot, recs[0]), word(B, "mirror-b", usdot, recs[1]), word(C, "mirror-c", usdot, recs[2])];
+    const build = (carrier: RegistryAttestation[], quorum = 2) => makeArtifact(A, { broker: three(BROKER), carrier }, 60_000, { registries: keys, quorum });
+
+    it("verifies with a quorum of unanimous registries", () => {
+      const { artifact, root } = build(three(CARRIER));
+      const v = verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: keys });
+      expect(v.ok, JSON.stringify(v.checks.filter((c) => !c.ok))).toBe(true);
+      expect(v.checks.find((c) => c.name === "carrier.registry.quorum")?.detail).toContain("3 pinned registries");
+    });
+
+    it("unanimity: one registry's word of a lapse blocks, however many say otherwise", () => {
+      const lapsed = cancelled(pub(CARRIER), "2026-09-18");
+      const { artifact, root } = build(three(CARRIER, [pub(CARRIER), pub(CARRIER), lapsed]));
+      const v = verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: keys });
+      expect(v).toMatchObject({ ok: false, reasonCode: "REGISTRY_CONTRADICTS_COMMITMENT" });
+      expect(v.checks.find((c) => c.name === "carrier.registry.standing-at-commitment")?.detail).toMatch(/mirror-c: INSURANCE_LAPSED.*mirror-a, mirror-b showed standing/);
+    });
+
+    it("REGISTRY_QUORUM_NOT_MET: too few pinned registries vouch, or a named one is absent", () => {
+      // The venue embedded only mirror-a's word (quorum 2 declared).
+      const { artifact, root } = build([word(A, "mirror-a", CARRIER)]);
+      expect(verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: keys })).toMatchObject({ ok: false, reasonCode: "REGISTRY_QUORUM_NOT_MET" });
+      // A verifier that pins only mirror-a and needs 1 is satisfied…
+      expect(verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: [keys[0]!], minRegistries: 1 }).ok).toBe(true);
+      // …unless it names a registry the venue left out.
+      const full = build(three(CARRIER));
+      const dropped = { ...full.artifact, registry: { ...full.artifact.registry!, attestations: { ...full.artifact.registry!.attestations, carrier: full.artifact.registry!.attestations.carrier.filter((x) => x.registryId !== "mirror-c") } } };
+      const v = verifyArtifact(dropped, { pinnedRootKey: full.root, registryKeys: keys, requiredRegistries: ["mirror-c"] });
+      expect(v.reasonCode).toBe("REGISTRY_QUORUM_NOT_MET");
+      expect(v.checks.find((c) => c.name === "carrier.registry.quorum")?.detail).toContain("required registry mirror-c absent");
+      // Unpinned registries in the artifact do not count toward the verifier's quorum.
+      const strangers = build([word(generateKeyPair(), "mirror-x", CARRIER), word(generateKeyPair(), "mirror-y", CARRIER)]);
+      expect(verifyArtifact(strangers.artifact, { pinnedRootKey: strangers.root, registryKeys: keys })).toMatchObject({ ok: false, reasonCode: "REGISTRY_QUORUM_NOT_MET" });
+    });
+
+    it("REGISTRY_STALE vs QUORUM: stale signatures explain a missed quorum", () => {
+      const { artifact, root } = build([word(A, "mirror-a", CARRIER), word(B, "mirror-b", CARRIER, pub(CARRIER), 120_000), word(C, "mirror-c", CARRIER, pub(CARRIER), 120_000)]);
+      expect(verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: keys })).toMatchObject({ ok: false, reasonCode: "REGISTRY_STALE" });
+    });
+
+    it("REGISTRY_DISAGREEMENT: mirrors differ on the facts without differing on the verdict", () => {
+      // mirror-c shows a cancellation effective long after delivery: still in standing, but not the same record.
+      const later = cancelled(pub(CARRIER), "2027-01-01");
+      const { artifact, root } = build(three(CARRIER, [pub(CARRIER), pub(CARRIER), later]));
+      const v = verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: keys });
+      expect(v).toMatchObject({ ok: false, reasonCode: "REGISTRY_DISAGREEMENT" });
+      expect(v.checks.find((c) => c.name === "carrier.registry.standing-at-commitment")?.ok).toBe(true);
+    });
+
+    it("current word from several registries: any lapse blocks, and the split is named", () => {
+      const { artifact, root } = build(three(CARRIER));
+      const today = [word(A, "mirror-a", CARRIER, cancelled(pub(CARRIER), "2026-09-18"), -3_600_000), word(B, "mirror-b", CARRIER, pub(CARRIER), -3_600_000)];
+      const v = verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: keys, currentAttestations: today });
+      expect(v).toMatchObject({ ok: false, reasonCode: "REGISTRY_CONTRADICTS_COMMITMENT" });
+      expect(v.checks.find((c) => c.name === "carrier.registry.standing-per-current-record")?.detail).toMatch(/mirror-a.*INSURANCE_LAPSED.*mirror-b say otherwise/);
+    });
   });
 });

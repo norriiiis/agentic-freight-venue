@@ -116,9 +116,9 @@ export class AgentHandle {
 export class VenueHandle {
   constructor(readonly dir: string, readonly url: string, public proc: ChildProcess) {}
   /** Arm a crash at a named point inside the next commit (SIM-ONLY). */
-  fault(f: { crashAt?: string; holdOutbox?: boolean; registryStale?: boolean; ignoreRegistry?: boolean } | null) { return httpPost<{ ok: boolean }>(`${this.url}/admin/fault`, f ?? {}); }
-  /** What the venue holds of the registry's word. */
-  registryMirror() { return httpGet<{ pinned: RegistryKey | null; stale: boolean; attestations: { usdot: string; asOf: string; recordHash: string; kid: string }[] }>(`${this.url}/admin/registry-mirror`); }
+  fault(f: { crashAt?: string; holdOutbox?: boolean; registryStale?: boolean; ignoreRegistry?: boolean; hideRegistries?: string[] } | null) { return httpPost<{ ok: boolean }>(`${this.url}/admin/fault`, f ?? {}); }
+  /** What the venue holds of the registries' word. */
+  registryMirror() { return httpGet<{ pinned: RegistryKey[]; quorum: number; stale: boolean; hidden: string[]; attestations: { registryId: string; usdot: string; asOf: string; recordHash: string; kid: string }[] }>(`${this.url}/admin/registry-mirror`); }
   flushOutbox() { return httpPost<{ pending: number; deadLetter: number }>(`${this.url}/admin/flush-outbox`, {}); }
   deadLetter() { return httpGet<{ toAgentId: string; attempts: number; note?: string }[]>(`${this.url}/admin/dead-letter`); }
   journal() { return httpGet<unknown[]>(`${this.url}/admin/journal`); }
@@ -257,7 +257,7 @@ export class VenueHandle {
 /** The registry process: the mock FMCSA L&I authority, with its own key and clock. Neither the venue nor the harness can sign for it. */
 export class RegistryHandle {
   constructor(readonly registryId: string, readonly dir: string, readonly url: string, readonly proc: ChildProcess) {}
-  status() { return httpGet<{ registryId: string; kid: string; records: number; attestationsServed: number; unavailable: boolean }>(`${this.url}/health`); }
+  status() { return httpGet<{ registryId: string; kid: string; records: number; attestationsServed: number; unavailable: boolean; frozen: boolean }>(`${this.url}/health`); }
   async key(): Promise<RegistryKey> { return httpGet<RegistryKey>(`${this.url}/.well-known/registry.json`); }
   records() { return httpGet<RegistryRecord[]>(`${this.url}/records`); }
   record(usdot: string) { return this.records().then((rs) => rs.find((r) => r.usdot === usdot)!); }
@@ -265,8 +265,8 @@ export class RegistryHandle {
   attest(usdot: string) { return httpGet<RegistryAttestation>(`${this.url}/attest?usdot=${usdot}`); }
   /** SIM: an insurer files a cancellation / FMCSA revokes — with the REGISTRY. Nobody tells the venue. */
   update(usdot: string, patch: Partial<RegistryRecord>) { return httpPost<{ ok: boolean; recordHash: string }>(`${this.url}/admin/update`, { usdot, patch }); }
-  /** SIM: the registry goes dark. */
-  fault(f: { unavailable: boolean }) { return httpPost<{ unavailable: boolean }>(`${this.url}/admin/fault`, f); }
+  /** SIM: the registry goes dark, or freezes — keeps signing the records it has, with a fresh clock (a mirror that stopped syncing, or lies). */
+  fault(f: { unavailable?: boolean; freeze?: boolean }) { return httpPost<{ unavailable: boolean; frozen: boolean }>(`${this.url}/admin/fault`, f); }
 }
 
 export class WitnessHandle {
@@ -292,44 +292,59 @@ export class WitnessHandle {
 export interface HarnessOptions {
   workspace: string;
   quiet?: boolean;
-  venue?: { maxRounds?: number; replyTimeoutMs?: number; sweepMs?: number; outboxMaxAttempts?: number; inclusionDelayMs?: number; registryMaxAgeMs?: number; underwriting?: Record<string, unknown> };
+  venue?: { maxRounds?: number; replyTimeoutMs?: number; sweepMs?: number; outboxMaxAttempts?: number; inclusionDelayMs?: number; registryMaxAgeMs?: number; registryQuorum?: number; underwriting?: Record<string, unknown> };
 }
 
 export class Harness {
   private procs: ChildProcess[] = [];
   private venueEnv?: Record<string, string>;
   venue!: VenueHandle;
+  /** The first registry (most scenarios need one); `registries` has them all. */
   registry!: RegistryHandle;
+  readonly registries: RegistryHandle[] = [];
   readonly agents = new Map<string, AgentHandle>();
   constructor(readonly opts: HarnessOptions) {
     rmSync(opts.workspace, { recursive: true, force: true });
     mkdirSync(opts.workspace, { recursive: true });
   }
 
-  /** The registry as its own process, started before the venue: the venue pins its key and holds only what it signs. */
+  /**
+   * A registry as its own process, started before the venue: the venue pins its key and holds only what it signs.
+   * Several are independent mirrors of one upstream (the harness plays the upstream: see registryUpdate).
+   */
   async startRegistry(registryId = "fmcsa-li-mock"): Promise<RegistryHandle> {
-    const dir = join(this.opts.workspace, "registry");
+    const dir = join(this.opts.workspace, this.registries.length ? registryId : "registry");
     mkdirSync(dir, { recursive: true });
     copyFileSync(REGISTRY_FIXTURE, join(dir, "records.json"));
     const port = await freePort();
-    const proc = spawnTs("src/registry/server.ts", { REGISTRY_ID: registryId, REGISTRY_DATA_DIR: dir, REGISTRY_STORE: join(dir, "records.json"), REGISTRY_PORT: String(port), SIM_MODE: "1" }, "registry", !!this.opts.quiet);
+    const proc = spawnTs("src/registry/server.ts", { REGISTRY_ID: registryId, REGISTRY_DATA_DIR: dir, REGISTRY_STORE: join(dir, "records.json"), REGISTRY_PORT: String(port), SIM_MODE: "1" }, registryId.padEnd(8).slice(0, 8), !!this.opts.quiet);
     this.procs.push(proc);
     const url = `http://127.0.0.1:${port}`;
     await waitForHealth(`${url}/health`);
-    this.registry = new RegistryHandle(registryId, dir, url, proc);
-    return this.registry;
+    const h = new RegistryHandle(registryId, dir, url, proc);
+    this.registries.push(h);
+    if (!this.registry) this.registry = h;
+    return h;
+  }
+  async startRegistries(ids: string[]): Promise<RegistryHandle[]> {
+    for (const id of ids) await this.startRegistry(id);
+    return this.registries;
+  }
+  /** An insurer files with FMCSA; FMCSA revokes: the upstream changes and every mirror that is still syncing reflects it. */
+  async registryUpdate(usdot: string, patch: Partial<RegistryRecord>) {
+    for (const r of this.registries) await r.update(usdot, patch);
   }
 
   async startVenue(): Promise<VenueHandle> {
-    if (!this.registry) await this.startRegistry();
+    if (this.registries.length === 0) await this.startRegistry();
     const dir = join(this.opts.workspace, "venue");
     mkdirSync(dir, { recursive: true });
     const port = await freePort();
     this.venueEnv = {
       VENUE_DATA_DIR: dir,
-      VENUE_REGISTRY_URL: this.registry.url,
-      // The operator pins the registry key by configuration; the harness plays the operator.
-      VENUE_REGISTRY_KEY: JSON.stringify(await this.registry.key()),
+      // The operator pins every registry's key by configuration; the harness plays the operator.
+      VENUE_REGISTRIES: JSON.stringify(await Promise.all(this.registries.map(async (r) => ({ registryId: r.registryId, url: r.url, publicKey: (await r.key()).publicKey })))),
+      VENUE_REGISTRY_QUORUM: String(this.opts.venue?.registryQuorum ?? 1),
       VENUE_REGISTRY_MAX_AGE_MS: String(this.opts.venue?.registryMaxAgeMs ?? 1000),
       VENUE_PORT: String(port),
       VENUE_ID: "venue-sim",

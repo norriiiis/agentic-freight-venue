@@ -39,8 +39,8 @@ export interface Credential {
   evidence: {
     registrySnapshotHash: string;
     registryCheckedAt: string;
-    /** The registry's signed attestation the issuer relied on (see protocol/registry.ts). */
-    registry?: { registryId: string; kid: string; asOf: string };
+    /** The registries' signed attestations the issuer relied on, one per registry (see protocol/registry.ts). */
+    registries?: { registryId: string; kid: string; asOf: string }[];
     insuranceCheckedAt: string;
     vettingProvider: string;
     vettingFlags: string[];
