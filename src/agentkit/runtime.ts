@@ -227,6 +227,19 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     return { ok: true, credential: this.credential };
   }
 
+  /** Report what happened to a committed load (pickup, delivery, POD hash, acceptance, payment): a signed party statement the venue records on its ledger. */
+  async reportEvent(p: { commitmentId: string; event: string; at?: string; evidenceHash?: string; note?: string }) {
+    const res = await rpcCall<{ ok: boolean; status: string; ledgerSeq: number }>(`${this.config.venueUrl}/a2a`, "venue/event", p, { authorization: `Bearer ${this.bearer("venue/event")}` });
+    this.audit.write({ component: this.comp.runtime, event: "lifecycle-report", outcome: res.error ? "REFUSED" : "ALLOWED", evidence: { ...p, result: res.result ?? res.error } });
+    return res.error ? { ok: false as const, reasonCode: (res.error.data as { reasonCode?: string })?.reasonCode, error: res.error.message } : { ...res.result!, ok: true as const };
+  }
+  /** File a claim against the guarantee on a commitment this agent is party to. */
+  async fileClaim(p: { commitmentId: string; peril: string; amountUsd: number; evidence?: Record<string, unknown> }) {
+    const res = await rpcCall<Record<string, unknown>>(`${this.config.venueUrl}/a2a`, "venue/claim", p, { authorization: `Bearer ${this.bearer("venue/claim")}` });
+    this.audit.write({ component: this.comp.runtime, event: "claim-filed", outcome: res.error ? "REFUSED" : "ALLOWED", evidence: { ...p, result: res.result ?? res.error } });
+    return res.error ? { ok: false, reasonCode: (res.error.data as { reasonCode?: string })?.reasonCode, error: res.error.message } : { ok: true, claim: res.result! };
+  }
+
   /** Present a renewed COI from the principal's insurer; kept on disk and on file with the venue. */
   async presentInsurance(att: InsurerAttestation): Promise<{ ok: boolean; reasonCode?: string; evidence?: unknown; satisfied?: string[]; voided?: string[] }> {
     const res = await rpcCall<{ satisfied?: string[]; voided?: string[] }>(`${this.config.venueUrl}/a2a`, "venue/present-insurance", { agentId: this.config.agentId, attestation: att }, { authorization: `Bearer ${this.bearer("venue/present-insurance")}` });
@@ -591,6 +604,12 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         }
         break;
       }
+      case "LIFECYCLE": {
+        // The other party's statement about our shared load; the local task keeps the latest status.
+        if (lt) lt.lifecycle = [...(lt.lifecycle ?? []), { event: data.event, by: data.by, at: data.at, status: data.status, ledgerSeq: data.ledgerSeq }];
+        this.audit.write({ component: this.comp.runtime, event: "lifecycle-notice", outcome: "INFO", taskId, evidence: { commitmentId: data.commitmentId, event: data.event, by: data.by, status: data.status } });
+        break;
+      }
       case "INSURANCE_RENEWED": {
         // The counterparty's insurer spoke again; the condition our commitment carried is met. Keep the origin's word beside the artifact.
         mkdirSync(join(this.config.dataDir, "commitments"), { recursive: true });
@@ -711,6 +730,8 @@ export class AgentRuntime<Ctx extends { canary: string }> {
       Object.assign(routes, {
         "POST /control/onboard": async () => ok(await this.onboard()),
         "POST /control/present-insurance": async (_r, b) => ok(await this.presentInsurance(b as InsurerAttestation)),
+        "POST /control/event": async (_r, b) => ok(await this.reportEvent(b as Parameters<AgentRuntime<Ctx>["reportEvent"]>[0])),
+        "POST /control/claim": async (_r, b) => ok(await this.fileClaim(b as Parameters<AgentRuntime<Ctx>["fileClaim"]>[0])),
         "POST /control/tender": async (_r: unknown, b: unknown) => {
           const { load, to } = b as { load: LoadSpec; to: { agentId: string } };
           return ok(await this.tender(load, to));

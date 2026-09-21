@@ -160,6 +160,18 @@ export interface InsuranceRenewedPayload {
   assuredThrough: string;
   ledgerSeq: number;
 }
+/** Venue -> agents: the other party reported a lifecycle event on a shared commitment. */
+export interface LifecyclePayload {
+  type: "LIFECYCLE";
+  loadRef: string;
+  commitmentId: string;
+  event: string;
+  by: string;
+  at: string;
+  status: string;
+  ledgerSeq: number;
+  evidenceHash: string | null;
+}
 /** Venue -> agent, after a venue-key compromise: this commitment's artifact carries a new attestation. */
 export interface CommitmentReattestedPayload {
   type: "COMMITMENT_REATTESTED";
@@ -173,6 +185,7 @@ export type NegotiationPayload =
   | CredentialReissuedPayload
   | CommitmentReattestedPayload
   | InsuranceRenewedPayload
+  | LifecyclePayload
   | TenderPayload
   | CounterPayload
   | AcceptPayload
@@ -216,6 +229,7 @@ const KEYS: Record<string, string[]> = {
   CREDENTIAL_REISSUED: ["type", "credential", "reason"],
   COMMITMENT_REATTESTED: ["type", "loadRef", "commitmentId", "artifact", "reason"],
   INSURANCE_RENEWED: ["type", "loadRef", "commitmentId", "attestation", "assuredThrough", "ledgerSeq"],
+  LIFECYCLE: ["type", "loadRef", "commitmentId", "event", "by", "at", "status", "ledgerSeq", "evidenceHash"],
 };
 const FORMATS: Record<string, { re: RegExp; max: number }> = {
   loadRef: { re: /^[A-Za-z0-9._\-/]+$/, max: 64 },

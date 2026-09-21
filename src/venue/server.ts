@@ -66,7 +66,8 @@ const jobs = new Scheduler((l) => console.error(l))
   .add({ name: "outbox-flush", everyMs: sweepMs, run: () => venue.flushOutbox() })
   .add({ name: "heartbeat", everyMs: Math.max(1_000, sweepMs), run: async () => { venue.state.persist(); return { lastAliveAt: venue.state.lastAliveAt }; } })
   .add({ name: "nonce-sweep", everyMs: Number(process.env.VENUE_NONCE_SWEEP_MS ?? 60_000), run: async () => ({ swept: venue.state.sweepNonces(2 * config.messageMaxAgeMs) }) })
-  .add({ name: "pre-pickup-and-renewal", everyMs: Number(process.env.VENUE_PREPICKUP_MS ?? 15 * 60_000), run: async (now) => ({ voided: (await venue.prePickupChecks(now)).map((c) => c.commitmentId) }) });
+  .add({ name: "pre-pickup-and-renewal", everyMs: Number(process.env.VENUE_PREPICKUP_MS ?? 15 * 60_000), run: async (now) => ({ voided: (await venue.prePickupChecks(now)).map((c) => c.commitmentId) }) })
+  .add({ name: "claim-windows", everyMs: Number(process.env.VENUE_CLAIM_WINDOW_SWEEP_MS ?? 60 * 60_000), run: async (now) => ({ released: venue.underwriting.expireClaimWindows(now).map((g) => g.guaranteeId) }) });
 
 const ok = (body: unknown) => ({ status: 200, body });
 /** Who is asking (SIM: witnesses send x-witness-id so the equivocation fault can target one; a real venue would fingerprint by IP). */
@@ -92,6 +93,11 @@ const routes: Record<string, HttpRoute> = {
   /** Put dead-lettered notices back on the outbox (all, or one by id) — e.g. after an agent's endpoint was fixed. */
   "POST /ops/dead-letter/retry": async (_r, b) => ok(venue.retryDeadLetter((b as { id?: string } | undefined)?.id)),
   "GET /metrics": async () => ({ status: 200, body: metrics.render() }),
+  "GET /ops/claims": async () => ok(venue.underwriting.allClaims()),
+  "GET /ops/reserve": async () => ok(venue.underwriting.reserveView()),
+  /** A human adjudicator's decision on a claim, with the reason on the record. */
+  "POST /ops/claims/decide": async (_r, b) => { const { claimId, covered, reasonCode, why, payoutUsd } = b as { claimId: string; covered: boolean; reasonCode?: string; why: string; payoutUsd?: number }; const c = venue.underwriting.decideClaim(claimId, { covered, reasonCode, why, payoutUsd }); if (c) venue.audit.write({ component: "underwriting", event: "claim-decided", outcome: covered ? "ALLOWED" : "REFUSED", evidence: { claimId, covered, reasonCode, why, status: c.status, payoutUsd: c.decision?.payoutUsd } }); return c ? ok(c) : { status: 404, body: { error: "unknown claim" } }; },
+  "POST /ops/reserve/capital": async (_r, b) => { const { usd } = b as { usd: number }; venue.underwriting.addCapital(usd); const paid = venue.underwriting.settleDeferred(); venue.audit.write({ component: "underwriting", event: "capital-added", outcome: "INFO", evidence: { usd, deferredPaid: paid.map((c) => c.claimId), reserve: venue.underwriting.reserveView() } }); return ok({ reserve: venue.underwriting.reserveView(), deferredPaid: paid.map((c) => c.claimId) }); },
   "GET /ops/health": async () => ok({ ok: true, venueId: config.venueId, outbox: venue.state.outbox.length, deadLetter: venue.state.deadLetter.length, tasks: venue.state.tasks.size, commitments: venue.state.commitments.size, nonces: venue.state.nonces.size, jobs: jobs.list() }),
   /** The venue's part of a verification bundle for one commitment (artifact, ledger, lists, renewals). The world's word is not the venue's to supply. */
   "GET /bundle/*": async (req) => {
@@ -146,6 +152,11 @@ if (simMode) {
     },
     "POST /admin/expire-stale-tasks": async () => ok({ expired: (await venue.expireStaleTasks()).map((t) => ({ taskId: t.task.id, outcome: t.outcome })) }),
     "GET /admin/jobs": async () => ok(jobs.list()),
+    "GET /admin/claims": async () => ok(venue.underwriting.allClaims()),
+    "GET /admin/history": async (req) => ok(venue.underwriting.historyFor(new URL(req.url ?? "/", "http://localhost").searchParams.get("usdot") ?? "")),
+    "GET /admin/reserve": async () => ok(venue.underwriting.reserveView()),
+    "POST /admin/claims/decide": async (_r, b) => { const { claimId, covered, reasonCode, why, payoutUsd } = b as { claimId: string; covered: boolean; reasonCode?: string; why: string; payoutUsd?: number }; return ok(venue.underwriting.decideClaim(claimId, { covered, reasonCode, why, payoutUsd }) ?? null); },
+    "POST /admin/reserve/capital": async (_r, b) => { venue.underwriting.addCapital((b as { usd: number }).usd); return ok({ reserve: venue.underwriting.reserveView(), deferredPaid: venue.underwriting.settleDeferred().map((c) => c.claimId) }); },
     /** Run a job by name, at a chosen moment (`now`, ISO) — how the simulator moves the calendar. */
     "POST /admin/jobs/run": async (_r, b) => { const { name, now } = b as { name: string; now?: string }; return ok(await jobs.runNow(name, now ? new Date(now) : undefined)); },
     /** `now` (ISO) lets the simulator move the clock for renewal deadlines; standing checks still use real registry time. */

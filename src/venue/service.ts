@@ -38,7 +38,7 @@ import { Ledger, type LedgerEntry } from "../ledger/chain";
 import { artifactHash, buildArtifact, reattestArtifact, type CommitmentArtifact } from "../ledger/artifact";
 import { UnderwritingEngine } from "../underwriting/engine";
 import { DEFAULT_PARAMS, type RiskInputs, type UnderwritingParams } from "../underwriting/types";
-import { VenueState, type CommitJournal, type CommitmentRecord, type KeyRotationJournal, type NegotiationTask, type Offer, type RegisteredAgent, type RootRotationJournal, type VoidJournal } from "./state";
+import { VenueState, type CommitJournal, type CommitmentRecord, type KeyRotationJournal, type LifecycleEventType, type NegotiationTask, type Offer, type RegisteredAgent, type RootRotationJournal, type VoidJournal } from "./state";
 import { GUARANTEE_SCOPE } from "../underwriting/types";
 import { guaranteeWouldHavePaid } from "./guarantee-outcome";
 
@@ -485,7 +485,63 @@ export class VenueService {
     return { ok: true, insurerId: params.attestation.insurerId, asOf: params.attestation.asOf, satisfied: outcome.satisfied.map((c) => c.commitmentId), voided: outcome.voided.map((c) => c.commitmentId) };
   }
 
-  // ---------------------------------------------------- conditional commitments
+  // ------------------------------------------------------------ lifecycle
+  //
+  // After commitment the load moves. Each step is a signed statement by the
+  // party who can know it — pickup and delivery by the carrier, acceptance
+  // and payment by the broker — recorded on the ledger with the hash of any
+  // document (POD, invoice) the parties keep. Completion feeds the carrier's
+  // history, which is what underwriting prices the next load on; the
+  // guarantee then stays claimable for the claim window.
+
+  private static LIFECYCLE_RULES: Record<LifecycleEventType, { by: "broker" | "carrier" | "either"; from: CommitmentRecord["status"][]; to?: CommitmentRecord["status"] }> = {
+    PICKED_UP: { by: "carrier", from: ["ACTIVE"], to: "IN_TRANSIT" },
+    DELIVERED: { by: "carrier", from: ["IN_TRANSIT"], to: "DELIVERED" },
+    POD: { by: "either", from: ["IN_TRANSIT", "DELIVERED", "COMPLETED"] },
+    DELIVERY_ACCEPTED: { by: "broker", from: ["DELIVERED"], to: "COMPLETED" },
+    DISPUTE_OPENED: { by: "either", from: ["IN_TRANSIT", "DELIVERED", "COMPLETED"] },
+    DISPUTE_CLOSED: { by: "either", from: ["IN_TRANSIT", "DELIVERED", "COMPLETED"] },
+    PAID: { by: "broker", from: ["DELIVERED", "COMPLETED"] },
+  };
+
+  async recordLifecycle(caller: RegisteredAgent, p: { commitmentId: string; event: LifecycleEventType; at?: string; evidenceHash?: string; note?: string }) {
+    const c = this.state.commitments.get(p.commitmentId);
+    if (!c || (caller.agentId !== c.brokerAgentId && caller.agentId !== c.carrierAgentId)) throw new Refusal("CLAIM_INVALID", "venue.commitment", { error: "not a party to this commitment", commitmentId: p.commitmentId });
+    const rule = VenueService.LIFECYCLE_RULES[p.event];
+    const role = caller.agentId === c.brokerAgentId ? "broker" : "carrier";
+    if (!rule) throw new Refusal("LIFECYCLE_EVENT_INVALID", "venue.commitment", { error: `unknown event ${p.event}` });
+    if (rule.by !== "either" && rule.by !== role) throw new Refusal("LIFECYCLE_EVENT_INVALID", "venue.commitment", { error: `${p.event} is reported by the ${rule.by}, not the ${role}`, commitmentId: c.commitmentId });
+    if (!rule.from.includes(c.status)) throw new Refusal("LIFECYCLE_EVENT_INVALID", "venue.commitment", { error: `${p.event} is not valid from status ${c.status}`, commitmentId: c.commitmentId, status: c.status });
+    const at = p.at ?? new Date().toISOString();
+    const entry = this.ledger.append("LIFECYCLE", { commitmentId: c.commitmentId, event: p.event, by: caller.agentId, at, evidenceHash: p.evidenceHash ?? null, note: p.note ?? null });
+    const ev = { event: p.event, by: caller.agentId, at, recordedAt: new Date().toISOString(), ledgerSeq: entry.seq, evidenceHash: p.evidenceHash, note: p.note };
+    (c.lifecycle ??= []).push(ev);
+    if (rule.to) c.status = rule.to;
+    if (p.event === "DISPUTE_OPENED" || p.event === "DISPUTE_CLOSED") this.underwriting.adjustDisputes(c.carrierUsdot, p.event === "DISPUTE_OPENED" ? 1 : -1);
+    let guarantee;
+    if (c.status === "COMPLETED" && c.guaranteeId) guarantee = this.underwriting.complete(c.guaranteeId, c.artifact.terms.delivery.windowEnd);
+    this.state.persist();
+    this.audit.write({ component: "venue.commitment", event: "lifecycle", outcome: "ALLOWED", taskId: c.taskId, subject: caller.agentId, evidence: { commitmentId: c.commitmentId, event: p.event, status: c.status, ledgerSeq: entry.seq, evidenceHash: p.evidenceHash ?? null, guarantee: guarantee ? { status: guarantee.status, claimWindowEndsAt: guarantee.claimWindowEndsAt } : undefined } });
+    const other = caller.agentId === c.brokerAgentId ? c.carrierAgentId : c.brokerAgentId;
+    this.enqueue(other, this.venueMessage({ type: "LIFECYCLE", loadRef: c.loadRef, commitmentId: c.commitmentId, event: p.event, by: caller.agentId, at, status: c.status, ledgerSeq: entry.seq, evidenceHash: p.evidenceHash ?? null }, c.taskId, `ctx_${c.loadRef}`), `LIFECYCLE ${p.event} ${c.commitmentId}`);
+    await this.flushOutbox();
+    return { ok: true, commitmentId: c.commitmentId, status: c.status, ledgerSeq: entry.seq, guarantee: guarantee ? { status: guarantee.status, claimWindowEndsAt: guarantee.claimWindowEndsAt } : undefined };
+  }
+
+  // ---------------------------------------------------------------- claims
+
+  async fileClaim(caller: RegisteredAgent, p: { commitmentId: string; peril: string; amountUsd: number; evidence?: Record<string, unknown> }) {
+    const c = this.state.commitments.get(p.commitmentId);
+    if (!c || (caller.agentId !== c.brokerAgentId && caller.agentId !== c.carrierAgentId)) throw new Refusal("CLAIM_INVALID", "venue.commitment", { error: "not a party to this commitment", commitmentId: p.commitmentId });
+    if (typeof p.peril !== "string" || !(p.amountUsd > 0)) throw new Refusal("CLAIM_INVALID", "venue.commitment", { error: "peril and a positive amount are required" });
+    const g = c.guaranteeId ? this.underwriting.guaranteeForCommitment(c.commitmentId) : undefined;
+    const claimantUsdot = caller.agentId === c.brokerAgentId ? c.brokerUsdot : c.carrierUsdot;
+    const claim = this.underwriting.fileClaim({ guaranteeId: g?.guaranteeId ?? "", commitmentId: c.commitmentId, claimantUsdot, peril: p.peril, amountUsd: p.amountUsd, evidence: p.evidence ?? {} }, { status: c.status, deliveryWindowEnd: c.artifact.terms.delivery.windowEnd, voidedAt: c.voided?.at, lifecycle: (c.lifecycle ?? []).map((e) => ({ event: e.event, at: e.at, by: e.by })) });
+    const entry = this.ledger.append("CLAIM", { claimId: claim.claimId, commitmentId: c.commitmentId, guaranteeId: claim.guaranteeId || null, claimantUsdot, peril: claim.peril, amountUsd: claim.amountUsd, decision: claim.decision, status: claim.status });
+    if (claim.status === "PAID") this.ledger.append("PAYOUT", { claimId: claim.claimId, guaranteeId: claim.guaranteeId, payoutUsd: claim.decision!.payoutUsd, paidAt: claim.paidAt, reserve: this.underwriting.reserveView() });
+    this.audit.write({ component: "underwriting", event: "claim", outcome: claim.decision?.covered ? "ALLOWED" : "REFUSED", reasonCode: claim.decision?.covered ? undefined : (claim.decision?.reasonCode as ReasonCode | undefined), taskId: c.taskId, subject: caller.agentId, evidence: { claimId: claim.claimId, peril: claim.peril, amountUsd: claim.amountUsd, status: claim.status, basis: claim.decision?.basis, payoutUsd: claim.decision?.payoutUsd, ledgerSeq: entry.seq, reserve: this.underwriting.reserveView() } });
+    return claim;
+  }
   //
   // The statutory window makes renewal arithmetic: a word signed at S assures
   // through S + notice, so a load delivering at D needs a word signed at or
@@ -783,6 +839,16 @@ export class VenueService {
           return this.acceptWitnessReceipt((params as { receipt: WitnessReceipt }).receipt);
         case "venue/notice":
           return await this.submitNotice(params as { notice: StatusNotice });
+        case "venue/event": {
+          const p = params as { commitmentId: string; event: LifecycleEventType; at?: string; evidenceHash?: string; note?: string };
+          const caller = this.authenticateBearer(headers.authorization, "venue/event");
+          return await this.recordLifecycle(caller, p);
+        }
+        case "venue/claim": {
+          const p = params as { commitmentId: string; peril: string; amountUsd: number; evidence?: Record<string, unknown> };
+          const caller = this.authenticateBearer(headers.authorization, "venue/claim");
+          return await this.fileClaim(caller, p);
+        }
         case "venue/present-insurance": {
           // The insured presents its own insurer's word: the caller must be the agent whose file changes.
           const p = params as { agentId: string; attestation: InsurerAttestation };

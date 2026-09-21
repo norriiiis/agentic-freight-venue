@@ -24,6 +24,9 @@ export type LedgerEntryType =
   | "ROOT_ROTATION"  // carries a root event (pre-rotation): the new root's authority is the previous root's commitment
   | "COMMITMENT"
   | "INSURANCE_RENEWAL" // a conditional commitment's insurer-renewal condition satisfied: carries the insurer's signed word
+  | "LIFECYCLE"         // a party's signed statement about the load after commitment (picked up, delivered, POD, accepted, paid)
+  | "CLAIM"             // a claim filed against a guarantee, with its adjudication
+  | "PAYOUT"            // a claim paid from the reserve
   | "VOID"
   | "KEY_ROTATION"   // carries the successor's root-signed certificate (+ revocation of the predecessor); signed by the SUCCESSOR
   | "RESEAL"         // after a compromise: the new key affirms a range of earlier entries as genuine

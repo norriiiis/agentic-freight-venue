@@ -68,6 +68,18 @@ export interface NegotiationTask {
   commitmentId?: string;
 }
 
+export type LifecycleEventType = "PICKED_UP" | "DELIVERED" | "POD" | "DELIVERY_ACCEPTED" | "DISPUTE_OPENED" | "DISPUTE_CLOSED" | "PAID";
+export interface LifecycleEvent {
+  event: LifecycleEventType;
+  by: string;           // agentId
+  at: string;           // when the party says it happened
+  recordedAt: string;   // when the venue recorded it
+  ledgerSeq: number;
+  /** sha256 of the proof-of-delivery document, invoice, etc. — the document itself stays with the parties. */
+  evidenceHash?: string;
+  note?: string;
+}
+
 export interface CommitmentRecord {
   commitmentId: string;
   taskId: string;
@@ -79,7 +91,10 @@ export interface CommitmentRecord {
   carrierUsdot: string;
   rateUsd: number;
   pickupWindowStart: string;
-  status: "ACTIVE" | "VOIDED" | "COMPLETED";
+  /** ACTIVE (not yet picked up) → IN_TRANSIT → DELIVERED → COMPLETED (delivery accepted); VOIDED from ACTIVE only. */
+  status: "ACTIVE" | "IN_TRANSIT" | "DELIVERED" | "COMPLETED" | "VOIDED";
+  /** What happened to the load after commitment, each event a signed party statement recorded on the ledger. */
+  lifecycle?: LifecycleEvent[];
   guaranteeId?: string;
   artifact: CommitmentArtifact;
   voided?: { at: string; reasonCode: ReasonCode; evidence: Record<string, unknown> };

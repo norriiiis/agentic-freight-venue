@@ -104,6 +104,9 @@ export class AgentHandle {
   commitments() { return httpGet<Record<string, unknown>[]>(`${this.url}/control/commitments`); }
   stateDigest() { return httpGet<{ agentId: string; dataDir: string; files: string[]; privateContextHash: string; knownAgentUrls: string[] }>(`${this.url}/control/state-digest`); }
   canary() { return httpGet<{ canary: string }>(`${this.url}/control/private-canary`); }
+  /** The party reports what happened to a committed load; the venue records it on the ledger. */
+  reportEvent(p: { commitmentId: string; event: string; at?: string; evidenceHash?: string; note?: string }) { return httpPost<{ ok: boolean; status?: string; ledgerSeq?: number; reasonCode?: string; error?: string; guarantee?: { status: string; claimWindowEndsAt?: string } }>(`${this.url}/control/event`, p); }
+  fileClaim(p: { commitmentId: string; peril: string; amountUsd: number; evidence?: Record<string, unknown> }) { return httpPost<{ ok: boolean; claim?: { claimId: string; status: string; decision?: { covered: boolean; reasonCode?: string; basis: string[]; payoutUsd: number } }; reasonCode?: string }>(`${this.url}/control/claim`, p); }
   /** The principal obtained a renewed COI from its insurer and hands it to its agent. */
   presentInsurance(att: InsurerAttestation) { return httpPost<{ ok: boolean; reasonCode?: string; evidence?: unknown; satisfied?: string[]; voided?: string[] }>(`${this.url}/control/present-insurance`, att); }
   /** Wait until this agent's own record of the task reaches a status (the venue's terminal state arrives asynchronously). */
@@ -144,6 +147,11 @@ export class VenueHandle {
   seedExposure(counterpartyUsdot: string, beneficiaryUsdot: string, amountUsd: number, day: string, note: string) { return httpPost<{ exposure: unknown }>(`${this.url}/admin/underwriting/seed-exposure`, { counterpartyUsdot, beneficiaryUsdot, amountUsd, day, note }); }
   seedHistory(usdot: string, history: Record<string, unknown>) { return httpPost(`${this.url}/admin/underwriting/seed-history`, { usdot, history }); }
   expireStaleTasks() { return httpPost<{ expired: { taskId: string; outcome: unknown }[] }>(`${this.url}/admin/expire-stale-tasks`, {}); }
+  history(usdot: string) { return httpGet<{ loadsCommitted: number; loadsCompleted: number; claimsPaid: number; disputesOpen: number }>(`${this.url}/admin/history?usdot=${usdot}`); }
+  claims() { return httpGet<{ claimId: string; status: string; decision?: { covered: boolean; basis: string[]; payoutUsd: number } }[]>(`${this.url}/admin/claims`); }
+  reserve() { return httpGet<{ initialCapitalUsd: number; premiumsUsd: number; payoutsUsd: number; exposureUsd: number; availableUsd: number }>(`${this.url}/admin/reserve`); }
+  decideClaim(p: { claimId: string; covered: boolean; reasonCode?: string; why: string; payoutUsd?: number }) { return httpPost<{ claimId: string; status: string } | null>(`${this.url}/admin/claims/decide`, p); }
+  addCapital(usd: number) { return httpPost<{ reserve: unknown; deferredPaid: string[] }>(`${this.url}/admin/reserve/capital`, { usd }); }
   jobs() { return httpGet<{ name: string; everyMs: number; runs: number; lastRunAt?: string; lastError?: string }[]>(`${this.url}/admin/jobs`); }
   runJob(name: string, now?: Date) { return httpPost<{ ok: boolean; result?: unknown; error?: string }>(`${this.url}/admin/jobs/run`, { name, now: now?.toISOString() }); }
   prePickupChecks(now?: Date) { return httpPost<{ voided: { commitmentId: string; voided: unknown }[] }>(`${this.url}/admin/pre-pickup-checks`, now ? { now: now.toISOString() } : {}); }

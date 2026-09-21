@@ -54,6 +54,10 @@ export interface UnderwritingParams {
   maxCounterpartyExposureUsd: number;
   maxPortfolioExposureUsd: number;
   lossGivenDefault: number;
+  /** Days after scheduled delivery during which a claim may be filed. */
+  claimWindowDays: number;
+  /** Capital the operator has put behind the guarantee, before any premium. */
+  initialCapitalUsd: number;
 }
 
 export const DEFAULT_PARAMS: UnderwritingParams = {
@@ -63,6 +67,8 @@ export const DEFAULT_PARAMS: UnderwritingParams = {
   minPremiumUsd: 12,
   maxCounterpartyExposureUsd: 40_000,
   maxPortfolioExposureUsd: 2_000_000,
+  claimWindowDays: 90,
+  initialCapitalUsd: 250_000,
   lossGivenDefault: 0.9,
 };
 

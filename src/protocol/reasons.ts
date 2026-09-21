@@ -95,6 +95,8 @@ export const REASONS = {
   VENUE_PORTFOLIO_LIMIT_EXCEEDED: "Venue's total guaranteed exposure would exceed its portfolio cap",
 
   // post-commitment
+  LIFECYCLE_EVENT_INVALID: "The lifecycle event is out of order for this commitment, or the party is not the one who may report it (pickup and delivery by the carrier; acceptance and payment by the broker)",
+  CLAIM_INVALID: "The claim names a commitment or guarantee the claimant is not party to, or a peril that is not a string",
   CREDENTIAL_REVOKED_PRE_PICKUP: "Counterparty credential revoked after commitment, before pickup; commitment voided",
   COMMITMENT_UNDER_COMPROMISED_KEY: "A party's acceptance was signed by a key later declared compromised as of a time before the signature; commitment voided",
 } as const;

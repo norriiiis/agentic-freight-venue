@@ -94,4 +94,6 @@ export interface LocalTask {
   myLastOffer?: Offer;
   commitmentId?: string;
   outcome?: { reasonCode: string; refusedBy: string; evidence: Record<string, unknown> };
+  /** The load after commitment, as the venue relayed the counterparty's statements. */
+  lifecycle?: { event: string; by: string; at: string; status: string; ledgerSeq: number }[];
 }
