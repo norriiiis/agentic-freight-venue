@@ -24,6 +24,8 @@ export interface MandateLimits {
   maxDailyExposureUsd: number;
   /** If true, the agent may only commit when a venue guarantee attaches. */
   requireGuarantee: boolean;
+  /** If true, the counterparty's own insurer must have attested coverage assured through the delivery window (no set of registry mirrors can forge that). */
+  requireInsurerAttestation?: boolean;
   /** May this agent tender loads to others (i.e. act as a broker)? Carriers: false. */
   mayTender: boolean;
   /** Bound on negotiation rounds this agent will participate in. */
@@ -70,6 +72,9 @@ export type MandateAction =
       round: number;
       counterpartyUsdot: string;
       counterpartyInsuranceUsd: number;
+      /** Through when the counterparty's own insurer has assured coverage (its signed word), if on file. */
+      counterpartyInsuranceAssuredThrough?: string;
+      deliveryWindowEnd?: string;
       guaranteeAvailable: boolean;
       day: string; // YYYY-MM-DD for the daily exposure bucket
     };

@@ -14,7 +14,7 @@ type LapseEvidence = { registry?: RegistryRef; registriesShowingThis?: string[];
 export const registryQuorum: Scenario = {
   id: "registry-quorum",
   title: "One registry is one party to trust: independent mirrors, unanimity on standing, and a verifier that names the registries it insists on",
-  summary: "Three vetting providers mirror the same upstream independently of each other and of the venue; the venue asks all three, needs two to have answered, and requires every answer to show the party in standing. Part 1: one mirror stops syncing and keeps signing the old record with a fresh clock — the other two have the cancellation, so the venue refuses, and the stale mirror's signed word beside its peers' is the evidence it answers for. Part 1b: the reverse — only one mirror has the filing yet; it outranks the two that do not, because a cancellation is news that cannot be un-known. Part 2: the venue quietly drops the mirror that says no and commits on the two that say yes; a verifier who accepts any two is satisfied, a verifier who NAMES the dropped mirror is not, and the mirrors' word fetched today settles it. Part 3: fewer mirrors than the quorum answer — the venue refuses rather than judge on one.",
+  summary: "Three vetting providers mirror the same upstream independently of each other and of the venue; the venue asks all three, needs two to have answered, and requires every answer to show the party in standing. Part 1: one mirror stops syncing yet claims a current sync (an honest one dates its last sync and drops out as stale) — the other two have the cancellation, so the venue refuses, and the stale mirror's signed word beside its peers' is the evidence it answers for. Part 1b: the reverse — only one mirror has the filing yet; it outranks the two that do not, because a cancellation is news that cannot be un-known. Part 2: the venue quietly drops the mirror that says no and commits on the two that say yes; a verifier who accepts any two is satisfied, a verifier who NAMES the dropped mirror is not, and the mirrors' word fetched today settles it. Part 3: fewer mirrors than the quorum answer — the venue refuses rather than judge on one.",
   expect: { outcome: "REFUSED", reasonCode: "REGISTRY_QUORUM_NOT_MET", refusedBy: "ledger/verify" },
   async run({ h, say }) {
     h.opts.venue = { registryQuorum: 2 };
@@ -35,24 +35,24 @@ export const registryQuorum: Scenario = {
     if (!v0.ok || art0.registry?.attestations.carrier.length !== 3) throw new Error("control: three-registry artifact did not verify");
 
     // ---- Part 1: a mirror that stopped syncing (or lies). The filing reaches the other two.
-    await a!.fault({ freeze: true });
+    await a!.fault({ freeze: true, claimsCurrent: true });
     const rec = await b!.record("2751903");
     await h.registryUpdate("2751903", { insurance: cancelBipd(rec.insurance, "2026-09-18") });
-    say(`part 1: ${a!.registryId} stops syncing (keeps signing the records it has, with a fresh clock). Great Plains Mutual files BMC-91X cancellation for PRAIRIE WIND, effective 2026-09-18: ${b!.registryId} and ${c!.registryId} have it; ${a!.registryId} still says insured.`);
+    say(`part 1: ${a!.registryId} stops syncing but claims a current sync (an honest one would date its last sync and drop out as stale). Great Plains Mutual files BMC-91X cancellation for PRAIRIE WIND, effective 2026-09-18: ${b!.registryId} and ${c!.registryId} have it; ${a!.registryId} still says insured.`);
     await new Promise((r) => setTimeout(r, policyMs + 200));
     const p1 = await negotiate(h, broker, carrier, { ...LOAD, loadRef: "L-2026-264-0601", commodity: "Bagged fertilizer, palletized", weightLbs: 41_600 });
     const r1 = await resultFromTask(h, p1.task!);
     const e1 = (r1.evidence ?? {}) as LapseEvidence;
     say(`   venue asks all three → ${r1.outcome} ${r1.reasonCode} (${r1.refusedBy}) on ${e1.registry?.registryId}'s word as of ${e1.registry?.asOf?.slice(11, 23)}Z; showing the lapse: ${e1.registriesShowingThis?.join(", ")}; dissenting: ${e1.dissentingRegistries?.map((d) => d.registryId).join(", ")} — ${e1.rule}`);
     if (r1.reasonCode !== "INSURANCE_LAPSED" || e1.dissentingRegistries?.[0]?.registryId !== a!.registryId) throw new Error("part 1: stale mirror not outvoted");
-    findings.push({ label: "part 1: one stale mirror cannot cause a commitment", reasonCode: "INSURANCE_LAPSED", by: "venue.identity", detail: `${a!.registryId} signed "insured" with a current clock; ${b!.registryId} and ${c!.registryId} signed the cancellation. Unanimity refuses, and the refusal records the dissent: a signed statement ${a!.registryId} is accountable for, next to its peers' signed statements to the contrary` });
+    findings.push({ label: "part 1: one stale mirror cannot cause a commitment", reasonCode: "INSURANCE_LAPSED", by: "venue.identity", detail: `${a!.registryId} signed "insured" with a current sync claim; ${b!.registryId} and ${c!.registryId} signed the cancellation. Unanimity refuses, and the refusal records the dissent: a signed statement ${a!.registryId} is accountable for, next to its peers' signed statements to the contrary. (An honestly stale mirror dates its last sync and is simply dropped as too old.)` });
 
     // ---- Part 1b: the reverse. Only one mirror has the filing yet — and it outranks the two that do not.
     await a!.fault({ freeze: false });
     const carrier2 = await h.startAgent(blueMesaCarrierSpec({ thinkMs: 60 }));
     await h.venue.seedHistory("1984411", CARRIER_HISTORY);
-    await b!.fault({ freeze: true });
-    await c!.fault({ freeze: true });
+    await b!.fault({ freeze: true, claimsCurrent: true });
+    await c!.fault({ freeze: true, claimsCurrent: true });
     const rec2 = await a!.record("1984411");
     await h.registryUpdate("1984411", { insurance: cancelBipd(rec2.insurance, "2026-09-19") });
     say(`part 1b: ${carrier2.spec.agentId} onboarded (all three vouch). Now ${b!.registryId} and ${c!.registryId} lag; Blue Mesa's insurer files a cancellation effective 2026-09-19 that only ${a!.registryId} has yet.`);

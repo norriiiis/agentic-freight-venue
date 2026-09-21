@@ -73,6 +73,14 @@ export function evaluateMandate(limits: MandateLimits, action: MandateAction, ex
     if (limits.requireGuarantee && !action.guaranteeAvailable) {
       v.push({ code: "MANDATE_GUARANTEE_REQUIRED", evidence: { requireGuarantee: true, guaranteeAvailable: false } });
     }
+    if (limits.requireInsurerAttestation) {
+      checked.push("insurerAttestation");
+      const assured = action.counterpartyInsuranceAssuredThrough ? new Date(action.counterpartyInsuranceAssuredThrough) : undefined;
+      const needed = action.deliveryWindowEnd ? new Date(action.deliveryWindowEnd) : undefined;
+      if (!assured || !needed || assured < needed) {
+        v.push({ code: "MANDATE_INSURER_ATTESTATION_REQUIRED", evidence: { counterpartyInsuranceAssuredThrough: action.counterpartyInsuranceAssuredThrough ?? null, deliveryWindowEnd: action.deliveryWindowEnd, note: assured ? "the insurer's own word assures coverage only through the earlier date; beyond it only registry mirrors vouch" : "no insurer attestation on file for the counterparty" } });
+      }
+    }
     if (exposure) {
       checked.push("exposure.counterparty");
       const cp = exposure.outstanding(action.counterpartyUsdot);
@@ -101,6 +109,7 @@ export function envelopeToLimits(e: MandateEnvelope): MandateLimits {
     maxPerCounterpartyExposureUsd: e.limits.maxPerCounterpartyExposureUsd,
     maxDailyExposureUsd: e.limits.maxDailyExposureUsd,
     requireGuarantee: e.limits.requireGuarantee,
+    requireInsurerAttestation: e.limits.requireInsurerAttestation,
     mayTender: true, // brokerage authority is checked by the venue against the registry, not the envelope
     maxNegotiationRounds: Number.MAX_SAFE_INTEGER, // protocol bound is the venue's own, not the envelope's
     paymentTermsDays: { min: 0, max: 365 },

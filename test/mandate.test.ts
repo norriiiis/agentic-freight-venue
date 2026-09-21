@@ -72,6 +72,13 @@ describe("mandate engine refuses its own principal's agent", () => {
   });
   it("refuses to commit without a guarantee when one is required", () => {
     expect(evaluateMandate(LIMITS, { ...baseAccept, guaranteeAvailable: false }).violations.map((x) => x.code)).toContain("MANDATE_GUARANTEE_REQUIRED");
+    // The counterparty's own insurer must have vouched through delivery — the one word no registry mirror can forge.
+    const strict = { ...LIMITS, requireInsurerAttestation: true };
+    const codes = (a: Partial<MandateAction>) => evaluateMandate(strict, { ...baseAccept, ...a } as MandateAction).violations.map((x) => x.code);
+    expect(codes({ deliveryWindowEnd: "2026-09-24T21:00:00.000Z" })).toContain("MANDATE_INSURER_ATTESTATION_REQUIRED");
+    expect(codes({ deliveryWindowEnd: "2026-09-24T21:00:00.000Z", counterpartyInsuranceAssuredThrough: "2026-09-23T00:00:00.000Z" })).toContain("MANDATE_INSURER_ATTESTATION_REQUIRED");
+    expect(codes({ deliveryWindowEnd: "2026-09-24T21:00:00.000Z", counterpartyInsuranceAssuredThrough: "2026-10-20T00:00:00.000Z" })).not.toContain("MANDATE_INSURER_ATTESTATION_REQUIRED");
+    expect(evaluateMandate(LIMITS, { ...baseAccept, deliveryWindowEnd: "2026-09-24T21:00:00.000Z" }).violations.map((x) => x.code)).not.toContain("MANDATE_INSURER_ATTESTATION_REQUIRED");
   });
   it("refuses when per-counterparty exposure would be exceeded", () => {
     const book = new ExposureBook();

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { generateKeyPair, signJws } from "../src/protocol/crypto";
-import { attestationFreshAt, signAttestation, standing, verifyAttestation, type RegistryAttestation, type RegistryRecord } from "../src/protocol/registry";
+import { attestationFreshAt, contradictedBy, coverageAssuredThrough, filingsShownBy, insurerStanding, signAttestation, signInsurerAttestation, standing, verifyAttestation, verifyInsurerAttestation, type RegistryAttestation, type RegistryRecord } from "../src/protocol/registry";
 import { buildArtifact, verifyArtifact } from "../src/ledger/artifact";
 import { signCert } from "../src/protocol/venue-keys";
 import { buildMessage, signMessage } from "../src/protocol/envelope";
@@ -217,6 +217,95 @@ describe("artifact carries the registry's word", () => {
       const v = verifyArtifact(artifact, { pinnedRootKey: root, registryKeys: keys, currentAttestations: today });
       expect(v).toMatchObject({ ok: false, reasonCode: "REGISTRY_CONTRADICTS_COMMITMENT" });
       expect(v.checks.find((c) => c.name === "carrier.registry.standing-per-current-record")?.detail).toMatch(/mirror-a.*INSURANCE_LAPSED.*mirror-b say otherwise/);
+    });
+  });
+
+  describe("accountability and the origin", () => {
+    const A = generateKeyPair(), B = generateKeyPair();
+    const keys = [{ registryId: "mirror-a", publicKey: A.publicJwk }, { registryId: "mirror-b", publicKey: B.publicJwk }];
+    const ins = generateKeyPair();
+    const insurerKey = { witnessId: "gpm", publicKey: ins.publicJwk };
+    const now = new Date();
+    const dayOff = (d: number) => new Date(now.getTime() + d * 86_400_000).toISOString().slice(0, 10);
+    const withFiling = (rec: RegistryRecord, filed: string, effective: string): RegistryRecord => ({ ...rec, insurance: rec.insurance.map((f) => (f.type === "BIPD" ? { ...f, cancellationDate: effective, cancellationFiledDate: filed } : f)) });
+    const policy = { usdot: CARRIER, policyNumber: "TRK-0092817-24", type: "BIPD" as const, form: "BMC-91X" as const, coverageToUsd: 1_000_000, effectiveDate: "2025-07-01" };
+
+    it("freshness is judged on the mirror's sync claim, not its signing clock", () => {
+      // An honest frozen mirror: signed now, synced an hour ago — stale under a 5-minute policy.
+      const honest = signAttestation(A, "mirror-a", CARRIER, pub(CARRIER), now, new Date(now.getTime() - 3_600_000));
+      expect(attestationFreshAt(honest, now, 300_000).ok).toBe(false);
+      // A lying frozen mirror: claims a current sync — passes freshness, and answers for the record.
+      const liar = signAttestation(A, "mirror-a", CARRIER, pub(CARRIER), now, now);
+      expect(attestationFreshAt(liar, now, 300_000).ok).toBe(true);
+    });
+
+    it("a mirror claiming a sync after a filing it does not show has signed a falsehood", () => {
+      const liar = signAttestation(A, "mirror-a", CARRIER, pub(CARRIER), now, now);
+      const honest = signAttestation(B, "mirror-b", CARRIER, withFiling(pub(CARRIER), dayOff(-1), dayOff(29)), now, now);
+      const proof = contradictedBy(liar, filingsShownBy(honest));
+      expect(proof).toMatchObject({ registryId: "mirror-a", missing: { source: "mirror-b", cancellationFiledDate: dayOff(-1) } });
+      // An honest lagging mirror whose sync predates the filing is not contradicted — merely stale.
+      const lagging = signAttestation(A, "mirror-a", CARRIER, pub(CARRIER), now, new Date(now.getTime() - 3 * 86_400_000));
+      expect(contradictedBy(lagging, filingsShownBy(honest))).toBeUndefined();
+      // Showing the same filing is not a contradiction; showing it filed later than claimed sync neither.
+      expect(contradictedBy(honest, filingsShownBy(honest))).toBeUndefined();
+    });
+
+    it("the insurer's word: signed, assured through the statutory notice, and standing per its own disclosure", () => {
+      const coi = signInsurerAttestation(ins, "gpm", policy, now);
+      expect(verifyInsurerAttestation(coi, ins.publicJwk)).toBe(true);
+      expect(verifyInsurerAttestation(coi, generateKeyPair().publicJwk)).toBe(false);
+      expect(coverageAssuredThrough(coi).getTime()).toBe(now.getTime() + 30 * 86_400_000);
+      expect(insurerStanding(coi, now, new Date(now.getTime() + 20 * 86_400_000)).ok).toBe(true);
+      const disclosed = signInsurerAttestation(ins, "gpm", { ...policy, cancellation: { filedDate: dayOff(-1), effectiveDate: dayOff(29) } }, now);
+      expect(coverageAssuredThrough(disclosed).toISOString().slice(0, 10)).toBe(dayOff(29));
+      expect(insurerStanding(disclosed, now, new Date(now.getTime() + 35 * 86_400_000))).toMatchObject({ ok: false, reasonCode: "INSURANCE_CANCELLATION_PENDING" });
+      expect(insurerStanding(disclosed, new Date(now.getTime() + 40 * 86_400_000))).toMatchObject({ ok: false, reasonCode: "INSURANCE_LAPSED" });
+    });
+
+    it("REGISTRY_FALSE_ATTESTATION: a colluding mirror in the artifact is convicted by any honest word", () => {
+      const filedRec = withFiling(pub(CARRIER), dayOff(-1), dayOff(60)); // cancels well after delivery: standing fine, the lie is about the record
+      const liar = signAttestation(A, "mirror-a", CARRIER, pub(CARRIER), now, now);
+      const honest = signAttestation(B, "mirror-b", CARRIER, filedRec, now, now);
+      // In the artifact itself: the venue embedded both, and mirror-b's word convicts mirror-a's (disagreement too, but the lie ranks first).
+      const both = makeArtifact(A, { broker: [signAttestation(A, "mirror-a", BROKER, pub(BROKER)), signAttestation(B, "mirror-b", BROKER, pub(BROKER))], carrier: [liar, honest] }, 60_000, { registries: keys, quorum: 2 });
+      expect(verifyArtifact(both.artifact, { pinnedRootKey: both.root, registryKeys: keys })).toMatchObject({ ok: false, reasonCode: "REGISTRY_FALSE_ATTESTATION" });
+      // Only the liar embedded (quorum 1); the honest mirror's word today convicts it.
+      const alone = makeArtifact(A, { broker: signAttestation(A, "mirror-a", BROKER, pub(BROKER)), carrier: liar }, 60_000, { registries: keys, quorum: 1 });
+      expect(verifyArtifact(alone.artifact, { pinnedRootKey: alone.root, registryKeys: keys }).ok).toBe(true);
+      const v = verifyArtifact(alone.artifact, { pinnedRootKey: alone.root, registryKeys: keys, currentAttestations: [signAttestation(B, "mirror-b", CARRIER, filedRec, new Date(now.getTime() + 3_600_000))] });
+      expect(v).toMatchObject({ ok: false, reasonCode: "REGISTRY_FALSE_ATTESTATION" });
+      expect(v.checks.find((c) => c.name === "carrier.registry[mirror-a].true-when-signed")?.detail).toContain("mirror-b show");
+      // …or by the origin's word, which discloses the filing.
+      const originsWord = signInsurerAttestation(ins, "gpm", { ...policy, cancellation: { filedDate: dayOff(-1), effectiveDate: dayOff(60) } }, now);
+      expect(verifyArtifact(alone.artifact, { pinnedRootKey: alone.root, registryKeys: keys, insurerKeys: [insurerKey], currentInsurerAttestations: [originsWord] })).toMatchObject({ ok: false, reasonCode: "REGISTRY_FALSE_ATTESTATION" });
+    });
+
+    it("the origin's word in the artifact: required, assured through delivery, and contradicting", () => {
+      const honest = signAttestation(A, "mirror-a", CARRIER, pub(CARRIER), now, now);
+      const base = { broker: signAttestation(A, "mirror-a", BROKER, pub(BROKER)), carrier: honest };
+      const without = makeArtifact(A, base, 60_000, { registries: keys, quorum: 1 });
+      expect(verifyArtifact(without.artifact, { pinnedRootKey: without.root, registryKeys: keys, insurerKeys: [insurerKey], requireInsurerAttestation: true })).toMatchObject({ ok: false, reasonCode: "INSURER_ATTESTATION_MISSING" });
+      expect(verifyArtifact(without.artifact, { pinnedRootKey: without.root, registryKeys: keys }).ok).toBe(true);
+      // With a COI: LOAD delivers within the statutory window of a word signed now.
+      const coi = signInsurerAttestation(ins, "gpm", policy, now);
+      const withCoi = { ...without.artifact, insurance: { carrier: coi } };
+      // (re-attesting is the venue's job; here the content hash changes, so only the insurer checks are inspected)
+      const v = verifyArtifact(withCoi, { pinnedRootKey: without.root, registryKeys: keys, insurerKeys: [insurerKey], requireInsurerAttestation: true });
+      expect(v.checks.find((c) => c.name === "carrier.insurer.assured-through-delivery")?.ok).toBe(true);
+      expect(v.checks.find((c) => c.name === "carrier.insurer[gpm].signed")?.ok).toBe(true);
+      // A COI signed 40 days before commitment assures only through 10 days before it: not through delivery.
+      const old = signInsurerAttestation(ins, "gpm", policy, new Date(now.getTime() - 40 * 86_400_000));
+      const vOld = verifyArtifact({ ...without.artifact, insurance: { carrier: old } }, { pinnedRootKey: without.root, registryKeys: keys, insurerKeys: [insurerKey], requireInsurerAttestation: true });
+      expect(vOld.checks.find((c) => c.name === "carrier.insurer.assured-through-delivery")?.ok).toBe(false);
+      // A COI disclosing a cancellation before delivery contradicts the commitment.
+      const disclosed = signInsurerAttestation(ins, "gpm", { ...policy, cancellation: { filedDate: dayOff(-31), effectiveDate: dayOff(-1) } }, now);
+      const vBad = verifyArtifact({ ...without.artifact, insurance: { carrier: disclosed } }, { pinnedRootKey: without.root, registryKeys: keys, insurerKeys: [insurerKey] });
+      expect(vBad.checks.find((c) => c.name === "carrier.insurer.standing-at-commitment")?.ok).toBe(false);
+      // Forged under another key: invalid.
+      const forged = signInsurerAttestation(generateKeyPair(), "gpm", policy, now);
+      const vForged = verifyArtifact({ ...without.artifact, insurance: { carrier: forged } }, { pinnedRootKey: without.root, registryKeys: keys, insurerKeys: [insurerKey] });
+      expect(vForged.checks.find((c) => c.name === "carrier.insurer[gpm].signed")?.ok).toBe(false);
     });
   });
 });

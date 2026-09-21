@@ -15,7 +15,7 @@ import { verifyMessageSignature } from "../protocol/envelope";
 import type { ReasonCode } from "../protocol/reasons";
 import type { Credential, CredentialStatusEntry } from "../protocol/types";
 import type { VenueKeyResolver } from "../protocol/venue-keys";
-import { registryRef, standing, type InsuranceStatus, type RegistryRef, type RegistryView } from "../protocol/registry";
+import { contradictedBy, filingShownByInsurer, filingsShownBy, insurerStanding, registryRef, standing, type FalseAttestationProof, type InsuranceStatus, type InsurerAttestation, type RegistryRef, type RegistryView } from "../protocol/registry";
 
 export interface Verdict {
   ok: boolean;
@@ -106,6 +106,10 @@ export interface LiveCheckResult extends Verdict {
   registry?: RegistryRef;
   /** Every registry whose fresh word was considered. */
   registries?: RegistryRef[];
+  /** The origin's word, if on file: who, through when coverage is assured by that word alone. */
+  insurer?: { insurerId: string; policyNumber: string; asOf: string; assuredThrough: string };
+  /** Mirrors whose signed word is contradicted by a filing someone else's signed word shows: proofs, not suspicions. */
+  falseAttestations?: FalseAttestationProof[];
 }
 
 /**
@@ -121,7 +125,7 @@ export interface LiveCheckResult extends Verdict {
 export function liveCheck(
   registry: RegistryView,
   cred: Credential,
-  opts: { now?: Date; hazmat?: boolean; requiredBipdUsd?: number; through?: Date } = {},
+  opts: { now?: Date; hazmat?: boolean; requiredBipdUsd?: number; through?: Date; insurer?: InsurerAttestation } = {},
 ): LiveCheckResult {
   const now = opts.now ?? new Date();
   const usdot = cred.subject.entity.usdot;
@@ -129,15 +133,28 @@ export function liveCheck(
   const stOpts = { hazmat: opts.hazmat, requiredBipdUsd: opts.requiredBipdUsd, through: opts.through };
   const drift = { credentialIssuedWithSnapshot: cred.evidence.registrySnapshotHash, snapshotChangedSinceIssuance: cred.evidence.registrySnapshotHash !== snapshot };
   const atts = registry.attestations?.(usdot) ?? [];
+  // The origin's word, if on file, is one more signed statement that must agree — and the one no mirror can forge.
+  const ins = opts.insurer && opts.insurer.usdot === usdot ? opts.insurer : undefined;
+  const insSt = ins ? insurerStanding(ins, now, opts.through) : undefined;
+  const insurer = ins && insSt ? { insurerId: ins.insurerId, policyNumber: ins.policyNumber, asOf: ins.asOf, assuredThrough: insSt.assuredThrough } : undefined;
+  // Accountability: a mirror claiming a sync after a filing that its record lacks has signed a falsehood.
+  const evidence = [...atts.flatMap(filingsShownBy), ...(ins ? [filingShownByInsurer(ins)].filter((x): x is NonNullable<typeof x> => !!x) : [])];
+  const falseAttestations = atts.map((a) => contradictedBy(a, evidence)).filter((x): x is FalseAttestationProof => !!x);
+  const proofs = falseAttestations.length ? { falseAttestations: falseAttestations.map((f) => ({ registryId: f.registryId, claimedSyncAt: f.claimedSyncAt, missing: f.missing })) } : {};
   if (atts.length === 0) {
     // A bare store (tests): one record, no signer.
     const st = standing(registry.get(usdot) ?? null, now, stOpts);
-    if (!st.ok) return { ok: false, reasonCode: st.reasonCode, insurance: st.insurance, registrySnapshotHash: snapshot, evidence: { ...st.evidence, registrySnapshotHash: snapshot, ...drift } };
-    return { ok: true, insurance: st.insurance, brokerAuthority: st.brokerAuthority, registrySnapshotHash: snapshot, evidence: { ...st.evidence, registrySnapshotHash: snapshot } };
+    if (!st.ok) return { ok: false, reasonCode: st.reasonCode, insurance: st.insurance, registrySnapshotHash: snapshot, insurer, evidence: { ...st.evidence, registrySnapshotHash: snapshot, ...drift } };
+    if (insSt && !insSt.ok) return { ok: false, reasonCode: insSt.reasonCode, insurance: st.insurance, registrySnapshotHash: snapshot, insurer, evidence: { ...insSt.evidence, source: `insurer:${ins!.insurerId}`, registrySnapshotHash: snapshot } };
+    return { ok: true, insurance: st.insurance, brokerAuthority: st.brokerAuthority, registrySnapshotHash: snapshot, insurer, evidence: { ...st.evidence, registrySnapshotHash: snapshot, insurer } };
   }
   const verdicts = atts.map((a) => ({ ref: registryRef(a), st: standing(a.record, now, stOpts) }));
   const refs = verdicts.map((v) => v.ref);
   const bad = verdicts.find((v) => !v.st.ok);
+  if (!bad && insSt && !insSt.ok) {
+    // Every mirror says fine; the origin says otherwise. The origin wins, and the mirrors that claim currency answer for it.
+    return { ok: false, reasonCode: insSt.reasonCode, insurance: verdicts[0]!.st.insurance, registrySnapshotHash: snapshot, registries: refs, insurer, falseAttestations, evidence: { ...insSt.evidence, source: `insurer:${ins!.insurerId}`, registries: refs, dissentingRegistries: refs, rule: "the origin's word outranks every mirror", ...proofs, ...drift } };
+  }
   if (bad) {
     const agreeing = verdicts.filter((v) => !v.st.ok).map((v) => v.ref.registryId);
     const dissenting = verdicts.filter((v) => v.st.ok).map((v) => v.ref);
@@ -157,13 +174,16 @@ export function liveCheck(
         // Signed word to the contrary from other registries: stale mirrors, or liars — either way, accountable.
         dissentingRegistries: dissenting.length ? dissenting : undefined,
         rule: atts.length > 1 ? "unanimity: any registry's word of a lapse blocks" : undefined,
+        ...proofs,
         ...drift,
       },
+      insurer,
+      falseAttestations,
     };
   }
   // All in standing: report the most conservative figures any registry shows.
   const first = verdicts[0]!.st;
   const min = (pick: (i: InsuranceStatus) => number) => Math.min(...verdicts.map((v) => pick(v.st.insurance!)));
   const insurance: InsuranceStatus = { ...first.insurance!, bipdCoverageUsd: min((i) => i.bipdCoverageUsd), cargoCoverageUsd: min((i) => i.cargoCoverageUsd), bondUsd: min((i) => i.bondUsd) };
-  return { ok: true, insurance, brokerAuthority: verdicts.every((v) => v.st.brokerAuthority), registrySnapshotHash: snapshot, registry: refs[0], registries: refs, evidence: { ...first.evidence, bipdUsd: insurance.bipdCoverageUsd, cargoUsd: insurance.cargoCoverageUsd, bondUsd: insurance.bondUsd, registrySnapshotHash: snapshot, registries: refs } };
+  return { ok: true, insurance, brokerAuthority: verdicts.every((v) => v.st.brokerAuthority), registrySnapshotHash: snapshot, registry: refs[0], registries: refs, insurer, falseAttestations, evidence: { ...first.evidence, bipdUsd: insurance.bipdCoverageUsd, cargoUsd: insurance.cargoCoverageUsd, bondUsd: insurance.bondUsd, registrySnapshotHash: snapshot, registries: refs, insurer, ...proofs } };
 }

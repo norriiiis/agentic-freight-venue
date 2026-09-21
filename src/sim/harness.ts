@@ -26,7 +26,7 @@ import type { AuditEntry } from "../protocol/audit";
 import type { NegotiationTask, CommitmentRecord } from "../venue/state";
 import type { LedgerEntry } from "../ledger/chain";
 import type { Message, Task } from "../protocol/a2a";
-import type { RegistryAttestation, RegistryKey, RegistryRecord } from "../protocol/registry";
+import { signInsurerAttestation, type InsurerAttestation, type RegistryAttestation, type RegistryKey, type RegistryRecord } from "../protocol/registry";
 import type { LoadSpec, NegotiationPayload } from "../protocol/freight";
 import type { LocalTask } from "../agentkit/types";
 
@@ -64,6 +64,8 @@ export interface AgentSpec {
   /** Override which envelope limits are disclosed to the venue. */
   envelopeDisclose?: Partial<MandateEnvelope["limits"]>;
   registerEnvelope?: boolean;
+  /** The COI on file: the principal's insurer's signed word, written into the agent's dir as insurance.json. */
+  insurerAttestation?: InsurerAttestation;
 }
 
 export class AgentHandle {
@@ -101,6 +103,8 @@ export class AgentHandle {
   commitments() { return httpGet<Record<string, unknown>[]>(`${this.url}/control/commitments`); }
   stateDigest() { return httpGet<{ agentId: string; dataDir: string; files: string[]; privateContextHash: string; knownAgentUrls: string[] }>(`${this.url}/control/state-digest`); }
   canary() { return httpGet<{ canary: string }>(`${this.url}/control/private-canary`); }
+  /** The principal obtained a renewed COI from its insurer and hands it to its agent. */
+  presentInsurance(att: InsurerAttestation) { return httpPost<{ ok: boolean; reasonCode?: string; evidence?: unknown }>(`${this.url}/control/present-insurance`, att); }
   /** Wait until this agent's own record of the task reaches a status (the venue's terminal state arrives asynchronously). */
   async waitStatus(taskId: string, statuses: LocalTask["status"][], timeoutMs = 8000): Promise<LocalTask | undefined> {
     const start = Date.now();
@@ -257,7 +261,7 @@ export class VenueHandle {
 /** The registry process: the mock FMCSA L&I authority, with its own key and clock. Neither the venue nor the harness can sign for it. */
 export class RegistryHandle {
   constructor(readonly registryId: string, readonly dir: string, readonly url: string, readonly proc: ChildProcess) {}
-  status() { return httpGet<{ registryId: string; kid: string; records: number; attestationsServed: number; unavailable: boolean; frozen: boolean }>(`${this.url}/health`); }
+  status() { return httpGet<{ registryId: string; kid: string; records: number; attestationsServed: number; unavailable: boolean; frozen: boolean; claimsCurrent: boolean }>(`${this.url}/health`); }
   async key(): Promise<RegistryKey> { return httpGet<RegistryKey>(`${this.url}/.well-known/registry.json`); }
   records() { return httpGet<RegistryRecord[]>(`${this.url}/records`); }
   record(usdot: string) { return this.records().then((rs) => rs.find((r) => r.usdot === usdot)!); }
@@ -265,8 +269,8 @@ export class RegistryHandle {
   attest(usdot: string) { return httpGet<RegistryAttestation>(`${this.url}/attest?usdot=${usdot}`); }
   /** SIM: an insurer files a cancellation / FMCSA revokes — with the REGISTRY. Nobody tells the venue. */
   update(usdot: string, patch: Partial<RegistryRecord>) { return httpPost<{ ok: boolean; recordHash: string }>(`${this.url}/admin/update`, { usdot, patch }); }
-  /** SIM: the registry goes dark, or freezes — keeps signing the records it has, with a fresh clock (a mirror that stopped syncing, or lies). */
-  fault(f: { unavailable?: boolean; freeze?: boolean }) { return httpPost<{ unavailable: boolean; frozen: boolean }>(`${this.url}/admin/fault`, f); }
+  /** SIM: the registry goes dark, or freezes — keeps signing the records it has. Honest: its sync claim stops advancing. `claimsCurrent`: it lies about its sync. */
+  fault(f: { unavailable?: boolean; freeze?: boolean; claimsCurrent?: boolean }) { return httpPost<{ unavailable: boolean; frozen: boolean; claimsCurrent: boolean }>(`${this.url}/admin/fault`, f); }
 }
 
 export class WitnessHandle {
@@ -416,6 +420,15 @@ export class Harness {
   }
 
   /**
+   * An INSURER: the origin of the filing every registry mirrors. Registered with the venue like any source; signs
+   * coverage attestations (a COI) that the insured presents. The harness plays the insurer's signing desk.
+   */
+  async startInsurer(insurerId: string): Promise<{ insurerId: string; kp: KeyPair; attest: (fields: Parameters<typeof signInsurerAttestation>[2], now?: Date) => InsurerAttestation }> {
+    const src = await this.startNoticeSource(insurerId);
+    return { insurerId, kp: src.kp, attest: (fields, now) => signInsurerAttestation(src.kp, insurerId, fields, now) };
+  }
+
+  /**
    * Start an independent witness process and register its key with the venue (in production: operator
    * configuration). `peers` are other witnesses it gossips with — their ids, URLs and keys are distributed out
    * of band, exactly like CT monitor keys; neither the venue nor the peers can add themselves.
@@ -461,6 +474,7 @@ export class Harness {
     writeFileSync(join(dir, "mandate.json"), JSON.stringify(mandate, null, 2));
     if (spec.registerEnvelope !== false) writeFileSync(join(dir, "envelope.json"), JSON.stringify(issueEnvelope(principal, mandate, spec.envelopeDisclose), null, 2));
     writeFileSync(join(dir, "private.json"), JSON.stringify(spec.privateContext, null, 2));
+    if (spec.insurerAttestation) writeFileSync(join(dir, "insurance.json"), JSON.stringify(spec.insurerAttestation, null, 2));
     const port = await freePort();
     const config: AgentConfig = {
       agentId: spec.agentId,

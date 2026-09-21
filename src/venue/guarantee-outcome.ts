@@ -28,6 +28,7 @@ export function guaranteeWouldHavePaid(code: ReasonCode): string {
     case "MANDATE_EXPOSURE_COUNTERPARTY_EXCEEDED":
     case "MANDATE_EXPOSURE_DAILY_EXCEEDED":
     case "MANDATE_GUARANTEE_REQUIRED":
+    case "MANDATE_INSURER_ATTESTATION_REQUIRED":
       return "N/A — no transaction formed. A mandate refusal is the principal's own control, not an insured peril. A rogue agent that bypassed both the local and venue mandate check would be CONTROLS_BYPASSED: excluded.";
     case "VENUE_EXPOSURE_LIMIT_EXCEEDED":
     case "VENUE_PORTFOLIO_LIMIT_EXCEEDED":
@@ -40,6 +41,10 @@ export function guaranteeWouldHavePaid(code: ReasonCode): string {
     case "REGISTRY_ATTESTATION_MISSING":
     case "REGISTRY_QUORUM_NOT_MET":
     case "REGISTRY_DISAGREEMENT":
+    case "REGISTRY_FALSE_ATTESTATION":
+    case "INSURER_CONTRADICTS_COMMITMENT":
+    case "INSURANCE_NOT_ASSURED_THROUGH_DELIVERY":
+    case "INSURER_ATTESTATION_MISSING":
       return "The guarantee was attached on the venue's say-so, and the artifact shows that say-so was not backed by the registry's word at the time. The venue's own evidence indicts it: a claim against the venue, not against the guarantee's exclusions.";
     case "NEGOTIATION_MAX_ROUNDS":
     case "NEGOTIATION_WALKAWAY":

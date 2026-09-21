@@ -27,7 +27,7 @@ import { AuditLog, type Component } from "../protocol/audit";
 import { rpcCall, RpcRefusal } from "../protocol/rpc";
 import type { Credential, MandateEnvelope, RotationAuthorization, RotationClaims } from "../protocol/types";
 import { RegistryMirror, RegistryUnavailable, type RegistrySource } from "../identity/registry-mirror";
-import { hasBrokerAuthority, insuranceStatus, type RegistryAttestation, type RegistryKey } from "../protocol/registry";
+import { hasBrokerAuthority, insuranceStatus, verifyInsurerAttestation, type InsurerAttestation, type RegistryAttestation } from "../protocol/registry";
 import { StubVettingProvider } from "../identity/vetting";
 import { CredentialIssuer } from "../identity/issuer";
 import { liveCheck, signatureTrustedAt, verifyCredential, verifyPresentation, type LiveCheckResult } from "../identity/verifier";
@@ -140,7 +140,11 @@ export class VenueService {
    * why the lie is detectable.
    */
   private live(cred: Credential, opts: Parameters<typeof liveCheck>[2] = {}): LiveCheckResult {
-    const r = liveCheck(this.registry, cred, opts);
+    const insurer = this.state.agents.get(cred.subject.agentId)?.insurerAttestation;
+    const r = liveCheck(this.registry, cred, { ...opts, insurer });
+    if (r.falseAttestations?.length) {
+      for (const f of r.falseAttestations) this.audit.writeOnce(`false-attestation:${f.registryId}:${f.usdot}:${f.claimedSyncAt}`, { component: "venue.identity", event: "registry-false-attestation", outcome: "INFO", reasonCode: "REGISTRY_FALSE_ATTESTATION", subject: f.registryId, evidence: { usdot: f.usdot, claimedSyncAt: f.claimedSyncAt, missing: f.missing, kid: f.attestation.kid } });
+    }
     if (!r.ok && this.simFault?.ignoreRegistry && process.env.SIM_MODE === "1") {
       const rec = this.registry.get(cred.subject.entity.usdot);
       const now = opts.now ?? new Date();
@@ -354,7 +358,36 @@ export class VenueService {
     return b;
   }
 
-  async onboard(params: { card: AgentCard; claimed: { usdot: string; mc?: string }; proofOfControl: { method: string; token: string }; agentUrl: string; envelope?: MandateEnvelope }) {
+  /**
+   * The insurer's own signed word about a party's filing — a COI, presented by the party. Verified under the insurer's
+   * registered key (insurers register as notice sources) and against the party's entity; kept on file and used in
+   * every standing check as one more statement that must agree, and the one no registry mirror can forge.
+   */
+  private checkInsurerAttestation(a: InsurerAttestation, usdot: string): Record<string, unknown> | undefined {
+    const src = this.state.noticeSources.find((x) => x.sourceId === a.insurerId);
+    if (!src) return { error: "insurer is not a registered source", insurerId: a.insurerId };
+    if (!verifyInsurerAttestation(a, src.publicKey)) return { error: "insurer attestation does not verify under the registered key", insurerId: a.insurerId };
+    if (a.usdot !== usdot) return { error: "insurer attestation is about another entity", attested: a.usdot, entity: usdot };
+    return undefined;
+  }
+
+  async presentInsurance(params: { agentId: string; attestation: InsurerAttestation }) {
+    const reg = this.state.agents.get(params.agentId);
+    if (!reg) throw new Refusal("PROTOCOL_VIOLATION", "venue.protocol", { error: "unknown agent", agentId: params.agentId });
+    const cred = this.issuer.get(reg.credentialId)!;
+    const bad = this.checkInsurerAttestation(params.attestation, cred.subject.entity.usdot);
+    if (bad) {
+      this.audit.write({ component: "venue.identity", event: "present-insurance", outcome: "REFUSED", reasonCode: "INSURER_ATTESTATION_INVALID", subject: params.agentId, evidence: bad });
+      throw new Refusal("INSURER_ATTESTATION_INVALID", "venue.identity", bad);
+    }
+    if (reg.insurerAttestation && new Date(params.attestation.asOf) < new Date(reg.insurerAttestation.asOf)) throw new Refusal("INSURER_ATTESTATION_INVALID", "venue.identity", { error: "older than the attestation on file", onFile: reg.insurerAttestation.asOf, presented: params.attestation.asOf });
+    reg.insurerAttestation = params.attestation;
+    this.state.persist();
+    this.audit.write({ component: "venue.identity", event: "present-insurance", outcome: "ALLOWED", subject: params.agentId, evidence: { insurerId: params.attestation.insurerId, policyNumber: params.attestation.policyNumber, asOf: params.attestation.asOf, cancellation: params.attestation.cancellation ?? null } });
+    return { ok: true, insurerId: params.attestation.insurerId, asOf: params.attestation.asOf };
+  }
+
+  async onboard(params: { card: AgentCard; claimed: { usdot: string; mc?: string }; proofOfControl: { method: string; token: string }; agentUrl: string; envelope?: MandateEnvelope; insurerAttestation?: InsurerAttestation }) {
     const cardCheck = verifyAgentCard(params.card);
     if (!cardCheck.ok || !cardCheck.jwk) throw new Refusal("IDENTITY_SIGNATURE_INVALID", "venue.identity", { error: cardCheck.error, stage: "agent-card" });
     const agentId = String(params.card.metadata?.agentId ?? params.card.name);
@@ -372,7 +405,16 @@ export class VenueService {
       }
       envelope = params.envelope;
     }
-    const reg: RegisteredAgent = { agentId, credentialId: res.credential.credentialId, previousCredentialIds: [], url: params.agentUrl, card: params.card, envelope, registeredAt: new Date().toISOString() };
+    let insurerAttestation: InsurerAttestation | undefined;
+    if (params.insurerAttestation) {
+      const bad = this.checkInsurerAttestation(params.insurerAttestation, params.claimed.usdot);
+      if (bad) {
+        this.audit.write({ component: "venue.identity", event: "present-insurance", outcome: "REFUSED", reasonCode: "INSURER_ATTESTATION_INVALID", subject: agentId, evidence: bad });
+        throw new Refusal("INSURER_ATTESTATION_INVALID", "venue.identity", bad);
+      }
+      insurerAttestation = params.insurerAttestation;
+    }
+    const reg: RegisteredAgent = { agentId, credentialId: res.credential.credentialId, previousCredentialIds: [], url: params.agentUrl, card: params.card, envelope, insurerAttestation, registeredAt: new Date().toISOString() };
     this.state.agents.set(agentId, reg);
     this.state.persist();
     this.audit.write({ component: "venue.identity", event: "onboard", outcome: "ALLOWED", subject: agentId, evidence: { credentialId: res.credential.credentialId, entity: res.credential.subject.entity, envelopeRegistered: !!envelope, vettingFlags: res.credential.evidence.vettingFlags } });
@@ -585,6 +627,8 @@ export class VenueService {
           return this.acceptWitnessReceipt((params as { receipt: WitnessReceipt }).receipt);
         case "venue/notice":
           return await this.submitNotice(params as { notice: StatusNotice });
+        case "venue/present-insurance":
+          return await this.presentInsurance(params as { agentId: string; attestation: InsurerAttestation });
         case "message/send": {
           const m = (params as { message: Message }).message;
           return await this.ingest(m);
@@ -753,11 +797,17 @@ export class VenueService {
     if (sender.envelope) {
       const v = evaluateMandate(envelopeToLimits(sender.envelope), { kind: "OFFER", isTender: true, rateUsd: data.offer.rateUsd, miles: data.load.miles, originState: data.load.origin.state, destinationState: data.load.destination.state, equipment: data.load.equipment, hazmat: data.load.hazmat, paymentTermsDays: data.offer.paymentTermsDays, round: 1 });
       for (const x of v.violations) violations.push({ code: x.code, evidence: { ...x.evidence, envelopePrincipalKid: sender.envelope.principalKid, agentId: sender.agentId } });
+      // (d2) fail early, like the insurance minimum: if the principal requires the counterparty's own insurer to have
+      // vouched through delivery, the word on file must reach the load's delivery window before anyone negotiates.
+      if (sender.envelope.limits.requireInsurerAttestation && reg.ok && cpLive) {
+        const assured = cpLive.insurer?.assuredThrough;
+        if (!assured || new Date(assured) < through) violations.push({ code: "MANDATE_INSURER_ATTESTATION_REQUIRED", evidence: { counterparty: data.to.agentId, counterpartyInsuranceAssuredThrough: assured ?? null, assuredBy: cpLive.insurer?.insurerId ?? null, deliveryWindowEnd: through.toISOString(), envelopePrincipalKid: sender.envelope.principalKid, agentId: sender.agentId, note: assured ? "the insurer's own word assures coverage only through the earlier date; beyond it only registry mirrors vouch" : "no insurer attestation on file for the counterparty" } });
+      }
     }
 
     if (violations.length) {
       // most specific first
-      const order: ReasonCode[] = ["DOUBLE_BROKERING_ATTEMPT", "LOAD_ALREADY_COMMITTED", "REGISTRY_UNAVAILABLE", "NO_BROKERAGE_AUTHORITY", "INSURANCE_LAPSED", "INSURANCE_CANCELLATION_PENDING", "INSURANCE_BELOW_MINIMUM", "AUTHORITY_NOT_ACTIVE", "CREDENTIAL_REVOKED", "CREDENTIAL_EXPIRED", "COUNTERPARTY_UNVERIFIED", "MANDATE_RATE_ABOVE_CEILING", "MANDATE_RATE_BELOW_FLOOR", "MANDATE_LANE_NOT_APPROVED", "MANDATE_EQUIPMENT_NOT_APPROVED"];
+      const order: ReasonCode[] = ["DOUBLE_BROKERING_ATTEMPT", "LOAD_ALREADY_COMMITTED", "REGISTRY_UNAVAILABLE", "NO_BROKERAGE_AUTHORITY", "INSURANCE_LAPSED", "INSURANCE_CANCELLATION_PENDING", "INSURANCE_BELOW_MINIMUM", "AUTHORITY_NOT_ACTIVE", "CREDENTIAL_REVOKED", "CREDENTIAL_EXPIRED", "COUNTERPARTY_UNVERIFIED", "MANDATE_INSURER_ATTESTATION_REQUIRED", "MANDATE_RATE_ABOVE_CEILING", "MANDATE_RATE_BELOW_FLOOR", "MANDATE_LANE_NOT_APPROVED", "MANDATE_EQUIPMENT_NOT_APPROVED"];
       const primary = [...violations].sort((a, b) => (order.indexOf(a.code) === -1 ? 99 : order.indexOf(a.code)) - (order.indexOf(b.code) === -1 ? 99 : order.indexOf(b.code)))[0]!;
       const refusedBy: Component = primary.code.startsWith("MANDATE_") ? "venue.mandate" : ["DOUBLE_BROKERING_ATTEMPT", "COUNTERPARTY_UNVERIFIED", "NO_BROKERAGE_AUTHORITY", "LOAD_ALREADY_COMMITTED"].includes(primary.code) ? "venue.routing" : "venue.identity";
       const evidence = { ...primary.evidence, allViolations: violations.map((v) => v.code), details: violations };
@@ -877,7 +927,7 @@ export class VenueService {
     const cpInsurance = sender.agentId === t.brokerAgentId ? otherLive.insurance?.bipdCoverageUsd ?? 0 : otherLive.insurance?.bondUsd ?? 0;
     const verdict = evaluateMandate(
       envelopeToLimits(env),
-      { kind: "ACCEPT", rateUsd: data.terms.rateUsd, miles: t.load.miles, originState: t.load.origin.state, destinationState: t.load.destination.state, equipment: t.load.equipment, hazmat: t.load.hazmat, paymentTermsDays: data.terms.paymentTermsDays, round: data.round, counterpartyUsdot: otherCred.subject.entity.usdot, counterpartyInsuranceUsd: cpInsurance, guaranteeAvailable, day: data.terms.pickup.windowStart.slice(0, 10) },
+      { kind: "ACCEPT", rateUsd: data.terms.rateUsd, miles: t.load.miles, originState: t.load.origin.state, destinationState: t.load.destination.state, equipment: t.load.equipment, hazmat: t.load.hazmat, paymentTermsDays: data.terms.paymentTermsDays, round: data.round, counterpartyUsdot: otherCred.subject.entity.usdot, counterpartyInsuranceUsd: cpInsurance, counterpartyInsuranceAssuredThrough: otherLive.insurer?.assuredThrough, deliveryWindowEnd: data.terms.delivery.windowEnd, guaranteeAvailable, day: data.terms.pickup.windowStart.slice(0, 10) },
       this.exposureFor(sender.agentId),
     );
     if (!verdict.allowed) {
@@ -1032,6 +1082,7 @@ export class VenueService {
         acceptances: { broker: t.acceptances[t.brokerAgentId]!, carrier: t.acceptances[t.carrierAgentId]! },
         credentials: { broker: brokerCred, carrier: carrierCred },
         registry: { registries: this.registry.pinned, attestations: registryAtt, policy: { maxAgeMs: this.config.registryMaxAgeMs, quorum: this.config.registryQuorum } },
+        insurance: { broker: brokerReg.insurerAttestation, carrier: carrierReg.insurerAttestation },
         underwriting: quote.decision === "GUARANTEED" ? { decision: "GUARANTEED", riskScore: quote.assessment.probabilityOfLoss, guarantee: quote.guarantee } : { decision: "UNGUARANTEED", riskScore: quote.assessment.probabilityOfLoss, reasonCode: quote.reasonCode },
         ledger: { seq: head.seq + 1, prevHash: head.hash },
       },
@@ -1332,7 +1383,7 @@ export class VenueService {
         credentialId: fromCred.credentialId,
         entity: fromCred.subject.entity,
         publicKey: fromCred.subject.publicKey,
-        insurance: { bipdUsd: fromLive.insurance?.bipdCoverageUsd ?? 0, cargoUsd: fromLive.insurance?.cargoCoverageUsd ?? 0, bondUsd: fromLive.insurance?.bondUsd ?? 0 },
+        insurance: { bipdUsd: fromLive.insurance?.bipdCoverageUsd ?? 0, cargoUsd: fromLive.insurance?.cargoCoverageUsd ?? 0, bondUsd: fromLive.insurance?.bondUsd ?? 0, assuredThrough: fromLive.insurer?.assuredThrough, assuredBy: fromLive.insurer?.insurerId },
         verifiedAt: new Date().toISOString(),
         registries: fromLive.registries,
       },

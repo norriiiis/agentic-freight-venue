@@ -24,7 +24,8 @@ export interface VenueAttachment {
     credentialId: string;
     entity: { usdot: string; mc?: string; legalName: string; entityType: string };
     publicKey: OkpJwk;
-    insurance: { bipdUsd: number; cargoUsd: number; bondUsd: number };
+    /** Coverage per the registries' word (the lowest any shows); `assuredThrough` is the insurer's own word, if on file. */
+    insurance: { bipdUsd: number; cargoUsd: number; bondUsd: number; assuredThrough?: string; assuredBy?: string };
     verifiedAt: string;
     /** The registries' signed word these figures come from (the lowest any of them shows), and how old each was. */
     registries?: { registryId: string; kid: string; asOf: string }[];

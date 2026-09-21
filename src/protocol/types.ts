@@ -107,6 +107,7 @@ export interface MandateEnvelope {
     allowedLaneRegions?: string[]; // e.g. ["TX", "OK", "LA"]
     requiredCounterpartyInsuranceUsd: number;
     requireGuarantee: boolean;
+    requireInsurerAttestation?: boolean;
   };
   principalSignature: string; // JWS over envelope sans this field
   principalPublicKey: OkpJwk;

@@ -26,6 +26,19 @@
  * the filing outranks the two that do not. A mirror that is stale or lying
  * can therefore only block, never cause, a commitment; and its signed word
  * beside its peers' signed word is the evidence it answers for.
+ *
+ * Independence among mirrors is configuration, not proof, so two more things
+ * make collusion a losing game rather than a safe one. Every attestation
+ * states when the mirror last synced its upstream (`upstreamAsOf`) — its
+ * claim of currency, which freshness is judged on — and every cancellation
+ * carries the date it was FILED. A mirror that claims a sync after a filing
+ * date and serves a record without that filing has signed a falsehood, and
+ * any later word showing the filing (another mirror's, its own, or the
+ * insurer's) is a self-contained proof against it. And the ORIGIN of the
+ * fact — the insurer, whose filing every mirror mirrors — can sign it
+ * directly: an InsurerAttestation no set of mirrors can forge, whose
+ * statutory notice period turns a point-in-time statement into a window
+ * within which coverage cannot lawfully end.
  */
 import { hashObject } from "./canonical";
 import { importPublicKey, signJws, verifyJws, type KeyPair, type OkpJwk } from "./crypto";
@@ -44,6 +57,8 @@ export interface InsuranceFiling {
   coverageToUsd: number;
   effectiveDate: string;      // ISO date
   cancellationDate?: string;  // ISO date; insurer-filed cancellation, effective on this date
+  /** ISO date the registry received the cancellation notice (statute requires ≥ 30 days before it takes effect). */
+  cancellationFiledDate?: string;
 }
 
 export interface AuthorityRecord {
@@ -192,12 +207,19 @@ export function standing(rec: RegistryRecord | null, at: Date, opts: { hazmat?: 
 
 // ---------------------------------------------------------- attestation
 
-/** The registry's signed word: this record, as of this moment on the registry's clock. `record: null` is a signed "not found". */
+/**
+ * The registry's signed word: this record, as of this moment on the
+ * registry's clock, from an upstream it last synced at `upstreamAsOf`.
+ * `record: null` is a signed "not found". Freshness is judged on the sync
+ * claim; a mirror that overstates it answers for the record it served.
+ */
 export interface RegistryAttestation {
   schema: "freight-venue/registry-attestation/v1";
   registryId: string;
   usdot: string;
   asOf: string;
+  /** When this mirror last synced the upstream it mirrors — its claim of currency. Absent in attestations from before the field existed (then `asOf`). */
+  upstreamAsOf?: string;
   record: RegistryRecord | null;
   recordHash: string;
   kid: string;
@@ -231,8 +253,8 @@ export function standingProjection(rec: RegistryRecord | null): string {
   return hashObject({ entityType: rec.entityType, operatingStatus: rec.operatingStatus, outOfServiceDate: rec.outOfServiceDate ?? null, authorities: rec.authorities, insurance: rec.insurance });
 }
 
-export function signAttestation(registry: KeyPair, registryId: string, usdot: string, record: RegistryRecord | null, now = new Date()): RegistryAttestation {
-  const unsigned: Omit<RegistryAttestation, "signature"> = { schema: "freight-venue/registry-attestation/v1", registryId, usdot, asOf: now.toISOString(), record, recordHash: recordHash(record), kid: registry.kid };
+export function signAttestation(registry: KeyPair, registryId: string, usdot: string, record: RegistryRecord | null, now = new Date(), upstreamAsOf: Date = now): RegistryAttestation {
+  const unsigned: Omit<RegistryAttestation, "signature"> = { schema: "freight-venue/registry-attestation/v1", registryId, usdot, asOf: now.toISOString(), upstreamAsOf: upstreamAsOf.toISOString(), record, recordHash: recordHash(record), kid: registry.kid };
   return { ...unsigned, signature: signJws(unsigned, registry, { typ: "registry-attestation+jws" }, true) };
 }
 
@@ -249,13 +271,127 @@ export function verifyAttestation(a: RegistryAttestation, key: OkpJwk): boolean 
 }
 
 /**
- * Was the registry's word fresh enough when the venue relied on it? `asOf` must
- * fall inside [reliedAt − maxAgeMs, reliedAt + skewMs]: older and later
- * cancellations were invisible; from the future and a clock is wrong.
+ * Was the registry's word fresh enough when the venue relied on it? The
+ * mirror's SYNC claim (`upstreamAsOf`) must be no older than maxAgeMs at
+ * reliedAt — later filings were invisible to it — and its signing clock
+ * (`asOf`) no further in the future than skewMs, or a clock is wrong.
  */
 export function attestationFreshAt(a: RegistryAttestation, reliedAt: Date, maxAgeMs: number, skewMs = 60_000): { ok: boolean; ageMs: number } {
-  const ageMs = reliedAt.getTime() - new Date(a.asOf).getTime();
-  return { ok: ageMs <= maxAgeMs && ageMs >= -skewMs, ageMs };
+  const ageMs = reliedAt.getTime() - new Date(a.upstreamAsOf ?? a.asOf).getTime();
+  const signedAhead = new Date(a.asOf).getTime() - reliedAt.getTime();
+  return { ok: ageMs <= maxAgeMs && ageMs >= -skewMs && signedAhead <= skewMs, ageMs };
+}
+
+// ------------------------------------------------------- accountability
+
+/** A cancellation somebody's signed word shows: the fact a mirror claiming a later sync cannot honestly lack. */
+export interface FilingEvidence {
+  source: string;
+  policyNumber: string;
+  cancellationDate: string;
+  cancellationFiledDate: string;
+  asOf: string;
+}
+
+export function filingsShownBy(a: RegistryAttestation): FilingEvidence[] {
+  return (a.record?.insurance ?? []).filter((f) => f.cancellationDate && f.cancellationFiledDate).map((f) => ({ source: a.registryId, policyNumber: f.policyNumber, cancellationDate: f.cancellationDate!, cancellationFiledDate: f.cancellationFiledDate!, asOf: a.upstreamAsOf ?? a.asOf }));
+}
+
+/** A signed falsehood: attestation `x` claims a sync after a filing that its record lacks. Self-contained given the signers' keys. */
+export interface FalseAttestationProof {
+  registryId: string;
+  usdot: string;
+  claimedSyncAt: string;
+  attestation: RegistryAttestation;
+  missing: FilingEvidence;
+}
+
+/**
+ * Is `x` contradicted by any filing evidence? A mirror may lag — an honest
+ * lagging mirror says so in `upstreamAsOf`. What it may not do is claim a
+ * sync at S and serve a record without a cancellation the registry received
+ * before S. The proof names the filing and who showed it; who is lying is a
+ * question the corroboration answers.
+ */
+export function contradictedBy(x: RegistryAttestation, evidence: FilingEvidence[]): FalseAttestationProof | undefined {
+  const sync = new Date(x.upstreamAsOf ?? x.asOf);
+  for (const e of evidence) {
+    if (e.source === x.registryId && e.asOf === (x.upstreamAsOf ?? x.asOf)) continue;
+    if (new Date(e.cancellationFiledDate) >= sync) continue;
+    const own = x.record?.insurance.find((f) => f.policyNumber === e.policyNumber);
+    if (!own) continue; // a policy this mirror never showed: not a contradiction, a different record — caught as disagreement
+    if (own.cancellationDate && own.cancellationDate <= e.cancellationDate) continue;
+    return { registryId: x.registryId, usdot: x.usdot, claimedSyncAt: sync.toISOString(), attestation: x, missing: e };
+  }
+  return undefined;
+}
+
+// ------------------------------------------------------- the origin's word
+
+/**
+ * The insurer's own signed word about its own filing — the fact every mirror
+ * mirrors, from where it originates. No set of mirrors can forge it. Under
+ * 49 CFR 387 an insurer must give the registry `noticeDays` (30) before a
+ * cancellation takes effect, so a statement with no cancellation disclosed
+ * assures coverage through asOf + noticeDays whatever any mirror says.
+ */
+export interface InsurerAttestation {
+  schema: "freight-venue/insurer-attestation/v1";
+  insurerId: string;
+  usdot: string;
+  policyNumber: string;
+  type: FilingType;
+  form: FilingForm;
+  coverageToUsd: number;
+  effectiveDate: string;
+  /** A cancellation the insurer has filed (or is filing now), if any. */
+  cancellation?: { filedDate: string; effectiveDate: string };
+  noticeDays: number;
+  asOf: string;
+  kid: string;
+  /** Detached JWS by the insurer's key over the attestation sans this field. */
+  signature: string;
+}
+
+export function signInsurerAttestation(insurer: KeyPair, insurerId: string, fields: Omit<InsurerAttestation, "schema" | "insurerId" | "asOf" | "kid" | "signature" | "noticeDays"> & { noticeDays?: number }, now = new Date()): InsurerAttestation {
+  const unsigned: Omit<InsurerAttestation, "signature"> = { schema: "freight-venue/insurer-attestation/v1", insurerId, noticeDays: 30, ...fields, asOf: now.toISOString(), kid: insurer.kid };
+  return { ...unsigned, signature: signJws(unsigned, insurer, { typ: "insurer-attestation+jws" }, true) };
+}
+
+export function verifyInsurerAttestation(a: InsurerAttestation, key: OkpJwk): boolean {
+  if (a.schema !== "freight-venue/insurer-attestation/v1") return false;
+  const { signature, ...unsigned } = a;
+  try {
+    return verifyJws(signature, importPublicKey(key), unsigned).ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Through when this word alone assures coverage: the disclosed cancellation, else asOf + the statutory notice. */
+export function coverageAssuredThrough(a: InsurerAttestation): Date {
+  const statutory = new Date(new Date(a.asOf).getTime() + a.noticeDays * 86_400_000);
+  if (!a.cancellation) return statutory;
+  const eff = new Date(a.cancellation.effectiveDate);
+  return eff < statutory ? eff : statutory;
+}
+
+export function filingShownByInsurer(a: InsurerAttestation): FilingEvidence | undefined {
+  return a.cancellation ? { source: `insurer:${a.insurerId}`, policyNumber: a.policyNumber, cancellationDate: a.cancellation.effectiveDate, cancellationFiledDate: a.cancellation.filedDate, asOf: a.asOf } : undefined;
+}
+
+/**
+ * Standing per the origin's word: in force at `at`, and — if `through` is
+ * asked — assured through it. Beyond the assured window the insurer's word
+ * is silent, not negative: that is the registries' question.
+ */
+export function insurerStanding(a: InsurerAttestation, at: Date, through?: Date): { ok: boolean; reasonCode?: ReasonCode; assuredThrough: string; evidence: Record<string, unknown> } {
+  const assured = coverageAssuredThrough(a);
+  const base = { assuredThrough: assured.toISOString(), insurer: a.insurerId, policyNumber: a.policyNumber, asOf: a.asOf, cancellation: a.cancellation };
+  if (new Date(a.effectiveDate) > at) return { ok: false, reasonCode: "INSURANCE_LAPSED", assuredThrough: assured.toISOString(), evidence: { ...base, note: "policy not yet effective" } };
+  if (a.cancellation && new Date(a.cancellation.effectiveDate) <= at) return { ok: false, reasonCode: "INSURANCE_LAPSED", assuredThrough: assured.toISOString(), evidence: base };
+  if (through && a.cancellation && new Date(a.cancellation.effectiveDate) <= through) return { ok: false, reasonCode: "INSURANCE_CANCELLATION_PENDING", assuredThrough: assured.toISOString(), evidence: { ...base, through: through.toISOString() } };
+  return { ok: true, assuredThrough: assured.toISOString(), evidence: base };
 }
 
 /**

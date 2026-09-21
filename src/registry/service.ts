@@ -15,8 +15,12 @@ export class RegistryService {
   readonly store: MockRegistry;
   /** SIM fault: the registry is unreachable (answers 503). */
   unavailable = false;
-  /** SIM fault: a mirror that stopped syncing its upstream — it keeps signing the records it had, with a fresh clock. Stale or lying: the same from outside. */
-  private frozen?: Map<string, RegistryRecord | null>;
+  /**
+   * SIM fault: a mirror that stopped syncing its upstream — it keeps signing the records it had. An HONEST frozen
+   * mirror says so (`upstreamAsOf` stops advancing) and is merely stale; one that `claimsCurrent` signs a sync time
+   * it did not have, and answers for the record it served.
+   */
+  private frozen?: { records: Map<string, RegistryRecord | null>; at: Date; claimsCurrent: boolean };
   private served = 0;
 
   constructor(readonly registryId: string, dataDir: string, storePath: string) {
@@ -37,16 +41,20 @@ export class RegistryService {
 
   attest(usdot: string, now = new Date()): RegistryAttestation {
     this.served++;
-    const record = this.frozen ? (this.frozen.has(usdot) ? this.frozen.get(usdot)! : null) : this.store.publicRecord(usdot);
-    return signAttestation(this.kp, this.registryId, usdot, record, now);
+    const record = this.frozen ? (this.frozen.records.get(usdot) ?? null) : this.store.publicRecord(usdot);
+    const upstreamAsOf = this.frozen && !this.frozen.claimsCurrent ? this.frozen.at : now;
+    return signAttestation(this.kp, this.registryId, usdot, record, now, upstreamAsOf);
   }
 
-  /** SIM: freeze what this mirror serves at the current records (or thaw). */
-  freeze(on: boolean) {
-    this.frozen = on ? new Map(this.store.all().map((r) => [r.usdot, this.store.publicRecord(r.usdot)])) : undefined;
+  /** SIM: freeze what this mirror serves at the current records (or thaw); `claimsCurrent` makes it lie about its sync. */
+  freeze(on: boolean, claimsCurrent = false) {
+    this.frozen = on ? { records: new Map(this.store.all().map((r) => [r.usdot, this.store.publicRecord(r.usdot)])), at: new Date(), claimsCurrent } : undefined;
   }
   get isFrozen(): boolean {
     return !!this.frozen;
+  }
+  get claimsCurrent(): boolean {
+    return !!this.frozen?.claimsCurrent;
   }
 
   records(): RegistryRecord[] {
@@ -59,6 +67,6 @@ export class RegistryService {
   }
 
   status() {
-    return { registryId: this.registryId, kid: this.kp.kid, records: this.store.all().length, attestationsServed: this.served, unavailable: this.unavailable, frozen: this.isFrozen };
+    return { registryId: this.registryId, kid: this.kp.kid, records: this.store.all().length, attestationsServed: this.served, unavailable: this.unavailable, frozen: this.isFrozen, claimsCurrent: this.claimsCurrent };
   }
 }

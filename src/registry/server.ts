@@ -36,10 +36,10 @@ if (simMode) {
       return ok({ ok: true, recordHash: svc.store.snapshotHash(usdot) });
     },
     "POST /admin/fault": async (_r, b) => {
-      const f = b as { unavailable?: boolean; freeze?: boolean };
+      const f = b as { unavailable?: boolean; freeze?: boolean; claimsCurrent?: boolean };
       if (f.unavailable !== undefined) svc.unavailable = !!f.unavailable;
-      if (f.freeze !== undefined) svc.freeze(!!f.freeze);
-      return ok({ unavailable: svc.unavailable, frozen: svc.isFrozen });
+      if (f.freeze !== undefined) svc.freeze(!!f.freeze, !!f.claimsCurrent);
+      return ok({ unavailable: svc.unavailable, frozen: svc.isFrozen, claimsCurrent: svc.claimsCurrent });
     },
   } satisfies Record<string, HttpRoute>);
 }

@@ -10,6 +10,7 @@
  *                         startup replays or discards these.
  *   state/messages.jsonl  raw wire log (forensics only; append-only).
  */
+import type { InsurerAttestation } from "../protocol/registry";
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { appendDurable, writeFileAtomic } from "../protocol/fsatomic";
@@ -31,6 +32,8 @@ export interface RegisteredAgent {
   url: string;
   card: AgentCard;
   envelope?: MandateEnvelope;
+  /** The insurer's own signed word about this party's filing (the COI on file), presented at onboarding or renewed since. */
+  insurerAttestation?: InsurerAttestation;
   registeredAt: string;
   rotatedAt?: string;
 }

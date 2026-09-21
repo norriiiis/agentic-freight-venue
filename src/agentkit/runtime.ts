@@ -20,6 +20,7 @@ import { termsHash, textDigest, validateNegotiationPayload, type AcceptPayload, 
 import { AuditLog, type Component } from "../protocol/audit";
 import { httpGet, rpcCall, RpcRefusal, startServer, type HttpRoute } from "../protocol/rpc";
 import type { Credential, CredentialStatusEntry, MandateEnvelope, RotationAuthorization, RotationClaims, RotationReason } from "../protocol/types";
+import type { InsurerAttestation } from "../protocol/registry";
 import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyHistory, type VenueKeyResolver } from "../protocol/venue-keys";
 import { WitnessCore, emptyWitnessState, type WitnessCoreState, type WitnessPeer } from "../protocol/witness-core";
 import { evaluateMandate } from "../mandate/engine";
@@ -35,6 +36,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
   readonly audit: AuditLog;
   readonly exposure: ExposureBook;
   readonly envelope?: MandateEnvelope;
+  private insurerAttestation?: InsurerAttestation;
   credential?: Credential;
   /** Pinned venue ROOT key (trust-on-first-use, persisted). Operational keys are learned from root-signed certificates. */
   venueRoot?: OkpJwk;
@@ -70,6 +72,9 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     }
     const envPath = join(config.dataDir, "envelope.json");
     this.envelope = existsSync(envPath) ? JSON.parse(readFileSync(envPath, "utf8")) : undefined;
+    // The COI on file: the principal's own insurer's signed word about its filing, obtained out of band and renewed by the principal.
+    const insPath = join(config.dataDir, "insurance.json");
+    this.insurerAttestation = existsSync(insPath) ? JSON.parse(readFileSync(insPath, "utf8")) : undefined;
     this.ctx = JSON.parse(readFileSync(join(config.dataDir, "private.json"), "utf8"));
     this.audit = new AuditLog(join(config.dataDir, "audit.jsonl"));
     this.exposure = new ExposureBook(join(config.dataDir, "exposure.json"));
@@ -209,6 +214,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
       proofOfControl: this.config.proofOfControl,
       agentUrl: this.url,
       envelope: this.envelope,
+      insurerAttestation: this.insurerAttestation,
     });
     if (res.error) {
       const d = res.error.data as { reasonCode?: string; evidence?: unknown } | undefined;
@@ -219,6 +225,20 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     writeFileAtomic(join(this.config.dataDir, "credential.json"), JSON.stringify(this.credential, null, 2));
     this.audit.write({ component: this.comp.runtime, event: "onboard", outcome: "ALLOWED", evidence: { credentialId: this.credential.credentialId, expiresAt: this.credential.expiresAt } });
     return { ok: true, credential: this.credential };
+  }
+
+  /** Present a renewed COI from the principal's insurer; kept on disk and on file with the venue. */
+  async presentInsurance(att: InsurerAttestation): Promise<{ ok: boolean; reasonCode?: string; evidence?: unknown }> {
+    const res = await rpcCall(`${this.config.venueUrl}/a2a`, "venue/present-insurance", { agentId: this.config.agentId, attestation: att });
+    if (res.error) {
+      const d = res.error.data as { reasonCode?: string; evidence?: unknown } | undefined;
+      this.audit.write({ component: this.comp.runtime, event: "present-insurance", outcome: "REFUSED", evidence: { reasonCode: d?.reasonCode, error: res.error.message } });
+      return { ok: false, reasonCode: d?.reasonCode, evidence: d?.evidence };
+    }
+    this.insurerAttestation = att;
+    writeFileAtomic(join(this.config.dataDir, "insurance.json"), JSON.stringify(att, null, 2));
+    this.audit.write({ component: this.comp.runtime, event: "present-insurance", outcome: "ALLOWED", evidence: { insurerId: att.insurerId, policyNumber: att.policyNumber, asOf: att.asOf, cancellation: att.cancellation ?? null } });
+    return { ok: true };
   }
 
   // ---------------------------------------------------------------- key rotation
@@ -653,6 +673,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     const action: MandateAction = {
       kind: "ACCEPT", rateUsd: t.rateUsd, miles: t.load.miles, originState: t.load.origin.state, destinationState: t.load.destination.state, equipment: t.load.equipment, hazmat: t.load.hazmat,
       paymentTermsDays: t.paymentTermsDays, round: view.round, counterpartyUsdot: view.counterparty.entity.usdot, counterpartyInsuranceUsd: cpIns,
+      counterpartyInsuranceAssuredThrough: view.counterparty.insurance.assuredThrough, deliveryWindowEnd: t.delivery.windowEnd,
       // First acceptor cannot know yet; the venue enforces requireGuarantee at commitment. Countersigner sees the quote.
       guaranteeAvailable: view.guaranteeAvailable ?? true,
       day: t.pickup.windowStart.slice(0, 10),
@@ -680,6 +701,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     if (simMode) {
       Object.assign(routes, {
         "POST /control/onboard": async () => ok(await this.onboard()),
+        "POST /control/present-insurance": async (_r, b) => ok(await this.presentInsurance(b as InsurerAttestation)),
         "POST /control/tender": async (_r: unknown, b: unknown) => {
           const { load, to } = b as { load: LoadSpec; to: { agentId: string } };
           return ok(await this.tender(load, to));
