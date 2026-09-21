@@ -26,6 +26,7 @@ import { WitnessCore, emptyWitnessState, type WitnessCoreState, type WitnessPeer
 import { evaluateMandate } from "../mandate/engine";
 import { ExposureBook } from "../mandate/exposure";
 import { verifyMandate } from "../mandate/sign";
+import { validateLimits } from "../mandate/validate";
 import type { Mandate, MandateAction } from "../mandate/types";
 import type { AgentConfig, Decision, LocalTask, NegotiationView, Offer, Strategy } from "./types";
 
@@ -70,6 +71,8 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     if (!mv.ok || this.mandate.principal.kid !== config.principal.publicKey.kid || this.mandate.agentId !== config.agentId) {
       throw new Error(`refusing to start: mandate not validly signed by pinned principal (${mv.error ?? "kid/agentId mismatch"})`);
     }
+    const incoherent = validateLimits(this.mandate.limits);
+    if (incoherent.length) throw new Error(`refusing to start: mandate limits cannot be meant — ${incoherent.join("; ")} (the principal's tool, npm run mandate, would have refused to sign this)`);
     const envPath = join(config.dataDir, "envelope.json");
     this.envelope = existsSync(envPath) ? JSON.parse(readFileSync(envPath, "utf8")) : undefined;
     // The COI on file: the principal's own insurer's signed word about its filing, obtained out of band and renewed by the principal.

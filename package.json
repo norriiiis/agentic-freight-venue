@@ -4,14 +4,17 @@
   "private": true,
   "type": "module",
   "description": "Prototype transaction venue for autonomous freight agents: identity, mandate, negotiation, underwriting, tamper-evident commitments.",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "demo": "tsx src/sim/cli.ts demo",
     "sim": "tsx src/sim/cli.ts",
     "verify": "tsx src/ledger/verify-cli.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check:boundaries": "tsx test/boundaries.ts"
+    "check:boundaries": "tsx test/boundaries.ts",
+    "mandate": "tsx src/mandate/cli.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
