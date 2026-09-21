@@ -162,6 +162,12 @@ export class MockRegistry implements RegistryView {
   snapshotHash(usdot: string): string {
     return recordHash(this.publicRecord(usdot));
   }
+  /** A synced public record replaces the stored one (out-of-band stubs are kept if present). */
+  upsertPublic(rec: RegistryRecord) {
+    const cur = this.records.get(rec.usdot);
+    this.records.set(rec.usdot, { ...rec, _proofOfControlToken: cur?._proofOfControlToken ?? "", _vettingFlags: cur?._vettingFlags ?? [] });
+    this.persist();
+  }
   /** SIM-ONLY mutation hooks (an insurer filing a cancellation, FMCSA revoking authority). */
   update(usdot: string, patch: Partial<RegistryRecord>) {
     const r = this.records.get(usdot);

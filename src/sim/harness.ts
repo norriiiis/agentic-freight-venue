@@ -24,6 +24,7 @@ import type { MandateEnvelope } from "../protocol/types";
 import { httpGet, httpPost, waitForHealth } from "../protocol/rpc";
 import type { AuditEntry } from "../protocol/audit";
 import type { NegotiationTask, CommitmentRecord } from "../venue/state";
+import { readVenueDb } from "../venue/db";
 import type { LedgerEntry } from "../ledger/chain";
 import type { Message, Task } from "../protocol/a2a";
 import { signInsurerAttestation, signRegulatorAttestation, type FilerAttestation, type InsurerAttestation, type InsurerKey, type InsurerRegistration, type RegistryAttestation, type RegistryKey, type RegistryRecord, type RegulatorAttestation, type RegulatorKey, type RegulatorLogAttestation } from "../protocol/registry";
@@ -128,6 +129,8 @@ export class VenueHandle {
   journal() { return httpGet<unknown[]>(`${this.url}/admin/journal`); }
   outbox() { return httpGet<{ toAgentId: string; attempts: number; note?: string }[]>(`${this.url}/admin/outbox`); }
   exposure(counterparty: string, beneficiary: string) { return httpGet<{ counterpartyOutstandingUsd: number; pairOutstandingUsd: number; portfolioOutstandingUsd: number }>(`${this.url}/admin/exposure?counterparty=${counterparty}&beneficiary=${beneficiary}`); }
+  /** The venue's persisted state, read from its database while the process is down (what recovery will see). */
+  stateAtRest() { const s = readVenueDb(join(this.dir, "state", "venue.sqlite")); return { ...s, lastAliveAt: s.kv.lastAliveAt as string | undefined }; }
   /** Wait for the venue process to exit (e.g. after an armed crash). */
   async waitExit(timeoutMs = 10_000): Promise<number | null> {
     const start = Date.now();
@@ -141,6 +144,8 @@ export class VenueHandle {
   seedExposure(counterpartyUsdot: string, beneficiaryUsdot: string, amountUsd: number, day: string, note: string) { return httpPost<{ exposure: unknown }>(`${this.url}/admin/underwriting/seed-exposure`, { counterpartyUsdot, beneficiaryUsdot, amountUsd, day, note }); }
   seedHistory(usdot: string, history: Record<string, unknown>) { return httpPost(`${this.url}/admin/underwriting/seed-history`, { usdot, history }); }
   expireStaleTasks() { return httpPost<{ expired: { taskId: string; outcome: unknown }[] }>(`${this.url}/admin/expire-stale-tasks`, {}); }
+  jobs() { return httpGet<{ name: string; everyMs: number; runs: number; lastRunAt?: string; lastError?: string }[]>(`${this.url}/admin/jobs`); }
+  runJob(name: string, now?: Date) { return httpPost<{ ok: boolean; result?: unknown; error?: string }>(`${this.url}/admin/jobs/run`, { name, now: now?.toISOString() }); }
   prePickupChecks(now?: Date) { return httpPost<{ voided: { commitmentId: string; voided: unknown }[] }>(`${this.url}/admin/pre-pickup-checks`, now ? { now: now.toISOString() } : {}); }
   audit() { return httpGet<AuditEntry[]>(`${this.url}/admin/audit`); }
   ledger() { return httpGet<LedgerEntry[]>(`${this.url}/admin/ledger`); }

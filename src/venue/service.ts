@@ -783,8 +783,13 @@ export class VenueService {
           return this.acceptWitnessReceipt((params as { receipt: WitnessReceipt }).receipt);
         case "venue/notice":
           return await this.submitNotice(params as { notice: StatusNotice });
-        case "venue/present-insurance":
-          return await this.presentInsurance(params as { agentId: string; attestation: InsurerAttestation });
+        case "venue/present-insurance": {
+          // The insured presents its own insurer's word: the caller must be the agent whose file changes.
+          const p = params as { agentId: string; attestation: InsurerAttestation };
+          const caller = this.authenticateBearer(headers.authorization, "venue/present-insurance");
+          if (caller.agentId !== p.agentId) throw new Refusal("IDENTITY_SIGNATURE_INVALID", "venue.identity", { error: "bearer is not the agent whose insurance is presented", caller: caller.agentId, agentId: p.agentId });
+          return await this.presentInsurance(p);
+        }
         case "message/send": {
           const m = (params as { message: Message }).message;
           return await this.ingest(m);
@@ -1599,6 +1604,16 @@ export class VenueService {
   private flushing = false;
   /** Successful deliveries since process start (recovery reports how many notices it owed). */
   private delivered = 0;
+  /** Return dead-lettered notices to the outbox with their attempt count reset (all, or one). */
+  retryDeadLetter(id?: string): { retried: string[] } {
+    const pick = this.state.deadLetter.filter((n) => !id || n.id === id);
+    this.state.deadLetter = this.state.deadLetter.filter((n) => !pick.includes(n));
+    for (const n of pick) { n.attempts = 0; n.nextAttemptAt = new Date().toISOString(); this.state.outbox.push(n); }
+    this.state.persist();
+    if (pick.length) this.audit.write({ component: "venue.routing", event: "dead-letter-retry", outcome: "INFO", evidence: { ids: pick.map((n) => n.id) } });
+    return { retried: pick.map((n) => n.id) };
+  }
+
   async flushOutbox(): Promise<void> {
     if (this.flushing) return;
     this.flushing = true;

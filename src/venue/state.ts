@@ -1,9 +1,13 @@
 /**
  * Venue persistence.
  *
- *   state/snapshot.json   agents, tasks, commitments, nonces, outbox — ONE file,
- *                         written atomically (temp + fsync + rename), so every
- *                         persisted view of the venue is internally consistent.
+ *   state/venue.sqlite    agents, tasks, commitments, outbox, dead letter, nonces
+ *                         and the small kv (heartbeat, witnesses, receipts,
+ *                         sources) — one SQLite database (node:sqlite, WAL,
+ *                         synchronous=FULL). persist() commits only what
+ *                         changed, in ONE transaction, so every persisted
+ *                         view is internally consistent. Nonces live in
+ *                         their own table with a TTL sweep.
  *   state/journal/<id>    write-ahead intent for a commit or void in progress;
  *                         written before the ledger append, deleted after all
  *                         side effects are applied and persisted. Recovery on
@@ -14,6 +18,7 @@ import type { InsurerAttestation } from "../protocol/registry";
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { appendDurable, writeFileAtomic } from "../protocol/fsatomic";
+import { VenueDb } from "./db";
 import type { AgentCard, Message, Task } from "../protocol/a2a";
 import type { LoadSpec, Terms } from "../protocol/freight";
 import type { MandateEnvelope } from "../protocol/types";
@@ -152,7 +157,8 @@ export class VenueState {
   agents = new Map<string, RegisteredAgent>();
   tasks = new Map<string, NegotiationTask>();
   commitments = new Map<string, CommitmentRecord>();
-  nonces = new Map<string, { messageId: string; ts: string; senderAgentId: string }>();
+  /** Nonces are read and written through the database (their own table, TTL-swept); this map-like shim keeps the call sites. */
+  readonly nonces: { get(nonce: string): { messageId: string; ts: string; senderAgentId: string } | undefined; set(nonce: string, v: { messageId: string; ts: string; senderAgentId: string }): void; get size(): number };
   outbox: PendingNotice[] = [];
   deadLetter: PendingNotice[] = [];
   lastAliveAt?: string;
@@ -162,36 +168,57 @@ export class VenueState {
   noticeSources: { sourceId: string; publicKey: OkpJwk; insurerName?: string }[] = [];
   private readonly dir: string;
   private readonly journalDir: string;
+  readonly db: VenueDb;
+  private readonly written = { agents: new Map<string, string>(), tasks: new Map<string, string>(), commitments: new Map<string, string>(), outbox: new Map<string, string>(), dead_letter: new Map<string, string>(), kv: new Map<string, string>() };
 
   constructor(dataDir: string) {
     this.dir = join(dataDir, "state");
     this.journalDir = join(this.dir, "journal");
     mkdirSync(this.journalDir, { recursive: true });
+    this.db = new VenueDb(this.file("venue.sqlite"));
+    const db = this.db;
+    this.nonces = { get: (n) => db.nonceSeen(n), set: (n, v) => db.nonceInsert(n, v), get size() { return db.nonceCount(); } };
     this.load();
   }
   private file(name: string) {
     return join(this.dir, name);
   }
   private load() {
-    const p = this.file("snapshot.json");
-    if (!existsSync(p)) return;
-    const s = JSON.parse(readFileSync(p, "utf8")) as Snapshot;
-    this.agents = new Map(Object.entries(s.agents));
-    this.tasks = new Map(Object.entries(s.tasks));
-    this.commitments = new Map(Object.entries(s.commitments));
-    this.nonces = new Map(Object.entries(s.nonces));
-    this.outbox = s.outbox ?? [];
-    this.deadLetter = s.deadLetter ?? [];
-    this.lastAliveAt = s.lastAliveAt;
-    this.witnesses = s.witnesses ?? [];
-    this.witnessReceipts = s.witnessReceipts ?? {};
-    this.noticeSources = s.noticeSources ?? [];
+    // One-time migration from the JSON snapshot this store replaced.
+    const legacy = this.file("snapshot.json");
+    if (existsSync(legacy) && this.db.readAll("kv").length === 0) {
+      const s = JSON.parse(readFileSync(legacy, "utf8")) as Snapshot;
+      this.agents = new Map(Object.entries(s.agents)); this.tasks = new Map(Object.entries(s.tasks)); this.commitments = new Map(Object.entries(s.commitments));
+      this.outbox = s.outbox ?? []; this.deadLetter = s.deadLetter ?? []; this.lastAliveAt = s.lastAliveAt; this.witnesses = s.witnesses ?? []; this.witnessReceipts = s.witnessReceipts ?? {}; this.noticeSources = s.noticeSources ?? [];
+      for (const [k, v] of Object.entries(s.nonces)) this.db.nonceInsert(k, v);
+      this.persist();
+      unlinkSync(legacy);
+      return;
+    }
+    const rows = <T>(t: string, w: Map<string, string>) => this.db.readAll<T>(t).map((r) => { w.set(r.k, JSON.stringify(r.v)); return r; });
+    this.agents = new Map(rows<RegisteredAgent>("agents", this.written.agents).map((r) => [r.k, r.v]));
+    this.tasks = new Map(rows<NegotiationTask>("tasks", this.written.tasks).map((r) => [r.k, r.v]));
+    this.commitments = new Map(rows<CommitmentRecord>("commitments", this.written.commitments).map((r) => [r.k, r.v]));
+    this.outbox = rows<PendingNotice>("outbox", this.written.outbox).map((r) => r.v);
+    this.deadLetter = rows<PendingNotice>("dead_letter", this.written.dead_letter).map((r) => r.v);
+    const kv = Object.fromEntries(rows<unknown>("kv", this.written.kv).map((r) => [r.k, r.v])) as Partial<Pick<Snapshot, "lastAliveAt" | "witnesses" | "witnessReceipts" | "noticeSources">>;
+    this.lastAliveAt = kv.lastAliveAt; this.witnesses = kv.witnesses ?? []; this.witnessReceipts = kv.witnessReceipts ?? {}; this.noticeSources = kv.noticeSources ?? [];
   }
-  /** One atomic write. Either the whole new state is on disk or none of it. Doubles as a heartbeat. */
+  /** One transaction: only what changed is written, and all of it or none. Doubles as a heartbeat. */
   persist() {
     this.lastAliveAt = new Date().toISOString();
-    const s: Snapshot = { agents: Object.fromEntries(this.agents), tasks: Object.fromEntries(this.tasks), commitments: Object.fromEntries(this.commitments), nonces: Object.fromEntries(this.nonces), outbox: this.outbox, deadLetter: this.deadLetter, lastAliveAt: this.lastAliveAt, witnesses: this.witnesses, witnessReceipts: this.witnessReceipts, noticeSources: this.noticeSources };
-    writeFileAtomic(this.file("snapshot.json"), JSON.stringify(s));
+    this.db.commit([
+      { table: "agents", rows: [...this.agents].map(([k, v]) => ({ k, v })), written: this.written.agents },
+      { table: "tasks", rows: [...this.tasks].map(([k, v]) => ({ k, v })), written: this.written.tasks },
+      { table: "commitments", rows: [...this.commitments].map(([k, v]) => ({ k, v })), written: this.written.commitments },
+      { table: "outbox", rows: this.outbox.map((n, i) => ({ k: n.id, v: n, seq: i })), written: this.written.outbox },
+      { table: "dead_letter", rows: this.deadLetter.map((n, i) => ({ k: n.id, v: n, seq: i })), written: this.written.dead_letter },
+      { table: "kv", rows: [{ k: "lastAliveAt", v: this.lastAliveAt }, { k: "witnesses", v: this.witnesses }, { k: "witnessReceipts", v: this.witnessReceipts }, { k: "noticeSources", v: this.noticeSources }], written: this.written.kv },
+    ]);
+  }
+  /** Forget nonces older than the message acceptance window: a replay outside the window is refused as stale anyway. */
+  sweepNonces(maxAgeMs: number, now = new Date()): number {
+    return this.db.nonceSweep(new Date(now.getTime() - maxAgeMs));
   }
 
   // ---- write-ahead journal ----

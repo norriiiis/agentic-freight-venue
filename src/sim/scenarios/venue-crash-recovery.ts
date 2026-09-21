@@ -92,7 +92,7 @@ export const venueCrashRecovery: Scenario = {
     const loadD = { ...LOAD, loadRef: "L-2026-262-0422", commodity: "Household goods, palletized", weightLbs: LOAD.weightLbs + 4 * 700 };
     const [d1, d2] = await Promise.all([broker.tender(loadD, { agentId: carrier.spec.agentId }), broker.tender(loadD, { agentId: carrier2.spec.agentId })]);
     await h.venue.waitExit();
-    const tasksAtCrash = JSON.parse(readFileSync(join(h.venue.dir, "state", "snapshot.json"), "utf8")).tasks as Record<string, { task: { status: { state: string } } }>;
+    const tasksAtCrash = h.venue.stateAtRest().tasks as Record<string, { task: { status: { state: string } } }>;
     say(`D: multi-tender; venue died after the ledger append while ${carrier2.spec.agentId}'s negotiation was ${tasksAtCrash[d2.taskId!]?.task.status.state}; 1 journal file on disk — restarting`);
     await h.restartVenue();
     const [tD1, tD2] = await Promise.all([h.venue.waitTerminal(d1.taskId!, 15_000), h.venue.waitTerminal(d2.taskId!, 15_000)]);

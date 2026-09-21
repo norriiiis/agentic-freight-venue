@@ -6,10 +6,12 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { exportPrivateJwk, generateKeyPair, importKeyPair, type KeyPair, type OkpJwk } from "../protocol/crypto";
+import type { KeyPair, OkpJwk } from "../protocol/crypto";
+import { keyProviderFromEnv, loadOrCreate } from "../protocol/keys";
 import { signAttestation, signFilerAttestation, signRegulatorLogAttestation, type FilerAttestation, type InsurerRegistration, type OutOfBand, type RegistryAttestation, type RegistryRecord, type RegulatorLogAttestation } from "../protocol/registry";
 import type { RootEvent } from "../protocol/venue-keys";
 import { MockRegistry } from "./store";
+import { FileUpstream, type UpstreamSource } from "./upstream";
 
 export class RegistryService {
   readonly kp: KeyPair;
@@ -23,27 +25,54 @@ export class RegistryService {
    */
   private frozen?: { records: Map<string, RegistryRecord | null>; filers: Map<string, InsurerRegistration>; regulators: Map<string, RootEvent[]>; at: Date; claimsCurrent: boolean };
   private served = 0;
+  /** Where this mirror syncs from, and when each entity was last synced successfully — the `upstreamAsOf` it signs. */
+  readonly upstream: UpstreamSource;
+  private syncedAt = new Map<string, Date>();
+  private syncFailures = 0;
 
-  constructor(readonly registryId: string, dataDir: string, storePath: string) {
+  constructor(readonly registryId: string, dataDir: string, storePath: string, opts: { upstream?: UpstreamSource; syncMaxAgeMs?: number } = {}) {
     mkdirSync(dataDir, { recursive: true });
-    const keyPath = join(dataDir, "registry-key.jwk.json");
-    if (existsSync(keyPath)) this.kp = importKeyPair(JSON.parse(readFileSync(keyPath, "utf8")));
-    else {
-      this.kp = generateKeyPair();
-      writeFileSync(keyPath, JSON.stringify(exportPrivateJwk(this.kp)));
-    }
+    this.kp = loadOrCreate(keyProviderFromEnv((name) => join(dataDir, `${name}.jwk.json`)), "registry-key");
     writeFileSync(join(dataDir, "registry-public.jwk.json"), JSON.stringify({ ...this.kp.publicJwk, registryId }));
     this.store = new MockRegistry(storePath);
+    this.upstream = opts.upstream ?? new FileUpstream(this.store);
+    this.syncMaxAgeMs = opts.syncMaxAgeMs ?? 60_000;
+  }
+  private readonly syncMaxAgeMs: number;
+
+  /**
+   * Sync one entity from the upstream if the mirror's copy is older than the sync policy. A failed sync leaves the
+   * copy AND its `upstreamAsOf` where they were: a mirror never claims a currency it did not get.
+   */
+  async sync(usdot: string, now = new Date()): Promise<{ synced: boolean; upstreamAsOf?: Date; error?: string }> {
+    if (this.upstream instanceof FileUpstream) return { synced: true, upstreamAsOf: now }; // the store is the upstream
+    const last = this.syncedAt.get(usdot);
+    if (last && now.getTime() - last.getTime() < this.syncMaxAgeMs) return { synced: true, upstreamAsOf: last };
+    try {
+      const rec = await this.upstream.record(usdot);
+      if (rec) this.store.upsertPublic(rec);
+      this.syncedAt.set(usdot, now);
+      return { synced: true, upstreamAsOf: now };
+    } catch (e) {
+      this.syncFailures++;
+      return { synced: false, upstreamAsOf: last, error: e instanceof Error ? e.message : String(e) };
+    }
   }
 
   wellKnown(): { registryId: string; publicKey: OkpJwk } {
     return { registryId: this.registryId, publicKey: this.kp.publicJwk };
   }
 
-  attest(usdot: string, now = new Date()): RegistryAttestation {
+  async attest(usdot: string, now = new Date()): Promise<RegistryAttestation> {
     this.served++;
     const record = this.frozen ? (this.frozen.records.get(usdot) ?? null) : this.store.publicRecord(usdot);
-    const upstreamAsOf = this.frozen && !this.frozen.claimsCurrent ? this.frozen.at : now;
+    let upstreamAsOf = this.frozen && !this.frozen.claimsCurrent ? this.frozen.at : now;
+    if (!this.frozen && !(this.upstream instanceof FileUpstream)) {
+      const s = await this.sync(usdot, now);
+      // Honest currency: the time the upstream was last actually read for this entity (or never).
+      upstreamAsOf = s.upstreamAsOf ?? new Date(0);
+      return signAttestation(this.kp, this.registryId, usdot, this.store.publicRecord(usdot), now, upstreamAsOf);
+    }
     return signAttestation(this.kp, this.registryId, usdot, record, now, upstreamAsOf);
   }
 
@@ -84,6 +113,6 @@ export class RegistryService {
   }
 
   status() {
-    return { registryId: this.registryId, kid: this.kp.kid, records: this.store.all().length, attestationsServed: this.served, unavailable: this.unavailable, frozen: this.isFrozen, claimsCurrent: this.claimsCurrent };
+    return { registryId: this.registryId, kid: this.kp.kid, records: this.store.all().length, attestationsServed: this.served, unavailable: this.unavailable, frozen: this.isFrozen, claimsCurrent: this.claimsCurrent, upstream: this.upstream.id, syncFailures: this.syncFailures };
   }
 }

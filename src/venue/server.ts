@@ -16,10 +16,17 @@
  *   VENUE_MAX_ROUNDS     protocol bound on negotiation rounds
  *   VENUE_REPLY_TIMEOUT_MS  cancel a negotiation when the awaited party is silent this long (default 120s)
  *   VENUE_SWEEP_MS       how often the timeout sweeper runs (default 5s)
+ *   VENUE_OPS_TOKEN      bearer token for /ops/* (jobs, outbox, dead letter); unset = /ops refused
+ *   VENUE_ALERT_WEBHOOK  URL to POST operator alerts to (false attestations, key conflicts, abandoned deliveries, crashes)
+ *   VENUE_RATE_LIMIT_RPS requests per second per caller (default 50; 0 = unlimited)
+ *   VENUE_TLS_CERT / VENUE_TLS_KEY  PEM paths; set both to serve HTTPS
+ *   VENUE_HOST           bind address (default 127.0.0.1)
  *   SIM_MODE=1           enables /admin/* (fault injection + introspection for the simulator ONLY)
  */
 import { startServer, type HttpRoute } from "../protocol/rpc";
 import { VenueService } from "./service";
+import { Scheduler } from "./jobs";
+import { Alerts, Metrics } from "./observe";
 import type { WitnessKey } from "../protocol/witness";
 import type { OkpJwk } from "../protocol/crypto";
 
@@ -42,11 +49,24 @@ const config = {
 };
 const venue = new VenueService(config);
 const simMode = process.env.SIM_MODE === "1";
+// Metrics and alerts are derived from the audit stream — a number and the record it counts cannot disagree.
+const metrics = new Metrics();
+const alerts = new Alerts(process.env.VENUE_ALERT_WEBHOOK, config.venueId, (l) => console.error(l));
+venue.audit.onWrite((e) => { metrics.observe(e); alerts.observe(e); });
+metrics.gauge("venue_outbox_depth", () => venue.state.outbox.length);
+metrics.gauge("venue_dead_letter_depth", () => venue.state.deadLetter.length);
+metrics.gauge("venue_open_tasks", () => [...venue.state.tasks.values()].filter((t) => !["completed", "failed", "rejected", "canceled"].includes(t.task.status.state)).length);
+metrics.gauge("venue_active_commitments", () => [...venue.state.commitments.values()].filter((c) => c.status === "ACTIVE").length);
+metrics.gauge("venue_alerts_sent_total", () => alerts.sent);
+metrics.gauge("venue_alerts_failed_total", () => alerts.failed);
 const sweepMs = Number(process.env.VENUE_SWEEP_MS ?? 5_000);
-setInterval(() => {
-  venue.expireStaleTasks().catch((e) => console.error("[venue] sweeper", e));
-  venue.flushOutbox().catch((e) => console.error("[venue] outbox", e));
-}, sweepMs).unref();
+// Every periodic duty, named and schedulable. The simulator runs them by name with a chosen clock.
+const jobs = new Scheduler((l) => console.error(l))
+  .add({ name: "reply-timeout-sweep", everyMs: sweepMs, run: () => venue.expireStaleTasks() })
+  .add({ name: "outbox-flush", everyMs: sweepMs, run: () => venue.flushOutbox() })
+  .add({ name: "heartbeat", everyMs: Math.max(1_000, sweepMs), run: async () => { venue.state.persist(); return { lastAliveAt: venue.state.lastAliveAt }; } })
+  .add({ name: "nonce-sweep", everyMs: Number(process.env.VENUE_NONCE_SWEEP_MS ?? 60_000), run: async () => ({ swept: venue.state.sweepNonces(2 * config.messageMaxAgeMs) }) })
+  .add({ name: "pre-pickup-and-renewal", everyMs: Number(process.env.VENUE_PREPICKUP_MS ?? 15 * 60_000), run: async (now) => ({ voided: (await venue.prePickupChecks(now)).map((c) => c.commitmentId) }) });
 
 const ok = (body: unknown) => ({ status: 200, body });
 /** Who is asking (SIM: witnesses send x-witness-id so the equivocation fault can target one; a real venue would fingerprint by IP). */
@@ -64,6 +84,15 @@ const routes: Record<string, HttpRoute> = {
     return ok(venue.ledgerViewFor(requester(req)).filter((e) => e.seq >= (Number.isFinite(from) ? from : 0)));
   },
   "GET /.well-known/agent-card.json": async () => ok(venue.agentCard()),
+  // ---- operator surface (VENUE_OPS_TOKEN): what an on-call engineer needs, and nothing that changes a verdict.
+  "GET /ops/jobs": async () => ok(jobs.list()),
+  "POST /ops/jobs/run": async (_r, b) => { const { name } = b as { name: string }; return ok(await jobs.runNow(name)); },
+  "GET /ops/outbox": async () => ok(venue.state.outbox.map((n) => ({ id: n.id, toAgentId: n.toAgentId, attempts: n.attempts, nextAttemptAt: n.nextAttemptAt, note: n.note }))),
+  "GET /ops/dead-letter": async () => ok(venue.state.deadLetter.map((n) => ({ id: n.id, toAgentId: n.toAgentId, attempts: n.attempts, note: n.note }))),
+  /** Put dead-lettered notices back on the outbox (all, or one by id) — e.g. after an agent's endpoint was fixed. */
+  "POST /ops/dead-letter/retry": async (_r, b) => ok(venue.retryDeadLetter((b as { id?: string } | undefined)?.id)),
+  "GET /metrics": async () => ({ status: 200, body: metrics.render() }),
+  "GET /ops/health": async () => ok({ ok: true, venueId: config.venueId, outbox: venue.state.outbox.length, deadLetter: venue.state.deadLetter.length, tasks: venue.state.tasks.size, commitments: venue.state.commitments.size, nonces: venue.state.nonces.size, jobs: jobs.list() }),
   /** The venue's part of a verification bundle for one commitment (artifact, ledger, lists, renewals). The world's word is not the venue's to supply. */
   "GET /bundle/*": async (req) => {
     const id = decodeURIComponent((req.url ?? "").split("/bundle/")[1]?.split("?")[0] ?? "");
@@ -116,6 +145,9 @@ if (simMode) {
       return ok(venue.underwriting.exposure(u.searchParams.get("counterparty") ?? "", u.searchParams.get("beneficiary") ?? ""));
     },
     "POST /admin/expire-stale-tasks": async () => ok({ expired: (await venue.expireStaleTasks()).map((t) => ({ taskId: t.task.id, outcome: t.outcome })) }),
+    "GET /admin/jobs": async () => ok(jobs.list()),
+    /** Run a job by name, at a chosen moment (`now`, ISO) — how the simulator moves the calendar. */
+    "POST /admin/jobs/run": async (_r, b) => { const { name, now } = b as { name: string; now?: string }; return ok(await jobs.runNow(name, now ? new Date(now) : undefined)); },
     /** `now` (ISO) lets the simulator move the clock for renewal deadlines; standing checks still use real registry time. */
     "POST /admin/pre-pickup-checks": async (_r, b) => { const at = (b as { now?: string } | undefined)?.now; return ok({ voided: (await venue.prePickupChecks(at ? new Date(at) : undefined)).map((c) => ({ commitmentId: c.commitmentId, voided: c.voided })) }); },
     "GET /admin/audit": async () => ok(venue.audit.readAll()),
@@ -145,11 +177,17 @@ if (simMode) {
 // Pin the registry key, then recover BEFORE serving: reconcile journal vs ledger, finish in-flight commits, re-deliver owed notices.
 venue.init().then(() => venue.recover()).then((r) => {
   if (r.applied.length || r.aborted.length || r.retried.length || r.redelivered) console.log(`[venue] recovery: applied=${r.applied.length} aborted=${r.aborted.length} retried=${r.retried.length} redelivered=${r.redelivered}`);
+  const rps = Number(process.env.VENUE_RATE_LIMIT_RPS ?? 50);
   return startServer(config.port, {
     rpcPath: "/a2a",
     rpc: (method, params, req) => venue.handleRpc(method, params, req.headers as Record<string, string | string[] | undefined>),
     routes,
+    tls: process.env.VENUE_TLS_CERT && process.env.VENUE_TLS_KEY ? { certPath: process.env.VENUE_TLS_CERT, keyPath: process.env.VENUE_TLS_KEY } : undefined,
+    rateLimit: rps > 0 ? { perSecond: rps } : undefined,
+    opsToken: process.env.VENUE_OPS_TOKEN,
+    host: process.env.VENUE_HOST,
   });
 }).then(() => {
+  jobs.start();
   console.log(`[venue] ${config.venueId} listening on ${venue.url} (signing kid ${venue.kp.kid.slice(0, 12)}…, root ${venue.keys.rootPublicKey.kid?.slice(0, 12)}…) replyTimeout ${config.replyTimeoutMs}ms sweep ${sweepMs}ms${simMode ? " SIM_MODE" : ""}`);
 });

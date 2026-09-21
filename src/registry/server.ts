@@ -10,6 +10,7 @@
  */
 import { startServer, type HttpRoute } from "../protocol/rpc";
 import { RegistryService } from "./service";
+import { QcMobileUpstream } from "./upstream";
 import type { RegistryRecord } from "../protocol/registry";
 import type { RootEvent } from "../protocol/venue-keys";
 import { FilerRefusal } from "./store";
@@ -24,7 +25,10 @@ const refusable = (f: () => unknown) => {
   }
 };
 
-const svc = new RegistryService(process.env.REGISTRY_ID ?? "fmcsa-li-mock", process.env.REGISTRY_DATA_DIR ?? ".data/registry", process.env.REGISTRY_STORE ?? "src/identity/fixtures/registry.json");
+// REGISTRY_UPSTREAM=qcmobile with FMCSA_WEBKEY syncs from FMCSA's QCMobile API (identity, authority, status; insurance
+// as a summary — L&I filings need an export hook, see registry/upstream.ts). Default: the local store is the upstream.
+const upstream = process.env.REGISTRY_UPSTREAM === "qcmobile" ? new QcMobileUpstream(process.env.FMCSA_WEBKEY ?? "", process.env.QCMOBILE_BASE_URL) : undefined;
+const svc = new RegistryService(process.env.REGISTRY_ID ?? "fmcsa-li-mock", process.env.REGISTRY_DATA_DIR ?? ".data/registry", process.env.REGISTRY_STORE ?? "src/identity/fixtures/registry.json", { upstream, syncMaxAgeMs: Number(process.env.REGISTRY_SYNC_MS ?? 60_000) });
 const port = Number(process.env.REGISTRY_PORT ?? 4400);
 const simMode = process.env.SIM_MODE === "1";
 const ok = (body: unknown) => ({ status: 200, body });
@@ -34,7 +38,7 @@ const routes: Record<string, HttpRoute> = {
   "GET /health": async () => ok({ ok: true, ...svc.status() }),
   "GET /.well-known/registry.json": async () => ok(svc.wellKnown()),
   /** The registry's signed word about one entity, as of now. */
-  "GET /attest": async (req) => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.attest(usdotOf(req)))),
+  "GET /attest": async (req) => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(await svc.attest(usdotOf(req)))),
   "GET /records": async () => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.records())),
   /** The registry's signed word about a registered filer (an insurer), as of now. */
   "GET /attest-filer": async (req) => (svc.unavailable ? { status: 503, body: { error: "registry unavailable" } } : ok(svc.attestFiler(new URL(req.url ?? "/", "http://localhost").searchParams.get("insurerId") ?? ""))),

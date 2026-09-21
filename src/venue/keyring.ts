@@ -13,6 +13,7 @@
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { exportPrivateJwk, generateKeyPair, importKeyPair, type KeyPair, type OkpJwk } from "../protocol/crypto";
+import { keyProviderFromEnv, loadOrCreate, type KeyProvider } from "../protocol/keys";
 import { writeFileAtomic } from "../protocol/fsatomic";
 import { makeResolver, rootCommitment, signCert, signRootEvent, verifyCert, verifyRootEventSelf, type RootEvent, type VenueKeyCert, type VenueKeyHistory, type VenueKeyResolver, type VenueKeyRevocation } from "../protocol/venue-keys";
 
@@ -24,6 +25,7 @@ interface RingFile {
 }
 
 export class VenueKeyRing {
+  private readonly provider: KeyProvider;
   private rootLog: RootEvent[];
   private active: KeyPair;
   private certs: VenueKeyCert[];
@@ -36,13 +38,17 @@ export class VenueKeyRing {
   constructor(private readonly dir: string, readonly venueId: string) {
     this.ringPath = join(dir, "venue-keyring.json");
     this.keyPath = join(dir, "venue-key.jwk.json");
+    // The OPERATIONAL key comes from the configured provider (file / secrets manager); the root never does — it is the operator's, offline.
+    this.provider = keyProviderFromEnv((name) => join(dir, `${name}.jwk.json`));
+    // (The simulator keeps the root in the data dir because the harness plays the operator; a secrets manager that hands the process its root is a misconfiguration.)
+    if (this.provider.kind !== "file" && this.provider.load("venue-root")) throw new Error("refusing to start: the venue root private key is provisioned to this process (a root belongs in offline custody, not in a key provider)");
     this.nextPath = join(dir, "venue-key.next.jwk.json");
     if (existsSync(this.ringPath)) {
       const f = JSON.parse(readFileSync(this.ringPath, "utf8")) as RingFile;
       this.rootLog = f.rootLog;
       this.certs = f.certs;
       this.revocations = f.revocations;
-      this.active = importKeyPair(JSON.parse(readFileSync(this.keyPath, "utf8")));
+      this.active = this.provider.load("venue-key") ?? importKeyPair(JSON.parse(readFileSync(this.keyPath, "utf8")));
       if (this.active.kid !== f.activeKid) throw new Error("venue key ring inconsistent: active key on disk does not match the ring");
       if (existsSync(this.nextPath)) this.pending = importKeyPair(JSON.parse(readFileSync(this.nextPath, "utf8")));
     } else {
@@ -53,8 +59,7 @@ export class VenueKeyRing {
       writeFileAtomic(join(dir, "venue-root.jwk.json"), JSON.stringify(exportPrivateJwk(root)));
       writeFileAtomic(join(dir, "venue-root-next.jwk.json"), JSON.stringify(exportPrivateJwk(nextRoot)));
       this.rootLog = [signRootEvent(root, { seq: 0, nextRootCommitment: rootCommitment(nextRoot.publicJwk), at: new Date().toISOString(), reason: "ESTABLISHMENT" })];
-      this.active = generateKeyPair();
-      writeFileAtomic(this.keyPath, JSON.stringify(exportPrivateJwk(this.active)));
+      this.active = loadOrCreate(this.provider, "venue-key");
       this.certs = [signCert(root, this.active.publicJwk, 0, "INITIAL")];
       this.revocations = [];
       this.persist();

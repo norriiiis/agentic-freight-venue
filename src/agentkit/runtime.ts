@@ -229,7 +229,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
 
   /** Present a renewed COI from the principal's insurer; kept on disk and on file with the venue. */
   async presentInsurance(att: InsurerAttestation): Promise<{ ok: boolean; reasonCode?: string; evidence?: unknown; satisfied?: string[]; voided?: string[] }> {
-    const res = await rpcCall<{ satisfied?: string[]; voided?: string[] }>(`${this.config.venueUrl}/a2a`, "venue/present-insurance", { agentId: this.config.agentId, attestation: att });
+    const res = await rpcCall<{ satisfied?: string[]; voided?: string[] }>(`${this.config.venueUrl}/a2a`, "venue/present-insurance", { agentId: this.config.agentId, attestation: att }, { authorization: `Bearer ${this.bearer("venue/present-insurance")}` });
     if (res.error) {
       const d = res.error.data as { reasonCode?: string; evidence?: unknown } | undefined;
       this.audit.write({ component: this.comp.runtime, event: "present-insurance", outcome: "REFUSED", evidence: { reasonCode: d?.reasonCode, error: res.error.message } });

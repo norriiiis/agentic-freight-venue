@@ -4,7 +4,8 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { exportPrivateJwk, generateKeyPair, importKeyPair, type KeyPair } from "../protocol/crypto";
+import type { KeyPair } from "../protocol/crypto";
+import { keyProviderFromEnv, loadOrCreate } from "../protocol/keys";
 import { writeFileAtomic } from "../protocol/fsatomic";
 import type { EquivocationProof, LedgerHead, WitnessReceipt } from "../protocol/witness";
 import type { BrokenPromiseProof, InclusionPromise, StatusNotice } from "../protocol/inclusion";
@@ -23,12 +24,7 @@ export class WitnessService {
   signAnything = false;
 
   constructor(readonly witnessId: string, readonly dataDir: string, readonly venueUrl: string, public peers: WitnessPeer[] = []) {
-    const keyPath = join(dataDir, "witness-key.jwk.json");
-    if (existsSync(keyPath)) this.kp = importKeyPair(JSON.parse(readFileSync(keyPath, "utf8")));
-    else {
-      this.kp = generateKeyPair();
-      writeFileAtomic(keyPath, JSON.stringify(exportPrivateJwk(this.kp)));
-    }
+    this.kp = loadOrCreate(keyProviderFromEnv((name) => join(dataDir, `${name}.jwk.json`)), "witness-key");
     writeFileAtomic(join(dataDir, "witness-public.jwk.json"), JSON.stringify(this.kp.publicJwk, null, 2));
     this.statePath = join(dataDir, "witness-state.json");
     if (existsSync(this.statePath)) this.state = { ...emptyWitnessState(), ...JSON.parse(readFileSync(this.statePath, "utf8")) };

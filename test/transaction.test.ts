@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ExposureBook } from "../src/mandate/exposure";
 import { UnderwritingEngine } from "../src/underwriting/engine";
+import { readVenueDb } from "../src/venue/db";
 import { VenueState, type CommitJournal } from "../src/venue/state";
 import { writeFileAtomic, appendDurable } from "../src/protocol/fsatomic";
 import { Ledger, verifyChain } from "../src/ledger/chain";
@@ -77,22 +78,35 @@ describe("atomic persistence and journal", () => {
     appendDurable(p, "b\n");
     expect(readFileSync(p, "utf8")).toBe("a\nb\n");
   });
-  it("venue snapshot round-trips as one file; journal survives a 'restart'", () => {
+  it("venue state round-trips through SQLite in one transaction; journal survives a 'restart'; nonces sweep by age", () => {
     const dir = tmp();
     const s = new VenueState(dir);
-    s.nonces.set("n1", { messageId: "m1", ts: "t", senderAgentId: "a" });
+    s.nonces.set("n1", { messageId: "m1", ts: new Date(Date.now() - 3_600_000).toISOString(), senderAgentId: "a" });
+    s.nonces.set("n2", { messageId: "m2", ts: new Date().toISOString(), senderAgentId: "a" });
     s.outbox.push({ id: "o1", toAgentId: "a", message: { kind: "message", role: "agent", parts: [], messageId: "m2" }, enqueuedAt: "t", attempts: 0, nextAttemptAt: "t" });
     s.persist();
     const j: CommitJournal = { kind: "COMMIT", commitmentId: "cmt_x", taskId: "task_x", writtenAt: "t", artifact: {} as never, ledger: { seq: 1, prevHash: "0".repeat(64) } };
     s.writeJournal(j);
+    s.db.close();
     const s2 = new VenueState(dir); // the restarted process
     expect(s2.nonces.get("n1")?.messageId).toBe("m1");
     expect(s2.outbox).toHaveLength(1);
     expect(s2.readJournals().map((x) => x.commitmentId)).toEqual(["cmt_x"]);
     s2.deleteJournal("cmt_x");
     expect(s2.readJournals()).toEqual([]);
-    expect(existsSync(join(dir, "state", "snapshot.json"))).toBe(true);
-    expect(readdirSync(join(dir, "state")).filter((f) => f.includes(".tmp-"))).toEqual([]);
+    expect(existsSync(join(dir, "state", "venue.sqlite"))).toBe(true);
+    // Nonces older than the acceptance window are swept; the fresh one stays.
+    expect(s2.sweepNonces(5 * 60_000)).toBe(1);
+    expect(s2.nonces.get("n1")).toBeUndefined();
+    expect(s2.nonces.get("n2")?.messageId).toBe("m2");
+    // Only changed rows are written: a second persist with nothing changed touches nothing (the written cache agrees).
+    s2.outbox = [];
+    s2.persist();
+    s2.db.close();
+    const s3 = new VenueState(dir);
+    expect(s3.outbox).toEqual([]);
+    expect(readVenueDb(join(dir, "state", "venue.sqlite")).nonces).toBe(1);
+    s3.db.close();
   });
   it("ledger append is durable-before-visible and the chain verifies after reload", () => {
     const dir = tmp();

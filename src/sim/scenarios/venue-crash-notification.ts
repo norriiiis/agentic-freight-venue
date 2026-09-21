@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Scenario, Finding } from "../scenario";
 import { LOAD, blueMesaCarrierSpec } from "../fixtures";
@@ -52,7 +51,7 @@ export const venueCrashNotification: Scenario = {
     const loadY = { ...LOAD, loadRef: "L-2026-262-0431", commodity: "Building materials, palletized", weightLbs: 40_300 };
     const [rx, ry] = await Promise.all([broker.tender(loadX, { agentId: carrier.spec.agentId }), broker.tender(loadY, { agentId: carrier2.spec.agentId })]);
     await h.venue.waitExit();
-    const snapAtCrash = JSON.parse(readFileSync(join(h.venue.dir, "state", "snapshot.json"), "utf8")) as { tasks: Record<string, { awaitingSince: string; awaiting: string }>; lastAliveAt: string };
+    const snapAtCrash = h.venue.stateAtRest() as unknown as { tasks: Record<string, { awaitingSince: string; awaiting: string }>; lastAliveAt: string };
     const yBefore = snapAtCrash.tasks[ry.taskId!]!;
     say(`part 2: venue died committing ${loadX.loadRef} while ${carrier2.spec.agentId} was deliberating on ${loadY.loadRef} (awaiting since ${yBefore.awaitingSince.slice(11, 23)}); holding the restart for 2s to simulate a real outage`);
     await new Promise((res) => setTimeout(res, 2000));
