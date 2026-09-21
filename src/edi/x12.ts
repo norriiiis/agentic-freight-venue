@@ -17,6 +17,7 @@
  * truckload; a partner IG is the authority on the qualifiers.
  */
 import type { LifecycleEventType, Terms } from "../protocol/freight";
+import type { CommitmentArtifact } from "../ledger/artifact";
 
 export type Segment = string[];
 
@@ -258,4 +259,23 @@ export function read204(set: Segment[]): Partial<Terms> & { stops: { kind: strin
     }
   }
   return { loadRef, rateUsd, stops, references, ...(weightLbs !== undefined || miles !== undefined || commodity ? { load: { weightLbs, miles, commodity } as unknown as Terms["load"] } : {}) };
+}
+
+// -------------------------------------------------------- from an artifact
+
+/** The three documents a commitment feeds, as complete interchanges: the 204 the broker's TMS would send, the carrier's 990, and one 214 per shipment-status event. */
+export function interchangesFor(a: CommitmentArtifact, env: Omit<Envelope, "senderId" | "receiverId"> & { brokerId?: string; carrierId?: string; scac?: string }, lifecycle: StatusEvent[] = []): { name: string; set: "204" | "990" | "214"; x12: string }[] {
+  const t = a.terms;
+  const brokerId = env.brokerId ?? `USDOT${t.brokerEntity.usdot}`;
+  const carrierId = env.carrierId ?? `USDOT${t.carrierEntity.usdot}`;
+  const at = env.now ?? new Date(a.createdAt);
+  const out: ReturnType<typeof interchangesFor> = [
+    { name: `${t.loadRef}-204.edi`, set: "204", x12: interchange({ ...env, senderId: brokerId, receiverId: carrierId, now: at }, [{ id: "204", body: tender204(t, { scac: env.scac, commitmentId: a.commitmentId, billTo: { name: a.credentials.broker.subject.entity.legalName, id: t.brokerEntity.usdot } }) }]) },
+    { name: `${t.loadRef}-990.edi`, set: "990", x12: interchange({ ...env, controlNumber: env.controlNumber + 1, senderId: carrierId, receiverId: brokerId, now: at }, [{ id: "990", body: response990(t, "A", { scac: env.scac, at, commitmentId: a.commitmentId }) }]) },
+  ];
+  lifecycle.forEach((ev, i) => {
+    const body = status214(t, ev, { scac: env.scac, commitmentId: a.commitmentId, profile: env.profile });
+    if (body) out.push({ name: `${t.loadRef}-214-${i + 1}-${ev.event}.edi`, set: "214", x12: interchange({ ...env, controlNumber: env.controlNumber + 2 + i, senderId: carrierId, receiverId: brokerId, now: new Date(ev.at) }, [{ id: "214", body }]) });
+  });
+  return out;
 }

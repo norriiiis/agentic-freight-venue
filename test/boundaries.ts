@@ -30,6 +30,8 @@ export const RULES: BoundaryRule[] = [
   { scope: "underwriting", allowed: ["protocol", "mandate", "ledger", "underwriting"] },
   { scope: "mandate", allowed: ["protocol", "mandate"] },
   { scope: "protocol", allowed: ["protocol"] },
+  // EDI is a rendering of protocol terms for outside systems; it knows nothing of the venue.
+  { scope: "edi", allowed: ["protocol", "ledger", "edi"] },
 ];
 
 function walk(dir: string): string[] {

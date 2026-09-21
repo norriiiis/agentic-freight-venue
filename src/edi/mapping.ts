@@ -3,10 +3,10 @@
  * exchanges: a rate confirmation, and the X12 850 (tender / purchase order),
  * 855 (acknowledgment) and 856 (ship notice) transaction sets.
  *
- * NOTE: motor-carrier-specific X12 sets exist too (204 Load Tender / 990
- * Response / 214 Status); the mapping below targets 850/855/856 per the
- * brief, and 204/990 map the same way (BEG->B2, etc.). This is a
- * segment-level outline, not a full X12 serializer.
+ * The 850/855/856 mapping below is a segment-level OUTLINE, per the brief.
+ * The motor-carrier sets the industry actually exchanges for truckload —
+ * 204 Load Tender, 990 Response, 214 Shipment Status — are serialized in
+ * full (envelopes, control numbers, parse-back) in `x12.ts`.
  */
 import type { CommitmentArtifact } from "../ledger/artifact";
 

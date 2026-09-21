@@ -14,7 +14,8 @@ import { checkExpectation, renderResult, renderWire } from "./transcript";
 import type { Scenario, ScenarioResult } from "./scenario";
 import { verifyArtifact, type CommitmentArtifact } from "../ledger/artifact";
 import { verifyBundle, type Pins, type VerificationBundle } from "../ledger/bundle";
-import { toRateConfirmation, toX12Outline } from "../edi/mapping";
+import { toRateConfirmation } from "../edi/mapping";
+import { interchangesFor, parseX12 } from "../edi/x12";
 import type { OkpJwk } from "../protocol/crypto";
 
 const args = process.argv.slice(2);
@@ -83,7 +84,7 @@ async function demoExtras(workspace: string) {
     console.log(`  exclusions: ${u.guarantee.exclusions.map((s) => s.split(":")[0]).join(", ")}`);
   }
 
-  console.log(`\n${"─".repeat(100)}\n  Document compatibility: rate confirmation + X12 outline\n${"─".repeat(100)}`);
+  console.log(`\n${"─".repeat(100)}\n  Document compatibility: rate confirmation + X12 204/990/214\n${"─".repeat(100)}`);
   const rc = toRateConfirmation(artifact);
   console.log(`  RATE CONFIRMATION ${rc.confirmationNumber}`);
   console.log(`  ${rc.broker.legalName} (${rc.broker.mc})  ⇄  ${rc.carrier.legalName} (${rc.carrier.mc})`);
@@ -91,9 +92,12 @@ async function demoExtras(workspace: string) {
   for (const s of rc.stops) console.log(`  ${s.type.padEnd(8)} ${s.city}, ${s.state} ${s.zip}   ${s.windowStart} → ${s.windowEnd}`);
   console.log(`  linehaul $${rc.rate.linehaulUsd}  total $${rc.rate.totalUsd}  ${rc.paymentTerms}  subcontracting ${rc.subcontractingProhibited ? "PROHIBITED" : "permitted"}`);
   console.log(`  signed: broker ${rc.signatures.broker.signedAt} (kid ${rc.signatures.broker.kid.slice(0, 10)}…)  carrier ${rc.signatures.carrier.signedAt} (kid ${rc.signatures.carrier.kid.slice(0, 10)}…)`);
-  for (const set of toX12Outline(artifact)) {
-    console.log(`\n  X12 ${set.set} — ${set.purpose}`);
-    console.log(`    ${set.segments.join("~\n    ")}~`);
+  const docs = interchangesFor(artifact, { controlNumber: 1, scac: "PWTI" }, [{ event: "PICKED_UP", at: artifact.terms.pickup.windowStart }, { event: "DELIVERED", at: artifact.terms.delivery.windowStart }]);
+  for (const d of docs) {
+    const parsed = parseX12(d.x12);
+    console.log(`\n  X12 ${d.set}  ${d.name}  (${parsed.segments.length} segments${parsed.problems.length ? `; PROBLEMS: ${parsed.problems.join("; ")}` : ", parses clean"})`);
+    console.log(`    ${d.x12.split("\n").join("\n    ")}`);
+    writeFileSync(join(workspace, d.name), d.x12);
   }
   writeFileSync(join(workspace, "rate-confirmation.json"), JSON.stringify(rc, null, 2));
 }

@@ -68,7 +68,8 @@ export interface NegotiationTask {
   commitmentId?: string;
 }
 
-export type LifecycleEventType = "PICKED_UP" | "DELIVERED" | "POD" | "DELIVERY_ACCEPTED" | "DISPUTE_OPENED" | "DISPUTE_CLOSED" | "PAID";
+import type { LifecycleEventType } from "../protocol/freight";
+export type { LifecycleEventType };
 export interface LifecycleEvent {
   event: LifecycleEventType;
   by: string;           // agentId

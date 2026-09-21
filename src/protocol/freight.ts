@@ -161,6 +161,9 @@ export interface InsuranceRenewedPayload {
   ledgerSeq: number;
 }
 /** Venue -> agents: the other party reported a lifecycle event on a shared commitment. */
+/** What happens to a load after the commitment. Reported by the party who can know it; see venue LIFECYCLE_RULES. */
+export type LifecycleEventType = "PICKED_UP" | "DELIVERED" | "POD" | "DELIVERY_ACCEPTED" | "DISPUTE_OPENED" | "DISPUTE_CLOSED" | "PAID";
+export const LIFECYCLE_EVENTS: LifecycleEventType[] = ["PICKED_UP", "DELIVERED", "POD", "DELIVERY_ACCEPTED", "DISPUTE_OPENED", "DISPUTE_CLOSED", "PAID"];
 export interface LifecyclePayload {
   type: "LIFECYCLE";
   loadRef: string;
