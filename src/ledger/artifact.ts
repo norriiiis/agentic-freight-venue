@@ -566,39 +566,7 @@ export function verifyArtifact(
   }
 
   const failed = checks.filter((c) => !c.ok);
-  const equivocated = failed.some((c) => c.name === "venue.no-equivocation");
-  const promiseBroken = failed.some((c) => c.name === "venue.honours-inclusion-promises" || (c.name.startsWith("inclusion[") && !c.name.endsWith(".promise-valid")));
-  const noticePending = !equivocated && !promiseBroken && failed.length > 0 && failed.every((c) => c.name === "status.no-pending-notices" || /\.(witnessed|witness-quorum|fresh-as-of|complete-to-witnessed-head)$/.test(c.name)) && failed.some((c) => c.name === "status.no-pending-notices");
-  const quorumOnly = !equivocated && !promiseBroken && !noticePending && failed.length > 0 && failed.every((c) => /\.(witnessed|witness-quorum|fresh-as-of|complete-to-witnessed-head)$/.test(c.name)) && failed.some((c) => c.name.endsWith(".witness-quorum"));
-  const freshnessOnly = !noticePending && failed.length > 0 && failed.every((c) => /\.(witnessed|fresh-as-of|complete-to-witnessed-head)$/.test(c.name));
-  const structural = failed.some((c) => /\.signature$|terms\.hash|-match$/.test(c.name) && !c.name.startsWith("venue.attestation["));
-  const venueKeyProblem = failed.some((c) => c.name === "venue.attestation.any-trusted" || c.name.endsWith("issuer-trusted-at-issuance") || c.name === "venue.certs.signed-by-root" || c.name === "venue.root.pinned-reaches-embedded");
-  const agentKeyProblem = failed.some((c) => c.name.endsWith("credential.trusted-at-signing"));
-  const registryContradiction = failed.some((c) => /\.registry\.standing-(at-commitment|per-current-record)$/.test(c.name));
-  const registryMissing = failed.some((c) => c.name === "registry.attestations-present");
-  const registryQuorum = failed.some((c) => c.name.endsWith(".registry.quorum"));
-  // Why the quorum failed: every failing per-registry check that was merely stale → STALE; any forged/mis-subject → INVALID; else too few / a required one absent.
-  const perRegistryFailed = failed.filter((c) => /\.registry\[[^\]]+\]$/.test(c.name) || /\.registry\.current\[[^\]]+\]\.signed$/.test(c.name));
-  const registryStale = registryQuorum && perRegistryFailed.length > 0 && perRegistryFailed.every((c) => c.detail?.includes("old at commitment"));
-  const registryInvalid = perRegistryFailed.some((c) => !c.detail?.includes("old at commitment"));
-  const registryDisagreement = failed.some((c) => c.name.endsWith(".registry.consistent"));
-  const registryFalse = failed.some((c) => /\.registry\[[^\]]+\]\.true-when-signed(-about-filer)?$/.test(c.name));
-  const insurerContradiction = failed.some((c) => /\.insurer\.standing-(at-commitment|per-current-word)$/.test(c.name));
-  const insurerMissing = failed.some((c) => c.name.endsWith(".insurer.attestation-present"));
-  const insurerInvalid = failed.some((c) => /\.insurer(\.current)?\[[^\]]+\]\.(signed|subject)$/.test(c.name));
-  const insurerNotOfRecord = failed.some((c) => /\.insurer\[[^\]]+\]\.of-record$/.test(c.name));
-  const insurerKeyNotOfRecord = failed.some((c) => /\.insurer\[[^\]]+\]\.key-of-record$/.test(c.name));
-  const filerUnlicensed = failed.some((c) => /\.filer\[[^\]]+\]\.licensed$/.test(c.name));
-  const regulatorUntrusted = failed.some((c) => /\.filer\[[^\]]+\]\.regulator-key-trusted$|\.regulator\[[^\]]+\]\.anchored$/.test(c.name));
-  const insurerFalse = failed.some((c) => /\.insurer\[[^\]]+\]\.true-when-signed$/.test(c.name));
-  const undertakingMissing = failed.some((c) => c.name.endsWith(".insurer.undertaking"));
-  const notAssured = failed.some((c) => c.name.endsWith(".insurer.assured-through-delivery"));
-  const renewalNotPresented = failed.some((c) => c.name.endsWith(".insurer.renewal-not-presented"));
-  const renewalContradiction = failed.some((c) => c.name.endsWith(".insurer.standing-per-renewal"));
-  const renewalPending = failed.some((c) => c.name.endsWith(".insurer.renewal-due"));
-  // Graded like NOTICE_PENDING: a conditional commitment before its deadline is not wrong, only not yet "fine".
-  const pendingOnly = renewalPending && failed.every((c) => c.name.endsWith(".insurer.renewal-due") || /\.(witnessed|witness-quorum|fresh-as-of|complete-to-witnessed-head)$/.test(c.name));
-  const reasonCode: ReasonCode | undefined = failed.length === 0 ? undefined : equivocated ? "VENUE_EQUIVOCATION" : promiseBroken ? "INCLUSION_PROMISE_BROKEN" : noticePending ? "NOTICE_PENDING" : registryFalse ? "REGISTRY_FALSE_ATTESTATION" : insurerFalse ? "INSURER_FALSE_ATTESTATION" : insurerContradiction || renewalContradiction ? "INSURER_CONTRADICTS_COMMITMENT" : registryContradiction ? "REGISTRY_CONTRADICTS_COMMITMENT" : registryMissing ? "REGISTRY_ATTESTATION_MISSING" : registryStale ? "REGISTRY_STALE" : registryInvalid && registryQuorum ? "REGISTRY_ATTESTATION_INVALID" : registryQuorum ? "REGISTRY_QUORUM_NOT_MET" : registryInvalid ? "REGISTRY_ATTESTATION_INVALID" : registryDisagreement ? "REGISTRY_DISAGREEMENT" : insurerInvalid ? "INSURER_ATTESTATION_INVALID" : regulatorUntrusted ? "REGULATOR_KEY_UNTRUSTED" : filerUnlicensed ? "FILER_UNLICENSED" : insurerKeyNotOfRecord ? "INSURER_KEY_NOT_OF_RECORD" : insurerNotOfRecord ? "INSURER_NOT_OF_RECORD" : insurerMissing ? "INSURER_ATTESTATION_MISSING" : undertakingMissing ? "INSURER_UNDERTAKING_MISSING" : notAssured ? "INSURANCE_NOT_ASSURED_THROUGH_DELIVERY" : renewalNotPresented ? "INSURANCE_RENEWAL_NOT_PRESENTED" : pendingOnly ? "INSURANCE_RENEWAL_PENDING" : quorumOnly ? "WITNESS_QUORUM_NOT_MET" : freshnessOnly ? (failed.some((c) => c.name.endsWith(".witnessed")) ? "STATUS_NOT_WITNESSED" : "STATUS_STALE") : structural ? "RECORD_TAMPERED" : agentKeyProblem && !venueKeyProblem ? "COMMITMENT_UNDER_COMPROMISED_KEY" : venueKeyProblem ? "VENUE_KEY_UNTRUSTED" : "CREDENTIAL_ISSUER_INVALID";
+  const reasonCode = verdictFor(failed);
   return {
     ok: failed.length === 0,
     reasonCode,
@@ -612,4 +580,58 @@ export function verifyArtifact(
       guaranteed: a.underwriting.decision === "GUARANTEED",
     },
   };
+}
+
+// ---------------------------------------------------------------- the verdict
+//
+// One artifact can fail many checks; the verdict names the one that matters
+// most. The order is a declared table, most damning first: proof that the
+// venue lied outranks proof that a source lied outranks a policy the verifier
+// set outranks staleness. Two verdicts are "graded" — NOTICE_PENDING and
+// INSURANCE_RENEWAL_PENDING mean "not yet fine", and apply only when nothing
+// worse also failed. test/verdict.test.ts pins this order.
+
+type Failed = { name: string; detail?: string };
+const witnessKind = (c: Failed) => /\.(witnessed|witness-quorum|fresh-as-of|complete-to-witnessed-head)$/.test(c.name);
+const perRegistry = (c: Failed) => /\.registry\[[^\]]+\]$/.test(c.name) || /\.registry\.current\[[^\]]+\]\.signed$/.test(c.name);
+
+/** Predicates over the failed checks, in precedence order. The first that matches names the verdict. */
+export const VERDICT_ORDER: { code: ReasonCode; when: (failed: Failed[]) => boolean }[] = [
+  { code: "VENUE_EQUIVOCATION", when: (f) => f.some((c) => c.name === "venue.no-equivocation") },
+  { code: "INCLUSION_PROMISE_BROKEN", when: (f) => f.some((c) => c.name === "venue.honours-inclusion-promises" || (c.name.startsWith("inclusion[") && !c.name.endsWith(".promise-valid"))) },
+  { code: "NOTICE_PENDING", when: (f) => f.some((c) => c.name === "status.no-pending-notices") && f.every((c) => c.name === "status.no-pending-notices" || witnessKind(c)) },
+  { code: "REGISTRY_FALSE_ATTESTATION", when: (f) => f.some((c) => /\.registry\[[^\]]+\]\.true-when-signed(-about-filer)?$/.test(c.name)) },
+  { code: "INSURER_FALSE_ATTESTATION", when: (f) => f.some((c) => /\.insurer\[[^\]]+\]\.true-when-signed$/.test(c.name)) },
+  { code: "INSURER_CONTRADICTS_COMMITMENT", when: (f) => f.some((c) => /\.insurer\.standing-(at-commitment|per-current-word|per-renewal)$/.test(c.name)) },
+  { code: "REGISTRY_CONTRADICTS_COMMITMENT", when: (f) => f.some((c) => /\.registry\.standing-(at-commitment|per-current-record)$/.test(c.name)) },
+  { code: "REGISTRY_ATTESTATION_MISSING", when: (f) => f.some((c) => c.name === "registry.attestations-present") },
+  // Why a registry quorum failed: every failing per-registry check merely stale → STALE; any forged / mis-subject → INVALID; else too few or a named one absent.
+  { code: "REGISTRY_STALE", when: (f) => f.some((c) => c.name.endsWith(".registry.quorum")) && f.filter(perRegistry).length > 0 && f.filter(perRegistry).every((c) => c.detail?.includes("old at commitment")) },
+  { code: "REGISTRY_ATTESTATION_INVALID", when: (f) => f.some((c) => c.name.endsWith(".registry.quorum")) && f.filter(perRegistry).some((c) => !c.detail?.includes("old at commitment")) },
+  { code: "REGISTRY_QUORUM_NOT_MET", when: (f) => f.some((c) => c.name.endsWith(".registry.quorum")) },
+  { code: "REGISTRY_ATTESTATION_INVALID", when: (f) => f.filter(perRegistry).some((c) => !c.detail?.includes("old at commitment")) },
+  { code: "REGISTRY_DISAGREEMENT", when: (f) => f.some((c) => c.name.endsWith(".registry.consistent")) },
+  { code: "INSURER_ATTESTATION_INVALID", when: (f) => f.some((c) => /\.insurer(\.current)?\[[^\]]+\]\.(signed|subject)$/.test(c.name)) },
+  { code: "REGULATOR_KEY_UNTRUSTED", when: (f) => f.some((c) => /\.filer\[[^\]]+\]\.regulator-key-trusted$|\.regulator\[[^\]]+\]\.anchored$/.test(c.name)) },
+  { code: "FILER_UNLICENSED", when: (f) => f.some((c) => /\.filer\[[^\]]+\]\.licensed$/.test(c.name)) },
+  { code: "INSURER_KEY_NOT_OF_RECORD", when: (f) => f.some((c) => /\.insurer\[[^\]]+\]\.key-of-record$/.test(c.name)) },
+  { code: "INSURER_NOT_OF_RECORD", when: (f) => f.some((c) => /\.insurer\[[^\]]+\]\.of-record$/.test(c.name)) },
+  { code: "INSURER_ATTESTATION_MISSING", when: (f) => f.some((c) => c.name.endsWith(".insurer.attestation-present")) },
+  { code: "INSURER_UNDERTAKING_MISSING", when: (f) => f.some((c) => c.name.endsWith(".insurer.undertaking")) },
+  { code: "INSURANCE_NOT_ASSURED_THROUGH_DELIVERY", when: (f) => f.some((c) => c.name.endsWith(".insurer.assured-through-delivery")) },
+  { code: "INSURANCE_RENEWAL_NOT_PRESENTED", when: (f) => f.some((c) => c.name.endsWith(".insurer.renewal-not-presented")) },
+  { code: "INSURANCE_RENEWAL_PENDING", when: (f) => f.some((c) => c.name.endsWith(".insurer.renewal-due")) && f.every((c) => c.name.endsWith(".insurer.renewal-due") || witnessKind(c)) },
+  { code: "WITNESS_QUORUM_NOT_MET", when: (f) => f.every(witnessKind) && f.some((c) => c.name.endsWith(".witness-quorum")) },
+  { code: "STATUS_NOT_WITNESSED", when: (f) => f.every(witnessKind) && f.some((c) => c.name.endsWith(".witnessed")) },
+  { code: "STATUS_STALE", when: (f) => f.every(witnessKind) },
+  { code: "RECORD_TAMPERED", when: (f) => f.some((c) => /\.signature$|terms\.hash|-match$/.test(c.name) && !c.name.startsWith("venue.attestation[")) },
+  { code: "COMMITMENT_UNDER_COMPROMISED_KEY", when: (f) => f.some((c) => c.name.endsWith("credential.trusted-at-signing")) && !f.some(venueKeyProblem) },
+  { code: "VENUE_KEY_UNTRUSTED", when: (f) => f.some(venueKeyProblem) },
+];
+function venueKeyProblem(c: Failed): boolean {
+  return c.name === "venue.attestation.any-trusted" || c.name.endsWith("issuer-trusted-at-issuance") || c.name === "venue.certs.signed-by-root" || c.name === "venue.root.pinned-reaches-embedded";
+}
+export function verdictFor(failed: Failed[]): ReasonCode | undefined {
+  if (failed.length === 0) return undefined;
+  return VERDICT_ORDER.find((v) => v.when(failed))?.code ?? "CREDENTIAL_ISSUER_INVALID";
 }

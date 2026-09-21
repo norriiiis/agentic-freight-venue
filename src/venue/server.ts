@@ -64,6 +64,12 @@ const routes: Record<string, HttpRoute> = {
     return ok(venue.ledgerViewFor(requester(req)).filter((e) => e.seq >= (Number.isFinite(from) ? from : 0)));
   },
   "GET /.well-known/agent-card.json": async () => ok(venue.agentCard()),
+  /** The venue's part of a verification bundle for one commitment (artifact, ledger, lists, renewals). The world's word is not the venue's to supply. */
+  "GET /bundle/*": async (req) => {
+    const id = decodeURIComponent((req.url ?? "").split("/bundle/")[1]?.split("?")[0] ?? "");
+    const part = venue.bundlePart(id, requester(req));
+    return part ? ok(part) : { status: 404, body: { error: "unknown commitment" } };
+  },
   /** Published credential status list (revocations + supersessions): what an offline verifier needs to judge old signatures. */
   /** Published credential status list: a projection of the ledger's CREDENTIAL_STATUS entries at a head, with the witnessed head. */
   "GET /.well-known/credential-status.json": async (req) => ok(venue.publishedStatusList(requester(req))),

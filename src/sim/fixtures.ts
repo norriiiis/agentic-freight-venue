@@ -7,10 +7,13 @@ import { randomBytes } from "node:crypto";
 import type { LoadSpec } from "../protocol/freight";
 import type { AgentSpec } from "./harness";
 
+/** Dates are relative to the wall clock so the fixture never ages into the past: pickup in two days, delivery in three. */
+export const dayAt = (offsetDays: number, hhmm = "13:00") => `${new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10)}T${hhmm}:00.000Z`;
+
 export const LOAD: LoadSpec = {
   loadRef: "L-2026-262-0417",
-  origin: { city: "Pasadena", state: "TX", zip: "77507", windowStart: "2026-09-23T13:00:00.000Z", windowEnd: "2026-09-23T19:00:00.000Z" },
-  destination: { city: "Kansas City", state: "MO", zip: "64120", windowStart: "2026-09-24T13:00:00.000Z", windowEnd: "2026-09-24T21:00:00.000Z" },
+  origin: { city: "Pasadena", state: "TX", zip: "77507", windowStart: dayAt(2), windowEnd: dayAt(2, "19:00") },
+  destination: { city: "Kansas City", state: "MO", zip: "64120", windowStart: dayAt(3), windowEnd: dayAt(3, "21:00") },
   equipment: "VAN",
   weightLbs: 38_500,
   commodity: "Consumer packaged goods, palletized",
@@ -92,7 +95,7 @@ export function carrierSpec(overrides: Partial<AgentSpec> = {}, privateOverrides
       openingMarkupPct: 0.08,
       concessionPct: 0.35,
       acceptGapPct: 0.03,
-      earliestPickup: "2026-09-23T15:00:00.000Z",
+      earliestPickup: dayAt(2, "15:00"),
       paymentTermsDays: 30,
       ...privateOverrides,
     },

@@ -60,7 +60,8 @@ export function startServer(port: number, spec: ServerSpec): Promise<Server> {
           return send(res, 200, rpcErr(body.id, RPC_ERR.INTERNAL, msg));
         }
       }
-      const route = spec.routes[key];
+      // Exact match first; then a prefix route ("GET /bundle/*") for paths that carry an id.
+      const route = spec.routes[key] ?? Object.entries(spec.routes).find(([k]) => k.endsWith("/*") && key.startsWith(k.slice(0, -1)))?.[1];
       if (!route) return send(res, 404, { error: "not found" });
       const body = req.method === "POST" ? await readJson(req) : undefined;
       const out = await route(req, body);

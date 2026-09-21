@@ -6,13 +6,14 @@
  *   npm run sim -- --list
  *   add --verbose to see process stdout, --json for machine-readable results
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Harness } from "./harness";
 import { SCENARIOS, ADVERSARIAL } from "./scenarios/index";
 import { checkExpectation, renderResult, renderWire } from "./transcript";
 import type { Scenario, ScenarioResult } from "./scenario";
 import { verifyArtifact, type CommitmentArtifact } from "../ledger/artifact";
+import { verifyBundle, type Pins, type VerificationBundle } from "../ledger/bundle";
 import { toRateConfirmation, toX12Outline } from "../edi/mapping";
 import type { OkpJwk } from "../protocol/crypto";
 
@@ -61,6 +62,18 @@ async function demoExtras(workspace: string) {
   for (const c of v.checks) console.log(`  ${c.ok ? "PASS" : "FAIL"}  ${c.name}`);
   console.log(`  → ${v.ok ? "VERIFIED: both parties signed these exact terms." : `NOT VERIFIED: ${v.reasonCode}`}`);
   console.log(`  re-run yourself:  npm run verify -- ${join(brokerDir, "commitments", file).replace(ROOT + "/", "")} --venue-root ${join(workspace, "venue", "venue-root-public.jwk.json").replace(ROOT + "/", "")} --ledger ${join(workspace, "venue", "ledger.jsonl").replace(ROOT + "/", "")}`);
+
+  const bundlePath = join(workspace, "bundle.json");
+  if (existsSync(bundlePath)) {
+    console.log(`\n${"─".repeat(100)}\n  The same, from a verification bundle: the venue's part + the registries' word today, against pins the verifier chose\n${"─".repeat(100)}`);
+    const bundle = JSON.parse(readFileSync(bundlePath, "utf8")) as VerificationBundle;
+    const pins = JSON.parse(readFileSync(join(workspace, "pins.json"), "utf8")) as Pins;
+    const vb = verifyBundle(bundle, pins);
+    console.log(`  sources: venue ${bundle.sources.venue}; registries ${bundle.sources.registries?.join(", ")}; pins: venue root, ${pins.registryKeys?.map((k) => k.registryId).join(", ")}`);
+    for (const c of vb.checks.filter((c) => !v.checks.some((x) => x.name === c.name))) console.log(`  ${c.ok ? "PASS" : "FAIL"}  ${c.name}${c.detail ? `  — ${c.detail}` : ""}`);
+    console.log(`  → ${vb.ok ? `VERIFIED (${vb.checks.length} checks)` : `NOT VERIFIED: ${vb.reasonCode}`}`);
+    console.log(`  re-run yourself:  npm run verify -- --bundle ${bundlePath.replace(ROOT + "/", "")} --pins ${join(workspace, "pins.json").replace(ROOT + "/", "")}`);
+  }
 
   console.log(`\n${"─".repeat(100)}\n  Underwriting\n${"─".repeat(100)}`);
   const u = artifact.underwriting;

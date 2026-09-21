@@ -172,6 +172,15 @@ export class VenueService {
     return r;
   }
 
+  /** The venue's part of a verification bundle: what it publishes about one commitment, for a party to keep or a verifier to fetch. */
+  bundlePart(commitmentId: string, requester?: string): { artifact: CommitmentArtifact; ledger: LedgerEntry[]; statusList: ReturnType<VenueService["publishedStatusList"]>; keyHistory: ReturnType<VenueService["publishedKeyHistory"]>; renewals: InsurerAttestation[] } | undefined {
+    const c = this.state.commitments.get(commitmentId);
+    if (!c) return undefined;
+    const ledger = this.ledgerViewFor(requester);
+    const renewals = ledger.filter((e) => e.type === "INSURANCE_RENEWAL" && (e.payload as { commitmentId?: string }).commitmentId === commitmentId).map((e) => (e.payload as { attestation: InsurerAttestation }).attestation);
+    return { artifact: c.artifact, ledger, statusList: this.publishedStatusList(requester), keyHistory: this.publishedKeyHistory(requester), renewals };
+  }
+
   // ------------------------------------------------------- witnessed heads
   //
   // The ledger is the source of truth; the published status list and key

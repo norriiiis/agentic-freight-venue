@@ -1,5 +1,11 @@
 /**
- * Independent artifact verifier. Usage:
+ * Independent artifact verifier. The simple way:
+ *   npm run verify -- --bundle bundle.json --pins pins.json [--as-of ISO]
+ *   npm run verify -- --from-venue http://venue --commitment cmt_… [--registry-url http://r]... [--witness-url http://w]... --pins pins.json
+ * A bundle holds everything below in one document (see ledger/bundle.ts); pins are the keys and policy YOU chose
+ * ({ venueRoot, registryKeys, regulatorKeys, insurerKeys, witnessKeys, minRegistries, requiredRegistries, requireInsurerAttestation, … }).
+ *
+ * The long way, one input at a time:
  *   npm run verify -- path/to/commitment.json [--venue-root venue-root-public.jwk.json] [--key-history venue-keys.json]
  *                                             [--ledger ledger.jsonl] [--status-list credential-status.json]
  *                                             [--witness-key witness-public.jwk.json[,id]]... [--as-of ISO]
@@ -47,7 +53,8 @@
  * Without the two lists the signatures still verify; a compromise declared after signing is invisible offline.
  * Uses nothing from the venue process. Exit code 0 iff the artifact verifies.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { fetchBundle, verifyBundle, type Pins, type VerificationBundle } from "./bundle";
 import { artifactHash, partyWitnessKeys, verifyArtifact, type CommitmentArtifact, type KeyHistoryInput } from "./artifact";
 import type { WitnessKey } from "../protocol/witness";
 import type { OkpJwk } from "../protocol/crypto";
@@ -55,16 +62,33 @@ import type { FilerAttestation, InsurerAttestation, InsurerKey, RegistryAttestat
 import { verifyChain, type LedgerEntry } from "./chain";
 
 const args = process.argv.slice(2);
-const file = args.find((a) => !a.startsWith("--"));
-if (!file) {
-  console.error("usage: verify <artifact.json> [--venue-key key.json] [--ledger ledger.jsonl]");
-  process.exit(2);
-}
 const opt = (name: string) => {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
 };
 const opts = (name: string) => args.map((a, i) => (a === name ? args[i + 1] : undefined)).filter((x): x is string => !!x);
+
+// ---- the bundle path: one document, one verdict
+if (opt("--bundle") || opt("--from-venue")) {
+  const pins = opt("--pins") ? (JSON.parse(readFileSync(opt("--pins")!, "utf8")) as Pins) : {};
+  const bundle = opt("--bundle") ? (JSON.parse(readFileSync(opt("--bundle")!, "utf8")) as VerificationBundle) : await fetchBundle({ venueUrl: opt("--from-venue")!, commitmentId: opt("--commitment")!, registryUrls: opts("--registry-url"), witnessUrls: opts("--witness-url") });
+  if (opt("--save-bundle")) writeFileSync(opt("--save-bundle")!, JSON.stringify(bundle, null, 2));
+  const res = verifyBundle(bundle, pins, opt("--as-of") ? new Date(opt("--as-of")!) : undefined);
+  console.log(`Commitment ${bundle.commitmentId}  (bundle assembled ${bundle.assembledAt} by ${bundle.assembledBy})`);
+  console.log(`  sources    venue ${bundle.sources.venue ?? "-"}; registries ${bundle.sources.registries?.join(", ") || "-"}; witnesses ${bundle.sources.witnesses?.join(", ") || "-"}`);
+  console.log(`  pins       ${[pins.venueRoot && "venue root", pins.registryKeys?.length && `${pins.registryKeys.length} registr${pins.registryKeys.length === 1 ? "y" : "ies"}`, pins.regulatorKeys?.length && `${pins.regulatorKeys.length} regulator(s)`, pins.insurerKeys?.length && `${pins.insurerKeys.length} insurer(s)`, pins.witnessKeys?.length && `${pins.witnessKeys.length} witness(es)`].filter(Boolean).join(", ") || "NONE — every embedded key is the venue's choice"}`);
+  console.log("");
+  for (const c of res.checks) console.log(`  ${c.ok ? "PASS" : "FAIL"}  ${c.name}${!c.ok && c.detail ? `  — ${c.detail}` : ""}`);
+  console.log("");
+  console.log(res.ok ? `VERIFIED (${res.checks.length} checks): both parties signed these exact terms.` : `NOT VERIFIED: ${res.reasonCode}`);
+  process.exit(res.ok ? 0 : 1);
+}
+
+const file = args.find((a) => !a.startsWith("--"));
+if (!file) {
+  console.error("usage: verify <artifact.json> [--venue-root key.json] [--ledger ledger.jsonl] …  |  verify --bundle bundle.json --pins pins.json");
+  process.exit(2);
+}
 const artifact = JSON.parse(readFileSync(file, "utf8")) as CommitmentArtifact;
 const pinned = opt("--venue-root") ? JSON.parse(readFileSync(opt("--venue-root")!, "utf8")) : undefined;
 const statusFile = opt("--status-list");
