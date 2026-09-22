@@ -34,7 +34,7 @@ const view = (theirRate: number, myLast?: number): NegotiationView => ({
   offer: { rateUsd: theirRate, pickup: { windowStart: LOAD.origin.windowStart, windowEnd: LOAD.origin.windowEnd }, delivery: { windowStart: LOAD.destination.windowStart, windowEnd: LOAD.destination.windowEnd }, paymentTermsDays: 30 },
   noteCode: "RATE",
   myLastOffer: myLast === undefined ? undefined : { rateUsd: myLast, pickup: { windowStart: LOAD.origin.windowStart, windowEnd: LOAD.origin.windowEnd }, delivery: { windowStart: LOAD.destination.windowStart, windowEnd: LOAD.destination.windowEnd }, paymentTermsDays: 30 },
-  counterparty: { agentId: "prairie-wind-carrier-agent", credentialId: "cred_x", entity: { usdot: "2751903", mc: "MC-0938251", entityType: "CARRIER" }, insurance: { bipdUsd: 1_000_000, cargoUsd: 100_000, bondUsd: 0 }, verifiedAt: new Date().toISOString() },
+  counterparty: { agentId: "prairie-wind-carrier-agent", credentialId: "cred_x", entity: { usdot: "2751903", mc: "MC-0938251", legalName: "PRAIRIE WIND TRANSPORT INC", entityType: "CARRIER" }, publicKey: generateKeyPair().publicJwk, insurance: { bipdUsd: 1_000_000, cargoUsd: 100_000, bondUsd: 0 }, verifiedAt: new Date().toISOString() } as NegotiationView["counterparty"],
 });
 const fallbacks: Fallback[] = [];
 const make = (timeoutMs = 2000): Strategy<BrokerPrivateContext> =>
