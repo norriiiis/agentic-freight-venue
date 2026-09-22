@@ -30,6 +30,14 @@ export interface AgentConfig {
   /** Pinned principal key: the mandate on disk must be signed by this key or the agent refuses to run. */
   principal: { name: string; publicKey: OkpJwk };
   /**
+   * The principal's own insurer's key, received out of band with the COI (never from the venue). When set, the agent
+   * refuses to present an insurer attestation that does not verify under it; unset, it still refuses one that is not
+   * about its principal, is already cancelled, or is dated in the future.
+   */
+  insurer?: { insurerId: string; publicKey: OkpJwk };
+  /** How far ahead of this agent's clock a document may be dated before it is refused (default protocol/clock.ts skewMs). */
+  clockSkewMs?: number;
+  /**
    * SIM-ONLY fault injection. Models a compromised or misbehaving agent
    * runtime. A deployed agent has no such switch.
    */

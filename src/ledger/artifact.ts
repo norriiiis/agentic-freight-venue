@@ -20,6 +20,7 @@
  * URL). The artifact embeds it for convenience; a verifier SHOULD pin it.
  */
 import { randomUUID } from "node:crypto";
+import { DEFAULT_CLOCK } from "../protocol/clock";
 import { canonicalize, hashObject } from "../protocol/canonical";
 import { importPublicKey, signJws, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import { dataPart, type Message } from "../protocol/a2a";
@@ -276,7 +277,7 @@ export function verifyArtifact(
   }
   if (opts.witnessKeys) {
     const asOf = opts.asOf ?? opts.now ?? new Date();
-    const tolerance = opts.maxStalenessMs ?? 15 * 60_000;
+    const tolerance = opts.maxStalenessMs ?? DEFAULT_CLOCK.witnessStalenessMs;
     const needed = new Date(asOf.getTime() - tolerance);
     const k = Math.max(1, opts.minWitnesses ?? 1);
     const proofs = (opts.equivocationProofs ?? []).filter((p) => p.venueId === a.venue.venueId && verifyEquivocationProof(p, opts.witnessKeys!));
@@ -447,7 +448,7 @@ export function verifyArtifact(
     const pinnedInsurer = (id: string) => opts.insurerKeys?.find((k) => k.insurerId === id);
     // The registries' word on a filer: verified under pinned registry keys, quorum, fresh at commitment; unanimous on the key at `at`.
     const k = Math.max(1, opts.minRegistries ?? reg?.policy.quorum ?? 1);
-    const maxAge = opts.maxRegistryAgeMs ?? reg?.policy.maxAgeMs ?? 5 * 60_000;
+    const maxAge = opts.maxRegistryAgeMs ?? reg?.policy.maxAgeMs ?? DEFAULT_CLOCK.registryMaxAgeMs;
     // The regulators' key logs per the registries: verified under pinned registry keys, fresh at commitment (or today), unanimous on the head.
     const regulatorWord = (regulatorId: string): { keys?: RegulatorKey; log?: RootEvent[]; anchoredBy: string; why?: string } => {
       const all = [...(a.insurance?.regulators ?? []), ...(opts.currentRegulatorAttestations ?? [])].filter((r) => r.regulatorId === regulatorId);

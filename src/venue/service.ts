@@ -9,6 +9,7 @@
  * (costs, margins, strategy). See DECISIONS.md Q5.
  */
 import { randomUUID } from "node:crypto";
+import { DEFAULT_CLOCK, type ClockPolicy } from "../protocol/clock";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { A2A_PROTOCOL_VERSION, FREIGHT_EXTENSION_URI, RPC_ERR, TERMINAL_STATES, dataPart, signAgentCard, verifyAgentCard, type AgentCard, type Message, type Task } from "../protocol/a2a";
@@ -54,6 +55,8 @@ export interface VenueConfig {
   port: number;
   maxRounds: number;
   messageMaxAgeMs: number;
+  /** Every other timestamp tolerance (skew, operator requests, rotation grace); defaults from protocol/clock.ts. */
+  clock?: Partial<ClockPolicy>;
   /** How long the venue waits for the awaited party's reply before canceling the negotiation. */
   replyTimeoutMs: number;
   /** Deliveries abandoned to the dead-letter queue after this many attempts (agents can still pull via tasks/get). */
@@ -78,6 +81,7 @@ export class Refusal extends Error {
 export class VenueService {
   /** Venue key ring: root public key, ACTIVE operational key, certificates, revocations. Never cache `kp` across a rotation. */
   readonly keys: VenueKeyRing;
+  readonly clock: ClockPolicy;
   readonly registry: RegistryMirror;
   readonly issuer: CredentialIssuer;
   readonly ledger: Ledger;
@@ -91,8 +95,9 @@ export class VenueService {
     mkdirSync(config.dataDir, { recursive: true });
     this.keys = new VenueKeyRing(config.dataDir, config.venueId);
     this.url = `http://127.0.0.1:${config.port}`;
-    this.registry = new RegistryMirror(config.registries, config.dataDir, config.registryQuorum);
-    this.issuer = new CredentialIssuer(config.venueId, () => this.keys.signer(), this.registry, new StubVettingProvider(this.registry), config.dataDir, undefined, undefined, config.registryMaxAgeMs);
+    this.clock = { ...DEFAULT_CLOCK, ...config.clock, messageMaxAgeMs: config.messageMaxAgeMs, registryMaxAgeMs: config.registryMaxAgeMs };
+    this.registry = new RegistryMirror(config.registries, config.dataDir, config.registryQuorum, this.clock.skewMs);
+    this.issuer = new CredentialIssuer(config.venueId, () => this.keys.signer(), this.registry, new StubVettingProvider(this.registry), config.dataDir, undefined, this.clock.rotationGraceMs, config.registryMaxAgeMs, this.clock.operatorRequestMaxAgeMs);
     this.ledger = new Ledger(join(config.dataDir, "ledger.jsonl"), () => this.keys.signer(), this.keys.currentCert(), this.keys.currentRootEvent());
     this.underwriting = new UnderwritingEngine(config.dataDir, { ...DEFAULT_PARAMS, ...config.underwriting });
     this.audit = new AuditLog(join(config.dataDir, "audit.jsonl"));
@@ -813,7 +818,7 @@ export class VenueService {
   private rootAuthorized(jws: string, action: string): { action: string; ts: string } {
     const res = verifyJws(jws, importPublicKey(this.keys.rootPublicKey));
     const claims = res.payload as { action?: string; ts?: string } | undefined;
-    if (!res.ok || claims?.action !== action || !claims.ts || Math.abs(Date.now() - new Date(claims.ts).getTime()) > 5 * 60_000) {
+    if (!res.ok || claims?.action !== action || !claims.ts || Math.abs(Date.now() - new Date(claims.ts).getTime()) > this.clock.operatorRequestMaxAgeMs) {
       this.audit.write({ component: "venue.identity", event: action, outcome: "REFUSED", reasonCode: "VENUE_KEY_ROTATION_UNAUTHORIZED", evidence: { error: res.error ?? "claims mismatch", action } });
       throw new Refusal("VENUE_KEY_ROTATION_UNAUTHORIZED", "venue.identity", { error: res.error ?? "operator request not signed by the venue root or stale", action });
     }
@@ -1306,7 +1311,9 @@ export class VenueService {
       if (!att) continue;
       const fk = await this.filerKey(att.insurerId, att.kid, new Date(att.asOf), 0);
       if (!fk.ok) {
-        if (side === "carrier" && (brokerReg.envelope?.limits.requireInsurerAttestation || brokerReg.envelope?.limits.requireInsurerUndertaking)) {
+        // Symmetric: the broker may require the carrier's insurer's word (BIPD), the carrier the broker's surety's (bond).
+        const requiring = side === "carrier" ? brokerReg : carrierReg;
+        if (requiring.envelope?.limits.requireInsurerAttestation || requiring.envelope?.limits.requireInsurerUndertaking) {
           await this.fail(t, fk.reasonCode, "venue.identity", { stage: "commit", agentId: reg.agentId, ...fk.evidence }, undefined, undefined);
           return;
         }
@@ -1318,6 +1325,9 @@ export class VenueService {
     }
     // The statutory window: if the broker requires the carrier's insurer's word and the word on file falls short of
     // delivery, the commitment is CONDITIONAL on a renewal signed within the window and presented by pickup.
+    // Carrier-side only: a BIPD lapse strands a load in transit, which is what the pickup deadline protects against; a
+    // bond lapse exposes the carrier's receivable, which payment terms (up to 45 days) outlast regardless — the
+    // carrier's protection is requiring the surety's word at all (above), not a renewal race to pickup.
     const rw = renewalWindow(insurance.carrier, new Date(terms.pickup.windowStart), new Date(terms.delivery.windowEnd));
     const renewal = (brokerReg.envelope?.limits.requireInsurerAttestation || brokerReg.envelope?.limits.requireInsurerUndertaking) && insurance.carrier && !rw.reachesDelivery ? { earliestSignedAt: rw.earliestSignedAt, dueBy: rw.dueBy, requiredBy: brokerReg.agentId } : undefined;
     const quote = this.quoteFor(t, terms);

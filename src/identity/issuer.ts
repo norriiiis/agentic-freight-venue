@@ -5,6 +5,7 @@
  * revocation status maintained here.
  */
 import { randomUUID } from "node:crypto";
+import { DEFAULT_CLOCK } from "../protocol/clock";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { importPublicKey, jwkThumbprint, signJws, verifyJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
@@ -51,9 +52,11 @@ export class CredentialIssuer {
     dataDir: string,
     private readonly validityDays = 90,
     /** How long a routinely-rotated credential is still accepted for in-flight messages. */
-    private readonly rotationGraceMs = 10 * 60_000,
+    private readonly rotationGraceMs = DEFAULT_CLOCK.rotationGraceMs,
     /** How fresh the registry's signed word must be at issuance. */
     private readonly registryMaxAgeMs = 60_000,
+    /** Rotation claims are deliberate acts: a claim older than this is stale. */
+    private readonly operatorRequestMaxAgeMs = DEFAULT_CLOCK.operatorRequestMaxAgeMs,
   ) {
     this.signer = typeof signer === "function" ? signer : () => signer;
     this.dir = join(dataDir, "identity");
@@ -173,7 +176,7 @@ export class CredentialIssuer {
     }
     const newKid = jwkThumbprint(req.newPublicKey);
     const c = req.claims;
-    if (c.credentialId !== old.credentialId || c.newKid !== newKid || Math.abs(now.getTime() - new Date(c.ts).getTime()) > 5 * 60_000) {
+    if (c.credentialId !== old.credentialId || c.newKid !== newKid || Math.abs(now.getTime() - new Date(c.ts).getTime()) > this.operatorRequestMaxAgeMs) {
       return { ok: false, reasonCode: "ROTATION_UNAUTHORIZED", evidence: { error: "claims do not match request (credentialId / newKid / ts)", claims: c, newKid } };
     }
     if (newKid === old.subject.publicKey.kid && c.reason !== "RENEWAL") {

@@ -93,6 +93,7 @@
  * one that pinned the regulator itself cross-checks them.
  */
 import { hashObject } from "./canonical";
+import { DEFAULT_CLOCK } from "./clock";
 import { importPublicKey, signJws, verifyJws, type KeyPair, type OkpJwk } from "./crypto";
 import type { ReasonCode } from "./reasons";
 import type { EntityType } from "./types";
@@ -333,7 +334,7 @@ export function verifyAttestation(a: RegistryAttestation, key: OkpJwk): boolean 
  * reliedAt — later filings were invisible to it — and its signing clock
  * (`asOf`) no further in the future than skewMs, or a clock is wrong.
  */
-export function attestationFreshAt(a: { asOf: string; upstreamAsOf?: string }, reliedAt: Date, maxAgeMs: number, skewMs = 60_000): { ok: boolean; ageMs: number } {
+export function attestationFreshAt(a: { asOf: string; upstreamAsOf?: string }, reliedAt: Date, maxAgeMs: number, skewMs = DEFAULT_CLOCK.skewMs): { ok: boolean; ageMs: number } {
   const ageMs = reliedAt.getTime() - new Date(a.upstreamAsOf ?? a.asOf).getTime();
   const signedAhead = new Date(a.asOf).getTime() - reliedAt.getTime();
   return { ok: ageMs <= maxAgeMs && ageMs >= -skewMs && signedAhead <= skewMs, ageMs };
@@ -688,6 +689,32 @@ export interface InsurerKey {
 export function signInsurerAttestation(insurer: KeyPair, insurerId: string, fields: Omit<InsurerAttestation, "schema" | "insurerId" | "asOf" | "kid" | "signature" | "noticeDays"> & { noticeDays?: number }, now = new Date(), insurerName?: string): InsurerAttestation {
   const unsigned: Omit<InsurerAttestation, "signature"> = { schema: "freight-venue/insurer-attestation/v1", insurerId, insurerName, noticeDays: 30, ...fields, asOf: now.toISOString(), kid: insurer.kid };
   return { ...unsigned, signature: signJws(unsigned, insurer, { typ: "insurer-attestation+jws" }, true) };
+}
+
+/**
+ * What a party can check about its OWN insurer's word before presenting it — without any registry: the schema,
+ * that it is about this party, that it is not already cancelled, that its clock is sane, and (when the principal
+ * pinned its insurer's key, received out of band with the COI) that the signature is the insurer's. The venue and
+ * the registries decide whether that insurer, and that key, are of record; this keeps a party from presenting a
+ * word that is not even about it. Returns the problems found; empty means "nothing this party can see is wrong".
+ */
+export function insurerAttestationProblems(a: InsurerAttestation, opts: { usdot: string; insurer?: { insurerId: string; publicKey: OkpJwk }; now?: Date; skewMs?: number }): string[] {
+  const p: string[] = [];
+  const now = opts.now ?? new Date();
+  if (a.schema !== "freight-venue/insurer-attestation/v1") p.push(`schema ${String(a.schema)} is not freight-venue/insurer-attestation/v1`);
+  if (a.usdot !== opts.usdot) p.push(`attestation is about USDOT ${a.usdot}, not this party (${opts.usdot})`);
+  if (!a.policyNumber || !a.insurerId || !a.kid || !a.signature) p.push("attestation is missing policyNumber, insurerId, kid or signature");
+  if (typeof a.coverageToUsd !== "number" || a.coverageToUsd <= 0) p.push("coverageToUsd is not a positive number");
+  const asOf = new Date(a.asOf).getTime();
+  if (!Number.isFinite(asOf)) p.push(`asOf ${String(a.asOf)} is not a date`);
+  else if (asOf - now.getTime() > (opts.skewMs ?? DEFAULT_CLOCK.skewMs)) p.push(`asOf ${a.asOf} is in the future: the insurer's clock or this one is wrong`);
+  if (a.cancellation && new Date(a.cancellation.effectiveDate).getTime() <= now.getTime()) p.push(`coverage cancelled effective ${a.cancellation.effectiveDate}: this word attests a lapse, not coverage`);
+  if (opts.insurer) {
+    if (a.insurerId !== opts.insurer.insurerId) p.push(`signed by insurer ${a.insurerId}, not the principal's pinned insurer ${opts.insurer.insurerId}`);
+    else if (a.kid !== opts.insurer.publicKey.kid) p.push(`signed with kid ${a.kid}, not the pinned insurer key ${opts.insurer.publicKey.kid} (a rotated key needs a new pin from the insurer, not from the venue)`);
+    else if (!verifyInsurerAttestation(a, opts.insurer.publicKey)) p.push("signature does not verify under the pinned insurer key");
+  }
+  return p;
 }
 
 export function verifyInsurerAttestation(a: InsurerAttestation, key: OkpJwk): boolean {

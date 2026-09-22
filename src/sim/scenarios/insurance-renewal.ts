@@ -70,10 +70,11 @@ export const insuranceRenewal: Scenario = {
     const p4 = await negotiate(h, broker, carrier, load(38, 40, "L-2026-303-0922", "Steel coil, tarped", 43_200));
     if (p4.task!.status !== "COMMITTED") throw new Error(`part 4: expected a conditional commitment, got ${p4.task!.status} ${p4.task!.outcome?.reasonCode}`);
     const art4 = artifactOf(p4.task!.commitmentId!);
-    const { voided } = await h.venue.prePickupChecks(new Date(day(38).getTime() + 3_600_000));
+    const pickupPlusHour = new Date(new Date(art4.terms.pickup.windowStart).getTime() + 3_600_000); // an hour into the pickup window, whatever the wall clock says
+    const { voided } = await h.venue.prePickupChecks(pickupPlusHour);
     await Promise.all([broker.waitStatus(p4.task!.task.id, ["VOIDED"]), carrier.waitStatus(p4.task!.task.id, ["VOIDED"])]);
     const rec4 = (await h.venue.commitments()).find((c) => c.commitmentId === art4.commitmentId)!;
-    const v4 = verify(art4, new Date(day(38).getTime() + 3_600_000));
+    const v4 = verify(art4, pickupPlusHour);
     say(`part 4: load delivers ${d(art4.terms.delivery.windowEnd)}; word on file (as of ${d(good.asOf)}) assures through ${d(day(36).toISOString())} → conditional (renewal ≥ ${d(art4.insurance?.renewal?.earliestSignedAt)} by ${d(art4.insurance?.renewal?.dueBy)}). Pickup arrives, nothing presented → ${rec4.status} ${rec4.voided?.reasonCode}; guarantee released; both agents notified`);
     say(`   verifier judging after pickup → ${v4.reasonCode ?? "VERIFIED"}: ${check(v4, "renewal-not-presented")?.slice(0, 140)}`);
     if (rec4.status !== "VOIDED" || rec4.voided?.reasonCode !== "INSURANCE_RENEWAL_NOT_PRESENTED" || voided.length !== 1 || v4.reasonCode !== "INSURANCE_RENEWAL_NOT_PRESENTED") throw new Error("part 4: deadline not enforced");

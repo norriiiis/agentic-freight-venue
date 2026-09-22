@@ -21,6 +21,7 @@ import { AuditLog, type Component } from "../protocol/audit";
 import { httpGet, rpcCall, RpcRefusal, startServer, type HttpRoute } from "../protocol/rpc";
 import type { Credential, CredentialStatusEntry, MandateEnvelope, RotationAuthorization, RotationClaims, RotationReason } from "../protocol/types";
 import type { InsurerAttestation } from "../protocol/registry";
+import { insurerAttestationProblems } from "../protocol/registry";
 import { makeResolver, type RootEvent, type VenueKeyCert, type VenueKeyHistory, type VenueKeyResolver } from "../protocol/venue-keys";
 import { WitnessCore, emptyWitnessState, type WitnessCoreState, type WitnessPeer } from "../protocol/witness-core";
 import { evaluateMandate } from "../mandate/engine";
@@ -90,6 +91,14 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     this.url = `http://127.0.0.1:${config.port}`;
     const r = config.role;
     this.comp = { mandate: `agent.${r}.mandate`, strategy: `agent.${r}.strategy`, runtime: `agent.${r}.runtime` };
+    if (this.insurerAttestation) {
+      // a COI on disk that is not about this principal (or already lapsed) is never presented; the principal is told
+      const problems = insurerAttestationProblems(this.insurerAttestation, { usdot: config.entity.usdot, insurer: config.insurer, skewMs: config.clockSkewMs });
+      if (problems.length) {
+        this.audit.write({ component: this.comp.runtime, event: "insurance-on-file", outcome: "REFUSED", reasonCode: "INSURER_ATTESTATION_INVALID", evidence: { insurerId: this.insurerAttestation.insurerId, policyNumber: this.insurerAttestation.policyNumber, problems } });
+        this.insurerAttestation = undefined;
+      }
+    }
     const self = this;
     const wsPath = join(config.dataDir, "party-witness-state.json");
     if (existsSync(wsPath)) this.witnessState = { ...emptyWitnessState(), ...JSON.parse(readFileSync(wsPath, "utf8")) };
@@ -245,6 +254,12 @@ export class AgentRuntime<Ctx extends { canary: string }> {
 
   /** Present a renewed COI from the principal's insurer; kept on disk and on file with the venue. */
   async presentInsurance(att: InsurerAttestation): Promise<{ ok: boolean; reasonCode?: string; evidence?: unknown; satisfied?: string[]; voided?: string[] }> {
+    const problems = insurerAttestationProblems(att, { usdot: this.config.entity.usdot, insurer: this.config.insurer, skewMs: this.config.clockSkewMs });
+    if (problems.length) {
+      // refused here, before the venue sees it: the agent does not present a word that is not its principal's insurer's
+      this.audit.write({ component: this.comp.runtime, event: "present-insurance", outcome: "REFUSED", reasonCode: "INSURER_ATTESTATION_INVALID", evidence: { insurerId: att.insurerId, policyNumber: att.policyNumber, problems, refusedLocally: true } });
+      return { ok: false, reasonCode: "INSURER_ATTESTATION_INVALID", evidence: { problems, refusedBy: `agent.${this.config.role}.runtime` } };
+    }
     const res = await rpcCall<{ satisfied?: string[]; voided?: string[] }>(`${this.config.venueUrl}/a2a`, "venue/present-insurance", { agentId: this.config.agentId, attestation: att }, { authorization: `Bearer ${this.bearer("venue/present-insurance")}` });
     if (res.error) {
       const d = res.error.data as { reasonCode?: string; evidence?: unknown } | undefined;

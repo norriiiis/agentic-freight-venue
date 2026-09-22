@@ -21,6 +21,8 @@
  *   VENUE_RATE_LIMIT_RPS requests per second per caller (default 50; 0 = unlimited)
  *   VENUE_TLS_CERT / VENUE_TLS_KEY  PEM paths; set both to serve HTTPS
  *   VENUE_HOST           bind address (default 127.0.0.1)
+ *   VENUE_CLOCK_SKEW_MS / VENUE_MSG_MAX_AGE_MS / VENUE_OPERATOR_REQUEST_MAX_AGE_MS / VENUE_ROTATION_GRACE_MS /
+ *   VENUE_WITNESS_STALENESS_MS  every timestamp tolerance, with its reason, in protocol/clock.ts
  *   SIM_MODE=1           enables /admin/* (fault injection + introspection for the simulator ONLY)
  */
 import { startServer, type HttpRoute } from "../protocol/rpc";
@@ -29,6 +31,7 @@ import { Scheduler } from "./jobs";
 import { Alerts, Metrics } from "./observe";
 import type { WitnessKey } from "../protocol/witness";
 import type { OkpJwk } from "../protocol/crypto";
+import { clockFromEnv } from "../protocol/clock";
 
 const config = {
   venueId: process.env.VENUE_ID ?? "venue-local",
@@ -46,6 +49,7 @@ const config = {
   noticeSources: process.env.VENUE_NOTICE_SOURCES ? JSON.parse(process.env.VENUE_NOTICE_SOURCES) : undefined,
   inclusionDelayMs: Number(process.env.VENUE_INCLUSION_DELAY_MS ?? 60_000),
   regulators: process.env.VENUE_REGULATORS ? JSON.parse(process.env.VENUE_REGULATORS) : undefined,
+  clock: clockFromEnv(),
 };
 const venue = new VenueService(config);
 const simMode = process.env.SIM_MODE === "1";

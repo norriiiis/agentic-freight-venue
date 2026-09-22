@@ -67,6 +67,8 @@ export interface AgentSpec {
   registerEnvelope?: boolean;
   /** The COI on file: the principal's insurer's signed word, written into the agent's dir as insurance.json. */
   insurerAttestation?: InsurerAttestation;
+  /** The principal's own insurer's key, pinned in the agent's config (received out of band, never from the venue). */
+  insurer?: AgentConfig["insurer"];
 }
 
 export class AgentHandle {
@@ -622,6 +624,10 @@ export class Harness {
       entity: spec.entity,
       proofOfControl: { method: "stub:fmcsa-registered-email-challenge", token: spec.proofOfControlToken },
       principal: { name: spec.principalName, publicKey: principal.publicJwk },
+      insurer: spec.insurer,
+      // The simulator models the passage of time by dating documents ahead (a renewal "signed on day 5"); the agent's
+      // clock is the wall clock, so its skew tolerance is widened to the scenarios' horizon. A deployed agent uses the default.
+      clockSkewMs: 400 * 86_400_000,
       thinkMs: spec.thinkMs ?? 120,
       rogue: spec.rogue,
     };

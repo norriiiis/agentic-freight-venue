@@ -14,6 +14,7 @@
  * in standing" is enough to refuse.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { DEFAULT_CLOCK } from "../protocol/clock";
 import { join } from "node:path";
 import type { OkpJwk } from "../protocol/crypto";
 import { writeFileAtomic } from "../protocol/fsatomic";
@@ -55,7 +56,7 @@ export class RegistryMirror implements RegistryView {
   /** SIM fault: registries the venue pretends not to have (a venue choosing its sources the way it might choose its witnesses). */
   hidden: string[] = [];
 
-  constructor(readonly sources: RegistrySource[], dataDir: string, readonly quorum = 1, readonly skewMs = 60_000) {
+  constructor(readonly sources: RegistrySource[], dataDir: string, readonly quorum = 1, readonly skewMs = DEFAULT_CLOCK.skewMs) {
     mkdirSync(dataDir, { recursive: true });
     this.path = join(dataDir, "registry-mirror.json");
     if (existsSync(this.path)) this.file = { filers: {}, reliedOnFilers: {}, regulators: {}, reliedOnRegulators: {}, ...JSON.parse(readFileSync(this.path, "utf8")) };

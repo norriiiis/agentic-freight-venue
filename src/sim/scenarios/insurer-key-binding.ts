@@ -41,6 +41,13 @@ export const insurerKeyBinding: Scenario = {
     if (!v0.ok || filers.length !== 3) throw new Error(`control failed: ${v0.checks.filter((x) => !x.ok).map((x) => `${x.name}: ${x.detail}`).join("; ")}`);
     findings.push({ label: "control: nothing to pin beyond the registries", detail: "the insurer's key is derived from filer attestations embedded in the artifact — verified under the pinned registry keys, a quorum fresh at commitment, unanimous that the signing key was the filer's at signing time. An insurer key pinned out of band is a cross-check, not a requirement" });
 
+    // ---- Part 0: the agent's own check, before the venue sees anything. A word that is not about its principal is not presented.
+    const someoneElses = gpm.attest({ ...policy, usdot: "3312874" });
+    const r0 = await carrier.presentInsurance(someoneElses);
+    say(`part 0: the carrier's agent is handed a genuine COI about USDOT 3312874 → refused by ${(r0.evidence as { refusedBy?: string })?.refusedBy}: ${((r0.evidence as { problems?: string[] })?.problems ?? []).join("; ")}`);
+    if (r0.reasonCode !== "INSURER_ATTESTATION_INVALID" || (r0.evidence as { refusedBy?: string })?.refusedBy !== "agent.carrier.runtime") throw new Error("part 0: the agent presented a word about someone else");
+    findings.push({ label: "part 0: the agent checks its own insurer's word first", reasonCode: "INSURER_ATTESTATION_INVALID", by: "agent.carrier.runtime", detail: "schema, subject, lapse, clock — and the signature, when the principal pinned its insurer's key out of band; nothing that is not about the principal leaves the agent, whatever the venue would have said" });
+
     // ---- Part 1: the venue operator binds an impostor's key to the insurer's name.
     const impostor = generateKeyPair();
     await h.venue.registerNoticeSource(gpm.insurerId, impostor.publicJwk, gpm.insurerName);
