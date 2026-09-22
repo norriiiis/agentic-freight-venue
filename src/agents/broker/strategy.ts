@@ -24,7 +24,8 @@ export interface BrokerPrivateContext {
 
 const round5 = (x: number) => Math.round(x / 5) * 5;
 
-function maxPay(ctx: BrokerPrivateContext, m: Mandate, miles: number): number {
+/** The most this principal will pay for a load: the private margin floor, the mandate ceiling, the per-mile ceiling. */
+export function maxPay(ctx: BrokerPrivateContext, m: Mandate, miles: number): number {
   const byMargin = ctx.customerRateUsd * (1 - ctx.minMarginPct);
   const byLoad = m.limits.maxRatePerLoadUsd ?? Number.POSITIVE_INFINITY;
   const byMile = m.limits.maxRatePerMileUsd ? m.limits.maxRatePerMileUsd * miles : Number.POSITIVE_INFINITY;

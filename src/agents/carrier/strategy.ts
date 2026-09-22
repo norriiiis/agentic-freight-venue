@@ -28,7 +28,8 @@ export interface CarrierPrivateContext {
 
 const round5 = (x: number) => Math.round(x / 5) * 5;
 
-function economics(load: LoadSpec, ctx: CarrierPrivateContext, m: Mandate) {
+/** Cost, floor (cost plus minimum margin, never below the mandate), target and opening ask for a load. */
+export function economics(load: LoadSpec, ctx: CarrierPrivateContext, m: Mandate) {
   const cost = ctx.costPerMileUsd * (load.miles + ctx.deadheadMiles) + ctx.fixedCostPerLoadUsd;
   const mandateFloor = Math.max(m.limits.minRatePerLoadUsd ?? 0, (m.limits.minRatePerMileUsd ?? 0) * load.miles);
   const floor = Math.ceil(Math.max(cost * (1 + ctx.minMarginPct), mandateFloor));

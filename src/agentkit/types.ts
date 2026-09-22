@@ -75,11 +75,13 @@ export interface NegotiationView {
  * context (Ctx) and the mandate; it returns decisions. It never sees the
  * counterparty's private context — only what crossed the wire.
  */
+export type MaybeAsync<T> = T | Promise<T>;
+export type AcceptDecision = { kind: "ACCEPT" } | { kind: "REJECT"; reasonCode: RejectReasonCode };
 export interface Strategy<Ctx> {
-  openingOffer(load: LoadSpec, ctx: Ctx, mandate: Mandate): Offer;
-  onTender(view: NegotiationView, ctx: Ctx, mandate: Mandate): Decision;
-  onCounter(view: NegotiationView, ctx: Ctx, mandate: Mandate): Decision;
-  onAcceptRequest(terms: Terms, view: NegotiationView, ctx: Ctx, mandate: Mandate): { kind: "ACCEPT" } | { kind: "REJECT"; reasonCode: RejectReasonCode };
+  openingOffer(load: LoadSpec, ctx: Ctx, mandate: Mandate): MaybeAsync<Offer>;
+  onTender(view: NegotiationView, ctx: Ctx, mandate: Mandate): MaybeAsync<Decision>;
+  onCounter(view: NegotiationView, ctx: Ctx, mandate: Mandate): MaybeAsync<Decision>;
+  onAcceptRequest(terms: Terms, view: NegotiationView, ctx: Ctx, mandate: Mandate): MaybeAsync<AcceptDecision>;
 }
 
 export interface LocalTask {

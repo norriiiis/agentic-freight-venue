@@ -450,7 +450,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
   // ------------------------------------------------------- initiating
 
   async tender(load: LoadSpec, to: { agentId: string }): Promise<{ taskId?: string; task?: Task; refusal?: unknown; localRefusal?: boolean }> {
-    const offer = this.forceRate(this.strategy.openingOffer(load, this.ctx, this.mandate));
+    const offer = this.forceRate(await this.strategy.openingOffer(load, this.ctx, this.mandate));
     if (!this.guard(this.offerAction(load, offer, 1, true), undefined, "tender")) return { localRefusal: true };
     const id = this.identity();
     const payload: TenderPayload = { type: "TENDER", load, offer, from: id.from, to };
@@ -536,7 +536,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         lt = { taskId, contextId, loadRef: data.load.loadRef, load: data.load, role: "responder", counterpartyAgentId: att!.counterparty.agentId, status: "OPEN", round: 1 };
         this.tasks.set(taskId, lt);
         const view: NegotiationView = { taskId, contextId, load: data.load, round: 1, offer: data.offer, counterparty: att!.counterparty };
-        const d = this.strategy.onTender(view, this.ctx, this.mandate);
+        const d = await this.strategy.onTender(view, this.ctx, this.mandate);
         await this.act(d, view, lt);
         break;
       }
@@ -548,7 +548,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         // Quarantine: the strategy sees the code, never the text. Only a digest reaches the audit log.
         const view: NegotiationView = { taskId, contextId, load, round, offer: data.offer, noteCode: data.noteCode, myLastOffer: lt.myLastOffer, counterparty: att!.counterparty };
         this.audit.write({ component: this.comp.strategy, event: "counter-received", outcome: "INFO", taskId, evidence: { round, theirRateUsd: data.offer.rateUsd, myLastRateUsd: lt.myLastOffer?.rateUsd, noteCode: data.noteCode, textQuarantined: data.text !== undefined, ...textDigest(data.text) } });
-        const d = this.strategy.onCounter(view, this.ctx, this.mandate);
+        const d = await this.strategy.onCounter(view, this.ctx, this.mandate);
         await this.act(d, view, lt);
         break;
       }
@@ -556,7 +556,7 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         if (!lt) return;
         const load = this.loadFor(lt);
         const view: NegotiationView = { taskId, contextId, load, round: att!.round, offer: { rateUsd: data.terms.rateUsd, pickup: data.terms.pickup, delivery: data.terms.delivery, paymentTermsDays: data.terms.paymentTermsDays }, myLastOffer: lt.myLastOffer, counterparty: att!.counterparty, guaranteeAvailable: att!.guaranteeAvailable };
-        const d = this.strategy.onAcceptRequest(data.terms, view, this.ctx, this.mandate);
+        const d = await this.strategy.onAcceptRequest(data.terms, view, this.ctx, this.mandate);
         if (d.kind === "REJECT") {
           await this.send(this.rejectPayload(lt, att!.round, d.reasonCode), taskId, contextId);
           lt.status = "REJECTED";
