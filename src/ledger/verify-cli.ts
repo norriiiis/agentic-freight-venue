@@ -71,11 +71,28 @@ const opts = (name: string) => args.map((a, i) => (a === name ? args[i + 1] : un
 // ---- the bundle path: one document, one verdict
 if (opt("--bundle") || opt("--from-venue")) {
   const pins = opt("--pins") ? (JSON.parse(readFileSync(opt("--pins")!, "utf8")) as Pins) : {};
-  const bundle = opt("--bundle") ? (JSON.parse(readFileSync(opt("--bundle")!, "utf8")) as VerificationBundle) : await fetchBundle({ venueUrl: opt("--from-venue")!, commitmentId: opt("--commitment")!, registryUrls: opts("--registry-url"), witnessUrls: opts("--witness-url") });
+  const raw = opt("--bundle") ? (JSON.parse(readFileSync(opt("--bundle")!, "utf8")) as Partial<VerificationBundle>) : await fetchBundle({ venueUrl: opt("--from-venue")!, commitmentId: opt("--commitment")!, registryUrls: opts("--registry-url"), witnessUrls: opts("--witness-url") });
+  /**
+   * A file downloaded from a venue's /bundle route is the VENUE'S PART: its artifact, its ledger entries, its
+   * lists. It is not a whole verification bundle, because what the world says is not the venue's to supply — a
+   * venue that could hand you the registries' current word could hand you anything. So a part verifies here on
+   * what it contains, and says plainly which checks had no independent word to run against.
+   */
+  const isPart = !raw.schema || !raw.sources;
+  const bundle: VerificationBundle = isPart
+    ? { schema: "freight-venue/verification-bundle/v1", commitmentId: raw.artifact?.commitmentId ?? "(unknown)", assembledAt: new Date().toISOString(), assembledBy: "verify-cli (from a venue part)", sources: {}, ...raw } as VerificationBundle
+    : (raw as VerificationBundle);
+  if (isPart) {
+    console.log(`NOTE  this file is the venue's part of a bundle, not a whole one: it carries no independent word`);
+    console.log(`      about the parties as of today. The checks that need one are reported below as having no`);
+    console.log(`      source. To gather it yourself, from registries YOU name rather than ones the venue chose:`);
+    console.log(`        npm run verify -- --from-venue <venue-url> --commitment ${raw.artifact?.commitmentId ?? "<id>"} --registry-url <registry-url> --pins <pins.json>`);
+    console.log("");
+  }
   if (opt("--save-bundle")) writeFileSync(opt("--save-bundle")!, JSON.stringify(bundle, null, 2));
   const res = verifyBundle(bundle, pins, opt("--as-of") ? new Date(opt("--as-of")!) : undefined);
   console.log(`Commitment ${bundle.commitmentId}  (bundle assembled ${bundle.assembledAt} by ${bundle.assembledBy})`);
-  console.log(`  sources    venue ${bundle.sources.venue ?? "-"}; registries ${bundle.sources.registries?.join(", ") || "-"}; witnesses ${bundle.sources.witnesses?.join(", ") || "-"}`);
+  console.log(`  sources    venue ${bundle.sources?.venue ?? "-"}; registries ${bundle.sources?.registries?.join(", ") || "-"}; witnesses ${bundle.sources?.witnesses?.join(", ") || "-"}`);
   console.log(`  pins       ${[pins.venueRoot && "venue root", pins.registryKeys?.length && `${pins.registryKeys.length} registr${pins.registryKeys.length === 1 ? "y" : "ies"}`, pins.regulatorKeys?.length && `${pins.regulatorKeys.length} regulator(s)`, pins.insurerKeys?.length && `${pins.insurerKeys.length} insurer(s)`, pins.witnessKeys?.length && `${pins.witnessKeys.length} witness(es)`].filter(Boolean).join(", ") || "NONE — every embedded key is the venue's choice"}`);
   console.log("");
   for (const c of res.checks) console.log(`  ${c.ok ? "PASS" : "FAIL"}  ${c.name}${!c.ok && c.detail ? `  — ${c.detail}` : ""}`);

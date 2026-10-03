@@ -2,6 +2,8 @@
 *.zip
 .DS_Store
 .data/
+.env
 .sim/
+deploy/.env
 design/interchange-console/
 node_modules/

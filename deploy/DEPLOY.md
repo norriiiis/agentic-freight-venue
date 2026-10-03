@@ -83,7 +83,10 @@ with phases 1–4 but must land before phase 5.
 ## Phase 2 — Up, on fixtures, reachable only by you (an hour)
 
 12. `cd deploy && docker compose up -d --build`. Three services; wait for the
-    registry and venue healthchecks to pass.
+    registry and venue healthchecks to pass. On a host without Docker,
+    `./deploy/bootstrap.sh up` runs the same three services with the same
+    variables, generates `deploy/.env` on first run, and handles the ordering
+    problem in step 14 for you.
 13. `docker compose logs app | head -40`. It prints the bootstrap operator
     account and **the console's control-verifier key**, with the exact two
     lines to paste.
@@ -142,9 +145,24 @@ Do all of this with your own companies, before any client.
 22. Onboard a second entity you control, on the other side of the trade.
 23. Post a load between them. Watch two agents negotiate it unattended and
     reach a commitment.
-24. Download the bundle and verify it on a different machine:
-    `npm run verify -- --bundle b.json --pins pins.json`. If it does not
-    verify away from the venue, nothing else here is worth anything.
+24. Download the bundle and verify it on a different machine. What the
+    console hands you is the VENUE'S PART — its artifact, its ledger entries,
+    its lists — because what the world says is not the venue's to supply:
+
+    ```bash
+    npm run verify -- --bundle record.json --pins pins.json          # the part, on its own
+    npm run verify -- --from-venue https://… --commitment cmt_… \
+                      --registry-url https://… --pins pins.json      # gathering the world's word yourself
+    ```
+
+    The second form is the one that matters, and it is a handful more checks:
+    it asks the registries YOU name what they say today, rather than trusting
+    a file the venue assembled. `pins.json` is `{venueRoot, registryKeys[],
+    minRegistries, maxRegistryAgeMs}`; the venue root is in
+    `venue-root-public.jwk.json` and the registry keys in
+    `registries.pinned.json`, both in the venue's data directory.
+    If it does not verify away from the venue, nothing else here is worth
+    anything.
 25. **Break things on purpose**, and check the refusal says something a client
     could act on:
     - answer a challenge wrongly six times (the challenge should die);
