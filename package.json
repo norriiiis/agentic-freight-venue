@@ -3,9 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Prototype transaction venue for autonomous freight agents: identity, mandate, negotiation, underwriting, tamper-evident commitments.",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   },
   "scripts": {
     "demo": "tsx src/sim/cli.ts demo",
@@ -21,10 +20,13 @@
     "pilot": "tsx src/app/pilot.ts",
     "vetting:check": "tsx src/identity/vetting-cli.ts"
   },
+  "dependencies": {
+    "tsx": "^4.19.0"
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
-  }
+  },
+  "description": "Prototype transaction venue for autonomous freight agents: identity, mandate, negotiation, underwriting, tamper-evident commitments."
 }

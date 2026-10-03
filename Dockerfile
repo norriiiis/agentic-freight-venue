@@ -5,13 +5,15 @@
 # Agents are started by the app as child processes inside its own container, so
 # the app container is the one that needs the data volume and the headroom.
 FROM node:22-slim
+# node:sqlite (DatabaseSync) needs >= 22.13; node:22-slim tracks the latest 22.x.
 
 RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev || npm install --omit=dev
+# tsx is a runtime dependency here, not a build tool: every process runs TypeScript directly.
+RUN npm ci --omit=dev
 COPY tsconfig.json ./
 COPY src ./src
 

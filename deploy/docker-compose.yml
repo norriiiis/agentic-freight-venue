@@ -20,6 +20,7 @@ services:
       # record's insurance is a summary, and insurer-of-record checks refuse it.
       REGISTRY_UPSTREAM: ${REGISTRY_UPSTREAM:-file}
       FMCSA_WEBKEY: ${FMCSA_WEBKEY:-}
+      REGISTRY_STORE: ${REGISTRY_STORE:-src/identity/fixtures/registry.json}
     volumes: ["registry-data:/data"]
     restart: unless-stopped
     healthcheck:
@@ -45,6 +46,22 @@ services:
       # No guarantee is offered: risk is assessed and published, the promise to pay is not made.
       VENUE_UW_PARAMS: '{"offerGuarantees":false}'
       VENUE_ALERT_WEBHOOK: ${VENUE_ALERT_WEBHOOK:-}
+      # Proof of control. SIM_STUB_TOKEN is absent from this list on purpose and must never be added here.
+      VENUE_CONTROL_METHODS: ${VENUE_CONTROL_METHODS:-REGISTRY_CONTACT_CHALLENGE,OPERATOR_ATTESTED}
+      VENUE_CONTROL_VERIFIERS: ${VENUE_CONTROL_VERIFIERS:-}
+      # How the venue reaches a carrier's contact point to challenge it. `console` only logs it: with that set,
+      # nobody outside this host can complete a challenge, which is right for a dry run and wrong for a client.
+      VENUE_NOTIFY: ${VENUE_NOTIFY:-console}
+      VENUE_NOTIFY_PROVIDER: ${VENUE_NOTIFY_PROVIDER:-resend}
+      VENUE_NOTIFY_TOKEN: ${VENUE_NOTIFY_TOKEN:-}
+      VENUE_NOTIFY_FROM: ${VENUE_NOTIFY_FROM:-}
+      # Vetting. Without a provider the venue cannot tell whether a mailbox is shared, and says so in the audit.
+      VETTING_PROVIDER: ${VETTING_PROVIDER:-stub}
+      CARRIEROK_API_KEY: ${CARRIEROK_API_KEY:-}
+      VETTING_MAX_CONTACT_SHARED: ${VETTING_MAX_CONTACT_SHARED:-0}
+      VETTING_ALLOW_ON_UNREACHABLE: ${VETTING_ALLOW_ON_UNREACHABLE:-}
+      VETTING_BLOCK_RISK: ${VETTING_BLOCK_RISK:-Very High}
+      VENUE_WATCHLIST_MS: ${VENUE_WATCHLIST_MS:-600000}
     volumes: ["venue-data:/data"]
     restart: unless-stopped
     healthcheck:
@@ -72,12 +89,13 @@ services:
       APP_VENUE_OPS_TOKEN: ${VENUE_OPS_TOKEN}
       APP_REGISTRY_URL: http://registry:4400
       APP_REGISTRY_ID: ${REGISTRY_ID:-fmcsa-li-mock}
-      APP_MAIL: ${APP_MAIL:-console}
-      APP_MAIL_PROVIDER: ${APP_MAIL_PROVIDER:-resend}
-      APP_MAIL_TOKEN: ${APP_MAIL_TOKEN:-}
-      APP_MAIL_FROM: ${APP_MAIL_FROM:-}
       APP_BOOTSTRAP_EMAIL: ${APP_BOOTSTRAP_EMAIL:-}
       APP_BOOTSTRAP_PASSWORD: ${APP_BOOTSTRAP_PASSWORD:-}
+      APP_VERIFIER_ID: ${APP_VERIFIER_ID:-interchange-console}
+      APP_NOTIFY: ${APP_NOTIFY:-console}
+      APP_NOTIFY_PROVIDER: ${APP_NOTIFY_PROVIDER:-resend}
+      APP_NOTIFY_TOKEN: ${APP_NOTIFY_TOKEN:-}
+      APP_NOTIFY_FROM: ${APP_NOTIFY_FROM:-}
       AGENT_LLM_URL: ${AGENT_LLM_URL:-}
       AGENT_LLM_MODEL: ${AGENT_LLM_MODEL:-}
       AGENT_LLM_KEY: ${AGENT_LLM_KEY:-}
