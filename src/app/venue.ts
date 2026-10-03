@@ -6,7 +6,7 @@
  * signed by them. What this client adds is the operator bearer token and
  * typed shapes for the few surfaces the console reads.
  */
-import { httpGet, httpPost } from "../protocol/rpc";
+import { httpGet, httpPost, rpcCall } from "../protocol/rpc";
 import type { OkpJwk } from "../protocol/crypto";
 
 export interface VenueAgentView { agentId: string; credentialId: string; url: string; registeredAt?: string; envelope?: Record<string, unknown> }
@@ -30,6 +30,22 @@ export class VenueClient {
   bundle(commitmentId: string) { return httpGet<Record<string, unknown>>(`${this.url}/bundle/${encodeURIComponent(commitmentId)}`); }
   publicKey() { return httpGet<{ venueId: string; rootPublicKey: OkpJwk; kid: string }>(`${this.url}/admin/public-key`).catch(() => undefined); }
   agentCard() { return httpGet<Record<string, unknown>>(`${this.url}/.well-known/agent-card.json`); }
+
+  /**
+   * Ask the venue to challenge the contact point on the public record, bound to the key that will be registered.
+   * This application never learns the code: it goes from the venue to the entity, and comes back through whoever
+   * is actually reading that mailbox. That is the whole of the proof.
+   */
+  async controlChallenge(p: { usdot: string; mc?: string; publicKey: OkpJwk }) {
+    const r = await rpcCall<{ challengeId: string; sentTo: string; expiresAt: string; subjectKid: string }>(`${this.url}/a2a`, "venue/control-challenge", p);
+    return r.error ? { ok: false as const, reasonCode: (r.error.data as { reasonCode?: string })?.reasonCode, error: r.error.message, evidence: (r.error.data as { evidence?: unknown })?.evidence } : { ok: true as const, ...r.result! };
+  }
+  async controlVerify(p: { challengeId: string; code: string }) {
+    const r = await rpcCall<{ challengeId: string; usdot: string; subjectKid: string; satisfiedAt: string }>(`${this.url}/a2a`, "venue/control-verify", p);
+    if (r.error) return { ok: false as const, reasonCode: (r.error.data as { reasonCode?: string })?.reasonCode, error: r.error.message, evidence: (r.error.data as { evidence?: unknown })?.evidence };
+    const { challengeId, usdot, subjectKid, satisfiedAt } = r.result!;
+    return { ok: true as const, challengeId, usdot, subjectKid, satisfiedAt };
+  }
 }
 
 export interface RegistryRecordView {

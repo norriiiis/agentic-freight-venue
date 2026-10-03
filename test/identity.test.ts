@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
+import { DEFAULT_CONTROL_POLICY } from "../src/protocol/control";
 import { mkdtempSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,7 +18,9 @@ function setup() {
   copyFileSync(FIXTURE, regPath);
   const registry = new MockRegistry(regPath);
   const venueKp = generateKeyPair();
-  const issuer = new CredentialIssuer("venue-test", venueKp, registry, new StubVettingProvider(registry), dir, 90);
+  // As a SIM_MODE venue is configured: the mock registry's readable token counts here and nowhere else.
+  const issuer = new CredentialIssuer("venue-test", venueKp, registry, new StubVettingProvider(registry), dir, 90, undefined, undefined, undefined,
+    { ...DEFAULT_CONTROL_POLICY, accept: ["REGISTRY_CONTACT_CHALLENGE", "OPERATOR_ATTESTED", "VETTING_PROVIDER_ASSERTION", "SIM_STUB_TOKEN"] });
   return { dir, registry, venueKp, issuer };
 }
 
@@ -27,7 +30,7 @@ describe("identity: issuance binds an agent key to a registry entity", () => {
 
   it("issues a credential for a real, insured, authorized carrier with proof of control", async () => {
     const agent = generateKeyPair();
-    const r = await ctx.issuer.issue({ agentId: "carrier-1", publicKey: agent.publicJwk, claimed: { usdot: "2751903", mc: "MC-0938251" }, proofOfControl: { method: "stub", token: "poc-prairie-2c91" } });
+    const r = await ctx.issuer.issue({ agentId: "carrier-1", publicKey: agent.publicJwk, claimed: { usdot: "2751903", mc: "MC-0938251" }, proofOfControl: { method: "SIM_STUB_TOKEN", token: "poc-prairie-2c91" } });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.credential.subject.entity.legalName).toBe("PRAIRIE WIND TRANSPORT INC");
@@ -35,31 +38,31 @@ describe("identity: issuance binds an agent key to a registry entity", () => {
   });
 
   it("refuses an entity not in the registry", async () => {
-    const r = await ctx.issuer.issue({ agentId: "x", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "9999999" }, proofOfControl: { method: "stub", token: "x" } });
+    const r = await ctx.issuer.issue({ agentId: "x", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "9999999" }, proofOfControl: { method: "SIM_STUB_TOKEN", token: "x" } });
     expect(r).toMatchObject({ ok: false, reasonCode: "ONBOARDING_ENTITY_NOT_FOUND" });
   });
 
   it("refuses a real entity without proof of control (the cheap spoof)", async () => {
-    const r = await ctx.issuer.issue({ agentId: "spoof", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903", mc: "MC-0938251" }, proofOfControl: { method: "stub", token: "guess" } });
+    const r = await ctx.issuer.issue({ agentId: "spoof", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903", mc: "MC-0938251" }, proofOfControl: { method: "SIM_STUB_TOKEN", token: "guess" } });
     expect(r).toMatchObject({ ok: false, reasonCode: "ONBOARDING_PROOF_OF_CONTROL_FAILED" });
   });
 
   it("refuses to bind a second key to an entity that already has a live credential", async () => {
-    const a = await ctx.issuer.issue({ agentId: "c1", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "stub", token: "poc-prairie-2c91" } });
+    const a = await ctx.issuer.issue({ agentId: "c1", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "SIM_STUB_TOKEN", token: "poc-prairie-2c91" } });
     expect(a.ok).toBe(true);
-    const b = await ctx.issuer.issue({ agentId: "c2", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "stub", token: "poc-prairie-2c91" } });
+    const b = await ctx.issuer.issue({ agentId: "c2", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "SIM_STUB_TOKEN", token: "poc-prairie-2c91" } });
     expect(b).toMatchObject({ ok: false, reasonCode: "ONBOARDING_KEY_ALREADY_BOUND" });
   });
 
   it("refuses when insurance is lapsed at issuance", async () => {
     ctx.registry.update("2751903", { insurance: ctx.registry.get("2751903")!.insurance.map((f) => (f.type === "BIPD" ? { ...f, cancellationDate: "2026-09-01" } : f)) });
-    const r = await ctx.issuer.issue({ agentId: "c", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "stub", token: "poc-prairie-2c91" } });
+    const r = await ctx.issuer.issue({ agentId: "c", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "SIM_STUB_TOKEN", token: "poc-prairie-2c91" } });
     expect(r).toMatchObject({ ok: false, reasonCode: "INSURANCE_LAPSED" });
   });
 
   it("refuses when authority is not active", async () => {
     ctx.registry.update("2751903", { operatingStatus: "OUT_OF_SERVICE", outOfServiceDate: "2026-08-15" });
-    const r = await ctx.issuer.issue({ agentId: "c", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "stub", token: "poc-prairie-2c91" } });
+    const r = await ctx.issuer.issue({ agentId: "c", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "SIM_STUB_TOKEN", token: "poc-prairie-2c91" } });
     expect(r).toMatchObject({ ok: false, reasonCode: "AUTHORITY_NOT_ACTIVE" });
   });
 });
@@ -69,7 +72,7 @@ describe("identity: verification catches expiry, revocation, forgery, and key mi
   beforeEach(() => { ctx = setup(); });
 
   async function issued(agentKp = generateKeyPair()) {
-    const r = await ctx.issuer.issue({ agentId: "carrier-1", publicKey: agentKp.publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "stub", token: "poc-prairie-2c91" } });
+    const r = await ctx.issuer.issue({ agentId: "carrier-1", publicKey: agentKp.publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "SIM_STUB_TOKEN", token: "poc-prairie-2c91" } });
     if (!r.ok) throw new Error(r.reasonCode);
     return { cred: r.credential, agentKp };
   }
@@ -126,7 +129,7 @@ describe("identity: verification catches expiry, revocation, forgery, and key mi
   });
 
   it("live check enforces the counterparty's required minimum above statutory", async () => {
-    const r = await ctx.issuer.issue({ agentId: "redline", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "4102217" }, proofOfControl: { method: "stub", token: "poc-redline-9b04" } });
+    const r = await ctx.issuer.issue({ agentId: "redline", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "4102217" }, proofOfControl: { method: "SIM_STUB_TOKEN", token: "poc-redline-9b04" } });
     if (!r.ok) throw new Error(r.reasonCode);
     expect(liveCheck(ctx.registry, r.credential, { requiredBipdUsd: 1_000_000 })).toMatchObject({ ok: false, reasonCode: "INSURANCE_BELOW_MINIMUM" });
   });
@@ -144,7 +147,7 @@ describe("identity: key rotation", () => {
     const agentKp = generateKeyPair();
     const principal = generateKeyPair();
     // issued ten minutes ago, so tests can place signatures in the past
-    const r = await ctx.issuer.issue({ agentId: "carrier-1", publicKey: agentKp.publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "stub", token: "poc-prairie-2c91" } }, new Date(Date.now() - 10 * 60_000));
+    const r = await ctx.issuer.issue({ agentId: "carrier-1", publicKey: agentKp.publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "SIM_STUB_TOKEN", token: "poc-prairie-2c91" } }, new Date(Date.now() - 10 * 60_000));
     if (!r.ok) throw new Error(r.reasonCode);
     return { cred: r.credential, agentKp, principal };
   }
@@ -192,8 +195,8 @@ describe("identity: key rotation", () => {
     const { cred } = await onboarded();
     const next = generateKeyPair();
     const claims = claimsFor(cred.credentialId, next);
-    expect(await ctx.issuer.rotate({ credentialId: cred.credentialId, newPublicKey: next.publicJwk, authorization: { kind: "PROOF_OF_CONTROL", method: "stub", token: "guess" }, claims })).toMatchObject({ ok: false, reasonCode: "ROTATION_UNAUTHORIZED" });
-    const r = await ctx.issuer.rotate({ credentialId: cred.credentialId, newPublicKey: next.publicJwk, authorization: { kind: "PROOF_OF_CONTROL", method: "stub", token: "poc-prairie-2c91" }, claims });
+    expect(await ctx.issuer.rotate({ credentialId: cred.credentialId, newPublicKey: next.publicJwk, authorization: { kind: "PROOF_OF_CONTROL", proof: { method: "SIM_STUB_TOKEN", token: "guess" } }, claims })).toMatchObject({ ok: false, reasonCode: "ROTATION_UNAUTHORIZED" });
+    const r = await ctx.issuer.rotate({ credentialId: cred.credentialId, newPublicKey: next.publicJwk, authorization: { kind: "PROOF_OF_CONTROL", proof: { method: "SIM_STUB_TOKEN", token: "poc-prairie-2c91" } }, claims });
     expect(r.ok).toBe(true);
   });
 
@@ -226,7 +229,7 @@ describe("identity: key rotation", () => {
 
   it("onboarding a second key for an entity still says ALREADY_BOUND and points at rotation", async () => {
     await onboarded();
-    const b = await ctx.issuer.issue({ agentId: "c2", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "stub", token: "poc-prairie-2c91" } });
+    const b = await ctx.issuer.issue({ agentId: "c2", publicKey: generateKeyPair().publicJwk, claimed: { usdot: "2751903" }, proofOfControl: { method: "SIM_STUB_TOKEN", token: "poc-prairie-2c91" } });
     expect(b).toMatchObject({ ok: false, reasonCode: "ONBOARDING_KEY_ALREADY_BOUND", evidence: { howToRotate: expect.stringContaining("venue/rotate") } });
   });
 });

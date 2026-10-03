@@ -11,6 +11,7 @@ import { join, resolve } from "node:path";
 import { exportPrivateJwk, generateKeyPair, signJws, type KeyPair, type OkpJwk } from "../protocol/crypto";
 import type { Credential, CredentialStatusEntry, RotationAuthorization, RotationClaims, RotationReason } from "../protocol/types";
 import { buildAgentCard } from "../agentkit/runtime";
+import type { ControlProof } from "../protocol/control";
 import { importKeyPair as importKp } from "../protocol/crypto";
 import { rootCommitment, signCert, signRevocation, signRootEvent, type RootEvent, type VenueKeyCert, type VenueKeyHistory, type VenueKeyRevocation } from "../protocol/venue-keys";
 import type { EquivocationProof, LedgerHead, WitnessReceipt, Witnessed } from "../protocol/witness";
@@ -65,6 +66,13 @@ export interface AgentSpec {
   /** Override which envelope limits are disclosed to the venue. */
   envelopeDisclose?: Partial<MandateEnvelope["limits"]>;
   registerEnvelope?: boolean;
+  /**
+   * How this agent proves control. The default is the simulator's shortcut, which a SIM venue accepts and a
+   * deployed one does not; `REGISTRY_CONTACT_CHALLENGE` makes the harness do exactly what the hosted console
+   * does — create the agent's key first, have the venue challenge the contact point on the public record, and
+   * answer it from that mailbox.
+   */
+  proofMethod?: "SIM_STUB_TOKEN" | "REGISTRY_CONTACT_CHALLENGE";
   /** The COI on file: the principal's insurer's signed word, written into the agent's dir as insurance.json. */
   insurerAttestation?: InsurerAttestation;
   /** The principal's own insurer's key, pinned in the agent's config (received out of band, never from the venue). */
@@ -156,6 +164,29 @@ export class VenueHandle {
   addCapital(usd: number) { return httpPost<{ reserve: unknown; deferredPaid: string[] }>(`${this.url}/admin/reserve/capital`, { usd }); }
   jobs() { return httpGet<{ name: string; everyMs: number; runs: number; lastRunAt?: string; lastError?: string }[]>(`${this.url}/admin/jobs`); }
   runJob(name: string, now?: Date) { return httpPost<{ ok: boolean; result?: unknown; error?: string }>(`${this.url}/admin/jobs/run`, { name, now: now?.toISOString() }); }
+  /**
+   * Attempt to bind a key to an entity directly, with whatever proof the caller has. No agent process: this is
+   * the shape a fraudster's request takes, and the point is that the venue's answer does not depend on who asked.
+   */
+  onboardRaw(p: { usdot: string; mc?: string; publicKey: OkpJwk; agentId: string; kp: KeyPair; proof?: unknown }) {
+    const card = buildAgentCard(
+      { agentId: p.agentId, role: "carrier", dataDir: "", port: 0, venueUrl: this.url, entity: { usdot: p.usdot, mc: p.mc, legalName: "(claimed)" }, principal: { name: "(claimed)", publicKey: p.kp.publicJwk } } as unknown as Parameters<typeof buildAgentCard>[0],
+      p.kp,
+      "http://127.0.0.1:1",
+    );
+    return rpcCall(`${this.url}/a2a`, "venue/onboard", { card, claimed: { usdot: p.usdot, mc: p.mc }, proofOfControl: p.proof, agentUrl: "http://127.0.0.1:1" });
+  }
+
+  /** The venue's outbound channel, as the entity's own mailbox: the only place a challenge code appears. */
+  challengeCodeFor(contact: string): string | undefined {
+    const f = join(this.dir, "control-challenges.jsonl");
+    if (!existsSync(f)) return undefined;
+    const lines = readFileSync(f, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as { to: string; text: string });
+    const mine = lines.filter((l) => l.to === contact).at(-1);
+    return /\n\s{4}(\d{6})\n/.exec(mine?.text ?? "")?.[1];
+  }
+  controlChallenge(p: { usdot: string; publicKey: unknown }) { return rpcCall<{ challengeId: string; sentTo: string; expiresAt: string; subjectKid: string }>(`${this.url}/a2a`, "venue/control-challenge", p); }
+  controlVerify(p: { challengeId: string; code: string }) { return rpcCall<{ challengeId: string; usdot: string; subjectKid: string; satisfiedAt: string }>(`${this.url}/a2a`, "venue/control-verify", p); }
   prePickupChecks(now?: Date) { return httpPost<{ voided: { commitmentId: string; voided: unknown }[] }>(`${this.url}/admin/pre-pickup-checks`, now ? { now: now.toISOString() } : {}); }
   audit() { return httpGet<AuditEntry[]>(`${this.url}/admin/audit`); }
   ledger() { return httpGet<LedgerEntry[]>(`${this.url}/admin/ledger`); }
@@ -361,7 +392,7 @@ export interface InsurerDesk {
 export interface HarnessOptions {
   workspace: string;
   quiet?: boolean;
-  venue?: { maxRounds?: number; replyTimeoutMs?: number; sweepMs?: number; outboxMaxAttempts?: number; inclusionDelayMs?: number; registryMaxAgeMs?: number; registryQuorum?: number; underwriting?: Record<string, unknown> };
+  venue?: { maxRounds?: number; replyTimeoutMs?: number; sweepMs?: number; outboxMaxAttempts?: number; inclusionDelayMs?: number; registryMaxAgeMs?: number; registryQuorum?: number; underwriting?: Record<string, unknown>; controlMethods?: string[]; controlVerifiers?: unknown[]; controlCooldownMs?: number };
 }
 
 export class Harness {
@@ -423,6 +454,14 @@ export class Harness {
       VENUE_OUTBOX_MAX_ATTEMPTS: String(this.opts.venue?.outboxMaxAttempts ?? 40),
       VENUE_INCLUSION_DELAY_MS: String(this.opts.venue?.inclusionDelayMs ?? 60_000),
       VENUE_UW_PARAMS: this.opts.venue?.underwriting ? JSON.stringify(this.opts.venue.underwriting) : "",
+      // Proof of control. By default a SIM venue also accepts the mock registry's readable token, which is what
+      // lets twenty-nine scenarios onboard agents in one line. A scenario that is ABOUT proof of control sets
+      // `controlMethods` to what a deployed venue accepts, and the shortcut disappears.
+      ...(this.opts.venue?.controlMethods ? { VENUE_CONTROL_METHODS: this.opts.venue.controlMethods.join(",") } : {}),
+      ...(this.opts.venue?.controlVerifiers ? { VENUE_CONTROL_VERIFIERS: JSON.stringify(this.opts.venue.controlVerifiers) } : {}),
+      VENUE_CONTROL_COOLDOWN_MS: String(this.opts.venue?.controlCooldownMs ?? 0),
+      VENUE_NOTIFY: "file",
+      VENUE_NOTIFY_FILE: join(dir, "control-challenges.jsonl"),
       SIM_MODE: "1",
     };
     const proc = spawnTs("src/venue/server.ts", this.venueEnv, "venue  ", !!this.opts.quiet);
@@ -605,6 +644,27 @@ export class Harness {
    * here (the "human"), used to sign the mandate/envelope, and then DROPPED —
    * only its public half goes into the agent's config.
    */
+  /**
+   * The proof this agent will present. For the challenge method the key must exist BEFORE the proof, because the
+   * proof names it — the same ordering the hosted console follows, and for the same reason.
+   */
+  private async proofFor(spec: AgentSpec, dir: string): Promise<ControlProof> {
+    if (spec.proofMethod !== "REGISTRY_CONTACT_CHALLENGE") {
+      // SIMULATION ONLY: the mock registry's readable token. A venue not in SIM_MODE refuses this method outright.
+      return { method: "SIM_STUB_TOKEN", token: spec.proofOfControlToken };
+    }
+    const kp = generateKeyPair();
+    writeFileSync(join(dir, "agent-key.jwk.json"), JSON.stringify(exportPrivateJwk(kp)));
+    const rec = await httpGet<{ email?: string }[]>(`${this.registry.url}/records`).then((rs) => rs.find((r) => (r as { usdot?: string }).usdot === spec.entity.usdot));
+    const ch = await this.venue.controlChallenge({ usdot: spec.entity.usdot, publicKey: kp.publicJwk });
+    if (!ch.result) throw new Error(`challenge refused: ${ch.error?.message}`);
+    const code = this.venue.challengeCodeFor(rec?.email ?? "");
+    if (!code) throw new Error(`no challenge code reached ${rec?.email}`);
+    const v = await this.venue.controlVerify({ challengeId: ch.result.challengeId, code });
+    if (!v.result) throw new Error(`challenge not satisfied: ${v.error?.message}`);
+    return { method: "REGISTRY_CONTACT_CHALLENGE", challengeId: ch.result.challengeId };
+  }
+
   async startAgent(spec: AgentSpec): Promise<AgentHandle> {
     const dir = join(this.opts.workspace, spec.agentId);
     mkdirSync(dir, { recursive: true });
@@ -622,7 +682,7 @@ export class Harness {
       port,
       venueUrl: this.venue.url,
       entity: spec.entity,
-      proofOfControl: { method: "stub:fmcsa-registered-email-challenge", token: spec.proofOfControlToken },
+      proofOfControl: await this.proofFor(spec, dir),
       principal: { name: spec.principalName, publicKey: principal.publicJwk },
       insurer: spec.insurer,
       // The simulator models the passage of time by dating documents ahead (a renewal "signed on day 5"); the agent's

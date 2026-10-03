@@ -22,7 +22,8 @@ import { join } from "node:path";
 import { AppDb, type AgentRow, type MemberRole, type OrgRole, type OrgRow } from "./db";
 import { Auth, cookie, hashPassword, may, newId, newInviteCode, passwordProblems, verifyPassword } from "./auth";
 import { keyStoreFromEnv } from "./keys";
-import { mailerFromEnv } from "./mail";
+import { notifierFromEnv } from "../protocol/notify";
+import { FileKeyProvider, loadOrCreate } from "../protocol/keys";
 import { RegistryClient, VenueClient } from "./venue";
 import { Supervisor } from "./supervisor";
 import { Onboarding, STARTING_LIMITS, stepOf } from "./onboarding";
@@ -47,7 +48,15 @@ const DISCLOSURE = "This venue and the registry mirror it reads are operated by 
 
 const db = new AppDb(join(DATA, "app.db"));
 const keys = keyStoreFromEnv(db);
-const mail = mailerFromEnv();
+const mail = notifierFromEnv("APP_", process.env, join(DATA, "sent-mail.jsonl"));
+/**
+ * This service's own identity as a control verifier. It signs only one thing: a statement that an operator
+ * verified a client by hand, bound to the key being registered. The venue takes that word only if the operator
+ * pinned this key in VENUE_CONTROL_VERIFIERS — so until that is done, the hand-verification path simply does not
+ * work, which is the correct failure.
+ */
+const verifierId = process.env.APP_VERIFIER_ID ?? "interchange-console";
+const verifierKp = loadOrCreate(new FileKeyProvider((n) => join(DATA, `${n}.jwk.json`)), "control-verifier");
 const venue = new VenueClient(process.env.APP_VENUE_URL ?? "http://127.0.0.1:4100", process.env.APP_VENUE_OPS_TOKEN);
 const registry = new RegistryClient(process.env.APP_REGISTRY_URL ?? "http://127.0.0.1:4400", process.env.APP_REGISTRY_ID ?? "fmcsa-li-mock");
 const supervisor = new Supervisor(db, {
@@ -55,7 +64,7 @@ const supervisor = new Supervisor(db, {
   venueUrl: venue.url,
   llm: process.env.AGENT_LLM_URL ? { url: process.env.AGENT_LLM_URL, model: process.env.AGENT_LLM_MODEL, key: process.env.AGENT_LLM_KEY, flavor: process.env.AGENT_LLM_FLAVOR } : undefined,
 });
-const onboarding = new Onboarding({ db, keys, mail, registry, supervisor, appUrl: APP_URL });
+const onboarding = new Onboarding({ db, keys, mail, registry, venue, supervisor, appUrl: APP_URL, verifier: { verifierId, kp: verifierKp } });
 const auth = new Auth(db, process.env.APP_SECURE_COOKIES === "1");
 
 // ----------------------------------------------------------------- plumbing
@@ -94,6 +103,9 @@ function navFor(org: OrgRow | undefined, active: string, staff: boolean): ShellN
 }
 
 async function currentAgentRow(orgId: string): Promise<AgentRow | undefined> { return db.agentsOf(orgId)[0]; }
+
+/** Back to the onboarding page, keeping the client context a staff member is working inside. */
+const back = (c: Req) => `/onboarding${c.url.searchParams.get("org") ? `?org=${encodeURIComponent(c.url.searchParams.get("org")!)}` : ""}`;
 
 function page(c: Req, o: { title: string; heading?: string; headingMeta?: string; actions?: string; active: string; body: string }) {
   const org = c.org;
@@ -217,19 +229,19 @@ route("POST", "/onboarding/claim-confirm", "org", async (c) => {
   redirect(c.res, "/onboarding");
 });
 route("POST", "/onboarding/challenge", "org", async (c) => {
-  const r = await onboarding.startEmailChallenge(c.org!.id, c.session!.user.id);
-  setFlash(c.session!.session.id, r.ok ? "good" : "bad", r.ok ? `A code is on its way to ${r.sentTo}.${r.detail ? ` (${r.detail})` : ""}` : r.error);
-  redirect(c.res, "/onboarding");
+  const r = await onboarding.startChallenge(c.org!.id, c.session!.user.id);
+  setFlash(c.session!.session.id, r.ok ? "good" : "bad", r.ok ? `The venue sent a code to ${r.sentTo}, the contact point on the public record. We do not see it.` : r.error);
+  redirect(c.res, back(c));
 });
-route("POST", "/onboarding/verify", "org", (c) => {
-  const r = onboarding.verifyChallenge(c.org!.id, c.form.code ?? "", c.session!.user.id);
+route("POST", "/onboarding/verify", "org", async (c) => {
+  const r = await onboarding.verifyChallenge(c.org!.id, c.form.code ?? "", c.session!.user.id);
   if (!r.ok) setFlash(c.session!.session.id, "bad", r.error);
-  redirect(c.res, "/onboarding");
+  redirect(c.res, back(c));
 });
 route("POST", "/onboarding/attest", "staff", (c) => {
-  const r = onboarding.operatorAttest(c.org!.id, c.session!.user.id, c.form.evidence ?? "");
+  const r = onboarding.operatorAttest(c.org!.id, c.session!.user.id, c.session!.user.name, c.form.evidence ?? "");
   if (!r.ok) setFlash(c.session!.session.id, "bad", r.error);
-  redirect(c.res, "/onboarding");
+  redirect(c.res, back(c));
 });
 route("POST", "/onboarding/key", "org", async (c) => {
   const r = await onboarding.createKey(c.org!.id, c.session!.user.id);
@@ -548,6 +560,9 @@ async function main() {
   server.listen(PORT, process.env.APP_HOST ?? "127.0.0.1", () => {
     console.log(`[app] console on ${APP_URL}`);
     console.log(`[app] venue ${venue.url} · registry ${registry.url} (${registry.registryId}) · key custody: ${keys.kind} · mail: ${mail.kind}`);
+    // The venue takes this service's word about a hand-verification only if it pins this key. Print the line to paste.
+    console.log(`[app] control verifier "${verifierId}" kid ${verifierKp.kid}`);
+    console.log(`[app] to let operators verify clients by hand, set on the venue:\n  VENUE_CONTROL_METHODS=REGISTRY_CONTACT_CHALLENGE,OPERATOR_ATTESTED\n  VENUE_CONTROL_VERIFIERS='${JSON.stringify([{ verifierId, publicKey: verifierKp.publicJwk, methods: ["OPERATOR_ATTESTED"] }])}'`);
   });
   const bye = () => { supervisor.stopAll(); server.close(); db.close(); process.exit(0); };
   process.on("SIGINT", bye);

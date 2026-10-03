@@ -23,7 +23,9 @@ const strategy = llm
 const rt = new AgentRuntime<BrokerPrivateContext>(config, strategy);
 rt.listen().then(async () => {
   await rt.pinVenue();
-  if (!config.rogue?.skipOnboarding && !rt.credential) {
+  // An agent provisioned by an operator (controlToken set) is onboarded by that operator, deliberately: the
+  // proof of control is theirs to present, it is good once, and two onboarders racing would spend it twice.
+  if (!config.rogue?.skipOnboarding && !rt.credential && !config.controlToken) {
     const r = await rt.onboard();
     console.log(`[${config.agentId}] onboard: ${r.ok ? `credential ${r.credential.credentialId}` : `REFUSED ${r.reasonCode}`}`);
   }

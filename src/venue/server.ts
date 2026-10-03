@@ -21,6 +21,12 @@
  *   VENUE_RATE_LIMIT_RPS requests per second per caller (default 50; 0 = unlimited)
  *   VENUE_TLS_CERT / VENUE_TLS_KEY  PEM paths; set both to serve HTTPS
  *   VENUE_HOST           bind address (default 127.0.0.1)
+ *   VENUE_CONTROL_METHODS   comma-separated proofs of control this venue accepts (default REGISTRY_CONTACT_CHALLENGE;
+ *                           SIM_MODE adds SIM_STUB_TOKEN, which is never accepted otherwise)
+ *   VENUE_CONTROL_VERIFIERS JSON [{ verifierId, publicKey, methods? }] — whose signed word about control counts
+ *   VENUE_CONTROL_MAX_AGE_MS / _TTL_MS / _MAX_ATTEMPTS / _COOLDOWN_MS   proof freshness, code lifetime, guess limit, resend floor
+ *   VENUE_NOTIFY            console | file | http — how a challenge reaches the contact point on the public record
+ *   VENUE_NOTIFY_PROVIDER / _TOKEN / _FROM / _FILE
  *   VENUE_CLOCK_SKEW_MS / VENUE_MSG_MAX_AGE_MS / VENUE_OPERATOR_REQUEST_MAX_AGE_MS / VENUE_ROTATION_GRACE_MS /
  *   VENUE_WITNESS_STALENESS_MS  every timestamp tolerance, with its reason, in protocol/clock.ts
  *   SIM_MODE=1           enables /admin/* (fault injection + introspection for the simulator ONLY)
@@ -32,6 +38,7 @@ import { Alerts, Metrics } from "./observe";
 import type { WitnessKey } from "../protocol/witness";
 import type { OkpJwk } from "../protocol/crypto";
 import { clockFromEnv } from "../protocol/clock";
+import type { ControlMethod } from "../protocol/control";
 
 const config = {
   venueId: process.env.VENUE_ID ?? "venue-local",
@@ -50,6 +57,17 @@ const config = {
   inclusionDelayMs: Number(process.env.VENUE_INCLUSION_DELAY_MS ?? 60_000),
   regulators: process.env.VENUE_REGULATORS ? JSON.parse(process.env.VENUE_REGULATORS) : undefined,
   clock: clockFromEnv(),
+  // Proof of control: the gate nothing downstream can repair. The stub token the mock registry serves is a
+  // SIMULATION affordance and is accepted only when this process is run in SIM_MODE.
+  control: {
+    accept: (process.env.VENUE_CONTROL_METHODS?.split(",").map((s) => s.trim()).filter(Boolean) as ControlMethod[] | undefined)
+      ?? (process.env.SIM_MODE === "1" ? ["REGISTRY_CONTACT_CHALLENGE", "VETTING_PROVIDER_ASSERTION", "OPERATOR_ATTESTED", "SIM_STUB_TOKEN"] as ControlMethod[] : undefined),
+    verifiers: process.env.VENUE_CONTROL_VERIFIERS ? JSON.parse(process.env.VENUE_CONTROL_VERIFIERS) : undefined,
+    maxAgeMs: process.env.VENUE_CONTROL_MAX_AGE_MS ? Number(process.env.VENUE_CONTROL_MAX_AGE_MS) : undefined,
+    ttlMs: process.env.VENUE_CONTROL_TTL_MS ? Number(process.env.VENUE_CONTROL_TTL_MS) : undefined,
+    maxAttempts: process.env.VENUE_CONTROL_MAX_ATTEMPTS ? Number(process.env.VENUE_CONTROL_MAX_ATTEMPTS) : undefined,
+    cooldownMs: process.env.VENUE_CONTROL_COOLDOWN_MS ? Number(process.env.VENUE_CONTROL_COOLDOWN_MS) : undefined,
+  },
 };
 const venue = new VenueService(config);
 const simMode = process.env.SIM_MODE === "1";
@@ -221,5 +239,6 @@ venue.init().then(() => venue.recover()).then((r) => {
   });
 }).then(() => {
   jobs.start();
+  if (simMode) console.warn(`[venue] SIM_MODE: the registry's readable stub token is accepted as proof of control. Never run a venue this way where real entities can reach it.`);
   console.log(`[venue] ${config.venueId} listening on ${venue.url} (signing kid ${venue.kp.kid.slice(0, 12)}…, root ${venue.keys.rootPublicKey.kid?.slice(0, 12)}…) replyTimeout ${config.replyTimeoutMs}ms sweep ${sweepMs}ms${simMode ? " SIM_MODE" : ""}`);
 });

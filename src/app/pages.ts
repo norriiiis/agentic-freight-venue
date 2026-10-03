@@ -100,7 +100,7 @@ function stepBody(v: OnboardingView): string {
              </form>`
           : email
             ? `<form method="post" action="/onboarding/challenge">${f}
-                 <p class="small">The public record lists <strong class="mono">${esc(email)}</strong> for this entity. We will send a code there.</p>
+                 <p class="small">The public record lists <strong class="mono">${esc(email)}</strong> for this entity. The venue sends a one-time code there, bound to the key your agent will use. Nobody who cannot read that mailbox can finish this step &mdash; including us.</p>
                  <button class="btn" type="submit" style="margin-top:10px">Send the code</button>
                </form>`
             : `<p class="small muted">The public record carries no email address for this entity, so we cannot challenge it automatically. One of our people will verify you by hand.</p>`}

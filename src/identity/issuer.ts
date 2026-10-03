@@ -5,6 +5,8 @@
  * revocation status maintained here.
  */
 import { randomUUID } from "node:crypto";
+import { DEFAULT_CONTROL_POLICY, evaluateControl, kidOf, type ControlPolicy, type ControlProof } from "../protocol/control";
+import type { ControlStore } from "./control-store";
 import { DEFAULT_CLOCK } from "../protocol/clock";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -18,7 +20,8 @@ export interface IssueRequest {
   agentId: string;
   publicKey: OkpJwk;
   claimed: { usdot: string; mc?: string };
-  proofOfControl: { method: string; token: string };
+  /** See protocol/control.ts. The venue decides which kinds it accepts; the caller does not. */
+  proofOfControl?: ControlProof;
 }
 
 export type IssueResult =
@@ -57,6 +60,10 @@ export class CredentialIssuer {
     private readonly registryMaxAgeMs = 60_000,
     /** Rotation claims are deliberate acts: a claim older than this is stale. */
     private readonly operatorRequestMaxAgeMs = DEFAULT_CLOCK.operatorRequestMaxAgeMs,
+    /** Which proofs of control this venue accepts, and whose word it takes. */
+    private readonly controlPolicy: ControlPolicy = DEFAULT_CONTROL_POLICY,
+    /** The venue's own record of challenges it sent and proofs it has spent. */
+    private readonly control?: ControlStore,
   ) {
     this.signer = typeof signer === "function" ? signer : () => signer;
     this.dir = join(dataDir, "identity");
@@ -112,11 +119,16 @@ export class CredentialIssuer {
     if (!ins.ok) {
       return { ok: false, reasonCode: ins.reasonCode!, evidence: { usdot: rec.usdot, insurance: ins } };
     }
-    // STUB proof of control: production would challenge the FMCSA-registered
-    // email/phone, or accept a vetting provider's verified-identity assertion.
-    if (req.proofOfControl.token !== rec._proofOfControlToken) {
-      return { ok: false, reasonCode: "ONBOARDING_PROOF_OF_CONTROL_FAILED", evidence: { usdot: rec.usdot, method: req.proofOfControl.method } };
-    }
+    // Proof of control. The gate nothing downstream can repair: everything after this binds a key to THIS entity's
+    // authority, and if it is wrong the credential is a forgery the venue signed itself. See protocol/control.ts.
+    const subjectKid = kidOf(req.publicKey);
+    const control = evaluateControl(req.proofOfControl, {
+      policy: this.controlPolicy, usdot: rec.usdot, subjectKid, now,
+      challenge: (id) => this.control?.satisfied(id),
+      seen: (jti) => this.control?.seen(jti) ?? false,
+      stubToken: rec._proofOfControlToken,
+    });
+    if (!control.ok) return { ok: false, reasonCode: control.reasonCode, evidence: { usdot: rec.usdot, subjectKid, ...control.evidence } };
     const existing = [...this.issued.values()].find(
       (c) => c.subject.entity.usdot === rec.usdot && !this.statuses.has(c.credentialId) && new Date(c.expiresAt) > now && c.subject.publicKey.x !== req.publicKey.x,
     );
@@ -128,8 +140,15 @@ export class CredentialIssuer {
       return { ok: false, reasonCode: "ONBOARDING_PROOF_OF_CONTROL_FAILED", evidence: { usdot: rec.usdot, vetting: vet } };
     }
 
-    const credential = this.mint(req.agentId, rec, req.publicKey, { insuranceCheckedAt: ins.asOf, vettingProvider: vet.provider, vettingFlags: vet.flags, proofOfControl: req.proofOfControl.method }, now);
+    const credential = this.mint(req.agentId, rec, req.publicKey, {
+      insuranceCheckedAt: ins.asOf, vettingProvider: vet.provider, vettingFlags: vet.flags,
+      proofOfControl: control.method,
+      proofOfControlDetail: { method: control.method, verifierId: control.verifierId, verifiedAt: control.verifiedAt, boundToKid: subjectKid },
+    }, now);
     this.issued.set(credential.credentialId, credential);
+    // Spend the proof only now: a failed issuance must not burn the client's challenge, and a successful one must
+    // make it unusable for anybody else.
+    this.control?.consume({ challengeId: req.proofOfControl?.method === "REGISTRY_CONTACT_CHALLENGE" ? req.proofOfControl.challengeId : undefined, jti: control.jti }, now);
     this.persist();
     return { ok: true, credential };
   }
@@ -140,7 +159,7 @@ export class CredentialIssuer {
     return atts.length ? atts.map(registryRef) : undefined;
   }
 
-  private mint(agentId: string, rec: RegistryRecord, publicKey: OkpJwk, ev: { insuranceCheckedAt: string; vettingProvider: string; vettingFlags: string[]; proofOfControl: string }, now: Date, supersedes?: string): Credential {
+  private mint(agentId: string, rec: RegistryRecord, publicKey: OkpJwk, ev: { insuranceCheckedAt: string; vettingProvider: string; vettingFlags: string[]; proofOfControl: string; proofOfControlDetail?: Credential["evidence"]["proofOfControlDetail"] }, now: Date, supersedes?: string): Credential {
     const kid = publicKey.kid ?? jwkThumbprint(publicKey);
     const unsigned: Omit<Credential, "issuerSignature"> = {
       credentialId: `cred_${randomUUID()}`,
@@ -194,8 +213,18 @@ export class CredentialIssuer {
       if (!sig.ok) return { ok: false, reasonCode: "ROTATION_UNAUTHORIZED", evidence: { presented: "PRINCIPAL", error: sig.error, principalKid: req.principalPublicKey.kid } };
     }
     if (a.kind === "PROOF_OF_CONTROL") {
+      // The same gate as onboarding, and for the same reason: this is how a principal who lost its own key gets
+      // back in, so anything weaker here is a way past the principal-only rule rather than an exception to it.
       const rec0 = this.registry.get(old.subject.entity.usdot);
-      if (!rec0 || a.token !== rec0._proofOfControlToken) return { ok: false, reasonCode: "ROTATION_UNAUTHORIZED", evidence: { presented: "PROOF_OF_CONTROL", error: "proof of control failed" } };
+      if (!rec0) return { ok: false, reasonCode: "ROTATION_UNAUTHORIZED", evidence: { presented: "PROOF_OF_CONTROL", error: "no registry record for this entity" } };
+      const v = evaluateControl(a.proof, {
+        policy: this.controlPolicy, usdot: rec0.usdot, subjectKid: newKid, now,
+        challenge: (id) => this.control?.satisfied(id),
+        seen: (jti) => this.control?.seen(jti) ?? false,
+        stubToken: rec0._proofOfControlToken,
+      });
+      if (!v.ok) return { ok: false, reasonCode: "ROTATION_UNAUTHORIZED", evidence: { presented: "PROOF_OF_CONTROL", control: v.reasonCode, ...v.evidence } };
+      this.control?.consume({ challengeId: a.proof?.method === "REGISTRY_CONTACT_CHALLENGE" ? a.proof.challengeId : undefined, jti: v.jti }, now);
     }
     // ---- same standing checks as onboarding (a rotation is a re-issuance) ----
     if (this.registry.refresh) {

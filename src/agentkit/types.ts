@@ -1,4 +1,5 @@
 import type { OkpJwk } from "../protocol/crypto";
+import type { ControlProof } from "../protocol/control";
 import type { CounterNoteCode, LoadSpec, RejectReasonCode, Terms } from "../protocol/freight";
 import type { VenueAttachment } from "../protocol/envelope";
 import type { Mandate } from "../mandate/types";
@@ -17,7 +18,12 @@ export interface AgentConfig {
   port: number;
   venueUrl: string;
   entity: { usdot: string; mc?: string; legalName: string };
-  proofOfControl: { method: string; token: string };
+  /**
+   * The proof of control this agent presents at onboarding, obtained by whoever provisioned it — a challenge the
+   * venue sent to the contact point on the public record, or a verifier's signed attestation. The agent does not
+   * produce this and cannot: it is a statement about who controls the authority, not about the agent.
+   */
+  proofOfControl?: ControlProof;
   /** Simulated deliberation time per decision (ms). Makes transcripts readable and lets the sim inject events mid-negotiation. */
   thinkMs?: number;
   /** How often to pull tasks/get for negotiations still OPEN locally (push is at-least-once; pull bounds the gap). Default 15s. */

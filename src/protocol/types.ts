@@ -3,6 +3,7 @@
  * agents and the venue agree on; no component's private state lives here.
  */
 import type { OkpJwk } from "./crypto";
+import type { ControlProof } from "./control";
 
 export type EntityType = "CARRIER" | "BROKER" | "CARRIER_BROKER";
 
@@ -44,7 +45,12 @@ export interface Credential {
     insuranceCheckedAt: string;
     vettingProvider: string;
     vettingFlags: string[];
-    proofOfControl: string; // method used, e.g. "stub:fmcsa-portal-email-challenge"
+    proofOfControl: string; // method used, e.g. "REGISTRY_CONTACT_CHALLENGE"
+    /**
+     * What that proof actually was. A counterparty reading this credential can tell the difference between a code
+     * the venue sent to the contact point on the public record and an operator's say-so, and refuse the weaker one.
+     */
+     proofOfControlDetail?: { method: string; verifierId?: string; verifiedAt: string; boundToKid: string };
   };
   /** Compact JWS by the issuer over the credential sans this field. */
   issuerSignature: string;
@@ -76,7 +82,7 @@ export type RotationReason = "ROTATION" | "RENEWAL" | "COMPROMISE";
 /** What a rotation request must prove. The agent's own current key is deliberately NOT an option. */
 export type RotationAuthorization =
   | { kind: "PRINCIPAL"; jws: string }            // detached JWS by the principal key registered in the mandate envelope
-  | { kind: "PROOF_OF_CONTROL"; method: string; token: string } // registry-rooted, same gate as onboarding
+  | { kind: "PROOF_OF_CONTROL"; proof?: ControlProof }          // the same gate as onboarding, and no weaker
   | { kind: "CURRENT_KEY_ONLY"; jws: string };    // the agent signs with its own key — refused, by design
 
 export interface RotationClaims {

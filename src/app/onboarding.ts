@@ -11,16 +11,32 @@
  *   5  AGENT     a process with that mandate on disk, onboarded to the venue,
  *                holding a credential bound to the entity
  *
- * On proof of control, plainly: the gate that matters in this pilot is step 2,
- * performed by this service — a challenge to the contact point on the public
- * record, or an operator who did the check by hand and said what they did. The
- * venue runs its own check too, against the registry's out-of-band channel,
- * and that one is a stub: anything that can reach the registry can read the
- * token. Two weak checks are not one strong one, and the stronger of the two
- * is the human one. This is the single most important thing to replace before
- * the pilot stops being closed.
+ * On proof of control. This application does not perform the proof and is not
+ * trusted to assert that it did. The VENUE sends a one-time code to the
+ * contact point on the registry's own record, bound to the exact key that is
+ * about to be registered, and this service never sees it: it passes the
+ * client's answer through and keeps only the challenge id. If the contact
+ * point on the record is not one the client can read, there is no code to
+ * find — which is the point.
+ *
+ * Where no contact point exists, an operator can still verify by hand, and
+ * then this service signs a control attestation with its own key saying what
+ * was done and which key it vouches for. That is a strictly weaker claim and
+ * is marked as such: the venue accepts it only if the operator pinned this
+ * service's key in VENUE_CONTROL_VERIFIERS, the credential records that this
+ * is what backed it, and a counterparty reading the artifact can refuse it.
+ *
+ * Both proofs are bound to the agent's key, which is why that key is created
+ * here, at this step, rather than when the agent first starts: a proof that is
+ * not about a particular key can be carried to any other.
  */
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { exportPrivateJwk, generateKeyPair, importKeyPair, type KeyPair, type OkpJwk } from "../protocol/crypto";
+import { writeFileAtomic } from "../protocol/fsatomic";
+import { signControlAttestation, type ControlAttestation, type ControlProof } from "../protocol/control";
+import type { Notifier } from "../protocol/notify";
 import { validateLimits } from "../mandate/validate";
 import { issueEnvelopeWith, issueMandateWith } from "../mandate/sign";
 import type { Mandate, MandateLimits } from "../mandate/types";
@@ -28,8 +44,7 @@ import type { MandateEnvelope } from "../protocol/types";
 import { newId } from "./auth";
 import type { AppDb, OrgRole, OrgStatus } from "./db";
 import type { PrincipalKeyStore } from "./keys";
-import type { Mailer } from "./mail";
-import type { RegistryClient } from "./venue";
+import type { RegistryClient, VenueClient } from "./venue";
 import { Supervisor, freePort } from "./supervisor";
 
 /**
@@ -81,10 +96,13 @@ export function stepOf(status: OrgStatus): Step {
 export interface OnboardingDeps {
   db: AppDb;
   keys: PrincipalKeyStore;
-  mail: Mailer;
+  mail: Notifier;
   registry: RegistryClient;
+  venue: VenueClient;
   supervisor: Supervisor;
   appUrl: string;
+  /** This service's own key, as a control verifier. The venue accepts its word only if it pinned this key. */
+  verifier: { verifierId: string; kp: KeyPair };
 }
 
 export class Onboarding {
@@ -120,52 +138,92 @@ export class Onboarding {
   }
 
   // ---------------------------------------------------------------- 2. prove
-  /** Send a one-time code to the contact point the public record carries. */
-  async startEmailChallenge(orgId: string, actorUserId: string): Promise<{ ok: true; sentTo: string; detail?: string } | { ok: false; error: string }> {
+  /**
+   * The key the agent will register, created now so the proof can be bound to it. Written straight into the
+   * agent's data directory, which is where the runtime looks for it, so the key that is proven is the key that is
+   * used — not one generated later that nobody vouched for.
+   */
+  ensureAgentKey(orgId: string): { agentId: string; kid: string; publicJwk: OkpJwk } {
     const e = this.d.db.entity(orgId);
-    if (!e || !e.snapshot) return { ok: false, error: "claim your entity first" };
-    const snap = JSON.parse(e.snapshot) as { email?: string; phone?: string };
-    const to = (snap.email ?? "").trim();
-    if (!to) return { ok: false, error: "The public record carries no email address for this entity, so we cannot challenge it. Ask us to verify you by hand instead." };
-    const code = randomBytes(4).toString("hex").toUpperCase();
-    const id = newId("proof");
-    this.d.db.run("INSERT INTO proofs (id, org_id, method, status, challenge, sent_to, created_at) VALUES (?, ?, ?, 'PENDING', ?, ?, ?)",
-      id, orgId, "registry-contact-challenge", code, to, new Date().toISOString());
-    const sent = await this.d.mail.send({
-      to,
-      subject: `Confirm control of USDOT ${e.usdot}`,
-      text: `Someone is setting up an automated freight agent for ${e.legalName} (USDOT ${e.usdot}).\n\nIf that is you, your confirmation code is:\n\n    ${code}\n\nEnter it at ${this.d.appUrl}/onboarding.\n\nIf it is not you, ignore this message and tell us at once — somebody is trying to transact as your company.\n`,
-    });
-    this.d.db.audit({ actorUserId, orgId, event: "onboarding.challenge-sent", outcome: sent.ok ? "ALLOWED" : "FAILED", detail: { to, proofId: id, transport: this.d.mail.kind, detail: sent.detail } });
-    return { ok: true, sentTo: to, detail: sent.detail };
+    if (!e) throw new Error("claim your entity first");
+    const agentId = agentIdFor(e.legalName, e.usdot);
+    const dir = this.d.supervisor.dirFor(agentId);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "agent-key.jwk.json");
+    if (existsSync(path)) {
+      const kp = importKeyPair(JSON.parse(readFileSync(path, "utf8")) as OkpJwk);
+      return { agentId, kid: kp.kid, publicJwk: kp.publicJwk };
+    }
+    const kp = generateKeyPair();
+    writeFileAtomic(path, JSON.stringify(exportPrivateJwk(kp)));
+    return { agentId, kid: kp.kid, publicJwk: kp.publicJwk };
   }
 
-  verifyChallenge(orgId: string, code: string, actorUserId: string): { ok: true } | { ok: false; error: string } {
-    const p = this.d.db.one<{ id: string; challenge: string }>("SELECT id, challenge FROM proofs WHERE org_id = ? AND status = 'PENDING' AND method = 'registry-contact-challenge' ORDER BY created_at DESC", orgId);
-    if (!p) return { ok: false, error: "no challenge is outstanding" };
-    if ((p.challenge ?? "").toUpperCase() !== code.trim().toUpperCase()) {
-      this.d.db.audit({ actorUserId, orgId, event: "onboarding.challenge-verify", outcome: "REFUSED", detail: { proofId: p.id } });
-      return { ok: false, error: "That code does not match." };
+  /** Ask the VENUE to challenge the contact point on the public record. This service never sees the code. */
+  async startChallenge(orgId: string, actorUserId: string): Promise<{ ok: true; sentTo: string; expiresAt: string } | { ok: false; error: string }> {
+    const e = this.d.db.entity(orgId);
+    if (!e) return { ok: false, error: "claim your entity first" };
+    const key = this.ensureAgentKey(orgId);
+    const r = await this.d.venue.controlChallenge({ usdot: e.usdot, mc: e.mc ?? undefined, publicKey: key.publicJwk });
+    if (!r.ok) {
+      this.d.db.audit({ actorUserId, orgId, event: "onboarding.challenge-sent", outcome: "REFUSED", detail: { reasonCode: r.reasonCode, error: r.error, evidence: r.evidence } });
+      return { ok: false, error: r.reasonCode === "CONTROL_NO_CONTACT_ON_RECORD"
+        ? "The public record carries no contact point for this entity, so there is nowhere to send a code. One of our people will verify you by hand instead."
+        : `The venue would not send a code: ${r.error}` };
     }
+    const id = newId("proof");
+    this.d.db.run("INSERT INTO proofs (id, org_id, method, status, challenge, sent_to, created_at, subject_kid) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?)",
+      id, orgId, "REGISTRY_CONTACT_CHALLENGE", r.challengeId, r.sentTo, new Date().toISOString(), r.subjectKid);
+    this.d.db.audit({ actorUserId, orgId, event: "onboarding.challenge-sent", outcome: "ALLOWED", detail: { proofId: id, challengeId: r.challengeId, sentTo: r.sentTo, subjectKid: r.subjectKid } });
+    return { ok: true, sentTo: r.sentTo, expiresAt: r.expiresAt };
+  }
+
+  /** Pass the client's answer to the venue. The venue decides, counts the attempt, and answers once. */
+  async verifyChallenge(orgId: string, code: string, actorUserId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    const p = this.d.db.one<{ id: string; challenge: string }>("SELECT id, challenge FROM proofs WHERE org_id = ? AND status = 'PENDING' AND method = 'REGISTRY_CONTACT_CHALLENGE' ORDER BY created_at DESC", orgId);
+    if (!p) return { ok: false, error: "no challenge is outstanding" };
+    const r = await this.d.venue.controlVerify({ challengeId: p.challenge, code });
+    if (!r.ok) {
+      const ev = r.evidence as { attemptsLeft?: number; why?: string } | undefined;
+      this.d.db.audit({ actorUserId, orgId, event: "onboarding.challenge-verify", outcome: "REFUSED", detail: { proofId: p.id, reasonCode: r.reasonCode, evidence: r.evidence } });
+      if (ev?.attemptsLeft === 0) this.d.db.run("UPDATE proofs SET status = 'FAILED' WHERE id = ?", p.id);
+      return { ok: false, error: `${ev?.why ?? r.error}${ev?.attemptsLeft ? ` ${ev.attemptsLeft} ${ev.attemptsLeft === 1 ? "try" : "tries"} left.` : ""}` };
+    }
+    const proof: ControlProof = { method: "REGISTRY_CONTACT_CHALLENGE", challengeId: r.challengeId };
     this.d.db.tx(() => {
-      this.d.db.run("UPDATE proofs SET status = 'VERIFIED', verified_at = ? WHERE id = ?", new Date().toISOString(), p.id);
+      this.d.db.run("UPDATE proofs SET status = 'VERIFIED', verified_at = ?, subject_kid = ?, proof = ? WHERE id = ?", r.satisfiedAt, r.subjectKid, JSON.stringify(proof), p.id);
       this.d.db.run("UPDATE orgs SET status = ? WHERE id = ? AND status = 'ENTITY_CLAIMED'", "CONTROL_PROVEN", orgId);
     });
-    this.d.db.audit({ actorUserId, orgId, event: "onboarding.challenge-verify", outcome: "ALLOWED", detail: { proofId: p.id } });
+    this.d.db.audit({ actorUserId, orgId, event: "onboarding.challenge-verify", outcome: "ALLOWED", detail: { proofId: p.id, challengeId: r.challengeId, subjectKid: r.subjectKid } });
     return { ok: true };
   }
 
-  /** An operator did the check themselves. Their name and what they did go on the record, because that is the evidence. */
-  operatorAttest(orgId: string, operatorUserId: string, evidence: string): { ok: true } | { ok: false; error: string } {
+  /**
+   * An operator verified by hand. This service then signs a statement of what was done, bound to the key, which
+   * the venue accepts only if it pinned this service's verifier key. The operator's name is in it, because that is
+   * the evidence, and a counterparty reading the credential can see that this — and not a challenge to the public
+   * record — is what the credential rests on.
+   */
+  operatorAttest(orgId: string, operatorUserId: string, operatorName: string, evidence: string): { ok: true; attestation: ControlAttestation } | { ok: false; error: string } {
     if (evidence.trim().length < 20) return { ok: false, error: "Say what you actually did to verify this — a phone number you called, a document you saw. Twenty characters is not evidence." };
+    const e = this.d.db.entity(orgId);
+    if (!e) return { ok: false, error: "claim the entity first" };
+    const key = this.ensureAgentKey(orgId);
+    const now = new Date();
+    const attestation = signControlAttestation(this.d.verifier.kp, this.d.verifier.verifierId, {
+      usdot: e.usdot, mc: e.mc ?? undefined, subjectKid: key.kid, method: "OPERATOR_ATTESTED",
+      evidence: { note: evidence.trim(), operator: operatorName, channel: "out-of-band", contactedAt: now.toISOString() },
+      verifiedAt: now.toISOString(), expiresAt: new Date(now.getTime() + 7 * 86_400_000).toISOString(), jti: `cta_${randomUUID()}`,
+    });
+    const proof: ControlProof = { method: "OPERATOR_ATTESTED", attestation };
     const id = newId("proof");
     this.d.db.tx(() => {
-      this.d.db.run("INSERT INTO proofs (id, org_id, method, status, created_at, verified_at, operator_user_id, evidence) VALUES (?, ?, ?, 'VERIFIED', ?, ?, ?, ?)",
-        id, orgId, "operator-attested", new Date().toISOString(), new Date().toISOString(), operatorUserId, evidence.trim());
+      this.d.db.run("INSERT INTO proofs (id, org_id, method, status, created_at, verified_at, operator_user_id, evidence, subject_kid, proof) VALUES (?, ?, ?, 'VERIFIED', ?, ?, ?, ?, ?, ?)",
+        id, orgId, "OPERATOR_ATTESTED", now.toISOString(), now.toISOString(), operatorUserId, evidence.trim(), key.kid, JSON.stringify(proof));
       this.d.db.run("UPDATE orgs SET status = ? WHERE id = ? AND status IN ('ENTITY_CLAIMED','NEW')", "CONTROL_PROVEN", orgId);
     });
-    this.d.db.audit({ actorUserId: operatorUserId, orgId, event: "onboarding.operator-attested", outcome: "ALLOWED", detail: { proofId: id, evidence: evidence.trim() } });
-    return { ok: true };
+    this.d.db.audit({ actorUserId: operatorUserId, orgId, event: "onboarding.operator-attested", outcome: "ALLOWED", detail: { proofId: id, subjectKid: key.kid, jti: attestation.jti, evidence: evidence.trim() } });
+    return { ok: true, attestation };
   }
 
   // ------------------------------------------------------------------ 3. key
@@ -219,15 +277,16 @@ export class Onboarding {
     const controlToken = existing?.controlToken ?? randomBytes(24).toString("base64url");
     const ctx = { ...(STARTING_CONTEXT[org.role]), ...(existing ? JSON.parse(existing.privateContext) as Record<string, unknown> : {}), ...(privateContext ?? {}), canary: randomBytes(8).toString("hex") };
 
-    // The venue runs its own proof-of-control check against the registry's out-of-band channel. See the note
-    // at the top of this file: that check is a stub, and the gate that matters was step 2, above.
-    const oob = await this.d.registry.outOfBand(entity.usdot);
+    // The proof obtained at step 2, bound to this agent's key. The venue checks it again and spends it.
+    const proofRow = this.d.db.provenControl(orgId);
+    if (!proofRow?.proof) return { ok: false, error: "control of this entity has not been proven yet" };
+    const proof = JSON.parse(proofRow.proof) as ControlProof;
 
     const { dir } = this.d.supervisor.provision({
       agentId: mandateRow.agentId, role: org.role, port, controlToken,
       entity: { usdot: entity.usdot, mc: entity.mc ?? undefined, legalName: entity.legalName },
       principalName: org.name, principalPublicKey: signer.publicJwk,
-      proofOfControl: { method: "stub:registry-out-of-band", token: oob?._proofOfControlToken ?? "" },
+      proofOfControl: proof,
       mandate, envelope, privateContext: ctx,
     });
 

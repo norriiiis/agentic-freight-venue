@@ -15,6 +15,7 @@ import { join, resolve } from "node:path";
 import { createServer } from "node:net";
 import { httpGet, httpPost, waitForHealth } from "../protocol/rpc";
 import type { AgentConfig } from "../agentkit/types";
+import type { ControlProof } from "../protocol/control";
 import type { AppDb, AgentRow, OrgRole } from "./db";
 
 const ROOT = resolve(import.meta.dirname, "../..");
@@ -51,7 +52,7 @@ export class Supervisor {
     agentId: string; role: OrgRole; port: number; controlToken: string;
     entity: { usdot: string; mc?: string; legalName: string };
     principalName: string; principalPublicKey: AgentConfig["principal"]["publicKey"];
-    proofOfControl: { method: string; token: string };
+    proofOfControl?: ControlProof;
     mandate: unknown; envelope: unknown; privateContext: Record<string, unknown>;
   }) {
     const dir = this.dirFor(input.agentId);

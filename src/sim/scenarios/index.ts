@@ -29,6 +29,7 @@ import { insurerKeyBinding } from "./insurer-key-binding";
 import { filerOnboarding } from "./filer-onboarding";
 import { regulatorKey } from "./regulator-key";
 import { loadLifecycle } from "./load-lifecycle";
+import { onboardingFraud } from "./onboarding-fraud";
 
-export const SCENARIOS: Scenario[] = [happyPath, insuranceLapsed, spoofedCarrier, doubleBrokering, brokerOverCeiling, exposureMidNegotiation, nonConvergence, revokedPrePickup, replayAndTamper, multiTender, negotiationTimeout, promptInjection, venueCrashRecovery, venueCrashNotification, keyRotation, venueKeyRotation, rootKeyRotation, statusTimestamping, witnessEquivocation, witnessCollusion, delayedRecording, registryNotRead, registryQuorum, registryCollusion, insuranceRenewal, insurerOfRecord, insurerKeyBinding, filerOnboarding, regulatorKey, loadLifecycle];
+export const SCENARIOS: Scenario[] = [happyPath, insuranceLapsed, spoofedCarrier, doubleBrokering, brokerOverCeiling, exposureMidNegotiation, nonConvergence, revokedPrePickup, replayAndTamper, multiTender, negotiationTimeout, promptInjection, venueCrashRecovery, venueCrashNotification, keyRotation, venueKeyRotation, rootKeyRotation, statusTimestamping, witnessEquivocation, witnessCollusion, delayedRecording, registryNotRead, registryQuorum, registryCollusion, insuranceRenewal, insurerOfRecord, insurerKeyBinding, filerOnboarding, regulatorKey, loadLifecycle, onboardingFraud];
 export const ADVERSARIAL = SCENARIOS.filter((s) => s.id !== "happy-path");

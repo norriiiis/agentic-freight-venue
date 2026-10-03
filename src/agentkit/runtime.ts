@@ -218,7 +218,22 @@ export class AgentRuntime<Ctx extends { canary: string }> {
     return res;
   }
 
+  private onboarding?: Promise<{ ok: true; credential: Credential } | { ok: false; reasonCode: string; evidence: unknown }>;
+
+  /**
+   * Idempotent, and single-flight. A proof of control is good exactly once, so a second attempt would spend a
+   * proof the principal cannot easily obtain again; two concurrent attempts would spend it twice and the second
+   * would be refused as a replay. Both callers here get the same answer from the same attempt.
+   */
   async onboard(): Promise<{ ok: true; credential: Credential } | { ok: false; reasonCode: string; evidence: unknown }> {
+    if (this.credential) return { ok: true, credential: this.credential };
+    if (this.onboarding) return this.onboarding;
+    this.onboarding = this.onboardOnce().finally(() => { this.onboarding = undefined; });
+    return this.onboarding;
+  }
+
+  private async onboardOnce(): Promise<{ ok: true; credential: Credential } | { ok: false; reasonCode: string; evidence: unknown }> {
+    if (this.credential) return { ok: true, credential: this.credential };
     if (!this.venueKey) await this.pinVenue();
     const res = await rpcCall<{ credential: Credential }>(`${this.config.venueUrl}/a2a`, "venue/onboard", {
       card: this.agentCard(),

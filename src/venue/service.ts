@@ -10,6 +10,9 @@
  */
 import { randomUUID } from "node:crypto";
 import { DEFAULT_CLOCK, type ClockPolicy } from "../protocol/clock";
+import { DEFAULT_CONTROL_POLICY, kidOf, type ControlPolicy, type ControlProof } from "../protocol/control";
+import { ControlStore } from "../identity/control-store";
+import { maskContact, notifierFromEnv, type Notifier } from "../protocol/notify";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { A2A_PROTOCOL_VERSION, FREIGHT_EXTENSION_URI, RPC_ERR, TERMINAL_STATES, dataPart, signAgentCard, verifyAgentCard, type AgentCard, type Message, type Task } from "../protocol/a2a";
@@ -57,6 +60,10 @@ export interface VenueConfig {
   messageMaxAgeMs: number;
   /** Every other timestamp tolerance (skew, operator requests, rotation grace); defaults from protocol/clock.ts. */
   clock?: Partial<ClockPolicy>;
+  /** Which proofs of control this venue accepts, and whose word it takes. See protocol/control.ts. */
+  control?: Partial<ControlPolicy> & { ttlMs?: number; maxAttempts?: number; cooldownMs?: number };
+  /** How this venue reaches a contact point on the public record to challenge it. */
+  notifier?: Notifier;
   /** How long the venue waits for the awaited party's reply before canceling the negotiation. */
   replyTimeoutMs: number;
   /** Deliveries abandoned to the dead-letter queue after this many attempts (agents can still pull via tasks/get). */
@@ -82,6 +89,9 @@ export class VenueService {
   /** Venue key ring: root public key, ACTIVE operational key, certificates, revocations. Never cache `kp` across a rotation. */
   readonly keys: VenueKeyRing;
   readonly clock: ClockPolicy;
+  readonly controlPolicy: ControlPolicy;
+  readonly control: ControlStore;
+  private readonly notifier: Notifier;
   readonly registry: RegistryMirror;
   readonly issuer: CredentialIssuer;
   readonly ledger: Ledger;
@@ -97,7 +107,10 @@ export class VenueService {
     this.url = `http://127.0.0.1:${config.port}`;
     this.clock = { ...DEFAULT_CLOCK, ...config.clock, messageMaxAgeMs: config.messageMaxAgeMs, registryMaxAgeMs: config.registryMaxAgeMs };
     this.registry = new RegistryMirror(config.registries, config.dataDir, config.registryQuorum, this.clock.skewMs);
-    this.issuer = new CredentialIssuer(config.venueId, () => this.keys.signer(), this.registry, new StubVettingProvider(this.registry), config.dataDir, undefined, this.clock.rotationGraceMs, config.registryMaxAgeMs, this.clock.operatorRequestMaxAgeMs);
+    this.controlPolicy = { ...DEFAULT_CONTROL_POLICY, ...config.control, verifiers: config.control?.verifiers ?? DEFAULT_CONTROL_POLICY.verifiers, accept: config.control?.accept ?? DEFAULT_CONTROL_POLICY.accept };
+    this.control = new ControlStore(config.dataDir, { ttlMs: config.control?.ttlMs, maxAttempts: config.control?.maxAttempts, cooldownMs: config.control?.cooldownMs });
+    this.notifier = config.notifier ?? notifierFromEnv("VENUE_", process.env, join(config.dataDir, "control-challenges.jsonl"));
+    this.issuer = new CredentialIssuer(config.venueId, () => this.keys.signer(), this.registry, new StubVettingProvider(this.registry), config.dataDir, undefined, this.clock.rotationGraceMs, config.registryMaxAgeMs, this.clock.operatorRequestMaxAgeMs, this.controlPolicy, this.control);
     this.ledger = new Ledger(join(config.dataDir, "ledger.jsonl"), () => this.keys.signer(), this.keys.currentCert(), this.keys.currentRootEvent());
     this.underwriting = new UnderwritingEngine(config.dataDir, { ...DEFAULT_PARAMS, ...config.underwriting });
     this.audit = new AuditLog(join(config.dataDir, "audit.jsonl"));
@@ -604,7 +617,49 @@ export class VenueService {
     await this.applyVoid(journal, entry, "live");
   }
 
-  async onboard(params: { card: AgentCard; claimed: { usdot: string; mc?: string }; proofOfControl: { method: string; token: string }; agentUrl: string; envelope?: MandateEnvelope; insurerAttestation?: InsurerAttestation }) {
+  /**
+   * Send a one-time code to the contact point the REGISTRY's record carries for this entity, bound to the key the
+   * caller intends to register. The caller learns only that it went, and roughly where; if they do not control that
+   * contact point they never see the code, which is the whole of the proof. Nothing here tells a caller whether an
+   * entity exists in a way a plain registry read would not already tell them.
+   */
+  async controlChallenge(params: { usdot: string; mc?: string; publicKey: OkpJwk }) {
+    const now = new Date();
+    const usdot = String(params.usdot ?? "").trim();
+    if (!this.controlPolicy.accept.includes("REGISTRY_CONTACT_CHALLENGE")) throw new Refusal("CONTROL_METHOD_NOT_ACCEPTED", "venue.identity", { accepted: this.controlPolicy.accept });
+    let rec;
+    try {
+      await this.registry.refresh(usdot, this.config.registryMaxAgeMs, now);
+      rec = this.registry.get(usdot);
+    } catch (e) {
+      throw new Refusal("REGISTRY_UNAVAILABLE", "venue.identity", { usdot, error: (e as Error).message });
+    }
+    if (!rec) throw new Refusal("ONBOARDING_ENTITY_NOT_FOUND", "venue.identity", { usdot });
+    const to = (rec.email ?? "").trim();
+    if (!to) throw new Refusal("CONTROL_NO_CONTACT_ON_RECORD", "venue.identity", { usdot, note: "the public record carries no email for this entity; control must be proven by a verifier this venue pins" });
+    const wait = this.control.cooldownRemainingMs(usdot, now);
+    if (wait > 0) throw new Refusal("CONTROL_CHALLENGE_FAILED", "venue.identity", { usdot, retryInMs: wait, why: "a challenge for this entity was sent recently; this venue will not be used to post codes to a carrier repeatedly" });
+    const subjectKid = kidOf(params.publicKey);
+    const { challengeId, code, expiresAt } = this.control.issue({ usdot, subjectKid, sentTo: to, channel: this.notifier.kind }, now);
+    const sent = await this.notifier.send({
+      to,
+      subject: `Confirm control of USDOT ${usdot}`,
+      text: `Somebody is registering an automated freight agent for ${rec.legalName} (USDOT ${usdot}) on ${this.config.venueId}.\n\nIf that is you, the confirmation code is:\n\n    ${code}\n\nIt is good until ${expiresAt} and can be used once.\n\nIf it is not you, do not pass this code on, and tell us: somebody is trying to transact as your company.\n\nThe key it would be bound to is ${subjectKid}.\n`,
+    });
+    this.audit.write({ component: "venue.identity", event: "control-challenge", outcome: sent.ok ? "ALLOWED" : "REFUSED", subject: usdot, evidence: { challengeId, sentTo: maskContact(to), channel: this.notifier.kind, subjectKid, expiresAt, detail: sent.detail } });
+    if (!sent.ok) throw new Refusal("CONTROL_CHALLENGE_FAILED", "venue.identity", { usdot, why: `the code could not be delivered: ${sent.detail ?? "unknown"}` });
+    return { challengeId, sentTo: maskContact(to), expiresAt, subjectKid };
+  }
+
+  /** Redeem a code. Answers only whether it matched and how many tries are left; it never echoes the code. */
+  controlVerify(params: { challengeId: string; code: string }) {
+    const r = this.control.verify(String(params.challengeId ?? ""), String(params.code ?? ""), new Date());
+    this.audit.write({ component: "venue.identity", event: "control-verify", outcome: r.ok ? "ALLOWED" : "REFUSED", evidence: { challengeId: params.challengeId, ok: r.ok, why: r.ok ? undefined : r.why, attemptsLeft: r.ok ? undefined : r.attemptsLeft } });
+    if (!r.ok) throw new Refusal("CONTROL_CHALLENGE_FAILED", "venue.identity", { challengeId: params.challengeId, why: r.why, attemptsLeft: r.attemptsLeft });
+    return { ok: true, challengeId: r.challenge.challengeId, usdot: r.challenge.usdot, subjectKid: r.challenge.subjectKid, satisfiedAt: r.challenge.satisfiedAt };
+  }
+
+  async onboard(params: { card: AgentCard; claimed: { usdot: string; mc?: string }; proofOfControl?: ControlProof; agentUrl: string; envelope?: MandateEnvelope; insurerAttestation?: InsurerAttestation }) {
     const cardCheck = verifyAgentCard(params.card);
     if (!cardCheck.ok || !cardCheck.jwk) throw new Refusal("IDENTITY_SIGNATURE_INVALID", "venue.identity", { error: cardCheck.error, stage: "agent-card" });
     const agentId = String(params.card.metadata?.agentId ?? params.card.name);
@@ -830,6 +885,10 @@ export class VenueService {
   async handleRpc(method: string, params: unknown, headers: Record<string, string | string[] | undefined>): Promise<unknown> {
     try {
       switch (method) {
+        case "venue/control-challenge":
+          return await this.controlChallenge(params as Parameters<VenueService["controlChallenge"]>[0]);
+        case "venue/control-verify":
+          return this.controlVerify(params as Parameters<VenueService["controlVerify"]>[0]);
         case "venue/onboard":
           return await this.onboard(params as Parameters<VenueService["onboard"]>[0]);
         case "venue/rotate":

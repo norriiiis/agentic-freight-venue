@@ -14,6 +14,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { exportPrivateJwk, generateKeyPair } from "../src/protocol/crypto";
 import { createServer } from "node:net";
 import { waitForHealth } from "../src/protocol/rpc";
 
@@ -22,6 +24,9 @@ const procs: ChildProcess[] = [];
 let workspace = "";
 let APP = "", VENUE = "", REGISTRY = "";
 const OPS = randomBytes(16).toString("hex");
+/** The console's verifier identity. An operator generates this, pins it on the venue, and starts the service with it. */
+const VERIFIER = generateKeyPair();
+const VERIFIER_ID = "interchange-console";
 const BOOT = { email: "ops@interchange.test", password: "operator-password-1" };
 
 const freePort = () => new Promise<number>((res, rej) => { const s = createServer(); s.on("error", rej); s.listen(0, "127.0.0.1", () => { const p = (s.address() as { port: number }).port; s.close(() => res(p)); }); });
@@ -65,6 +70,16 @@ class Client {
 
 const appDb = () => new DatabaseSync(join(workspace, "app", "app.db"));
 
+/** The contact point the registry fixture carries — the mailbox the venue challenges. */
+const contactFor = (usdot: string) => ({ "3312874": "compliance@northlinelogistics.example", "2751903": "dispatch@prairiewindtransport.example", "4102217": "ops@redlinexpress.example" } as Record<string, string>)[usdot]!;
+
+/** Read the venue's outbound channel: standing in for the carrier opening its own email. */
+function lastCodeSentTo(to: string): string {
+  const lines = readFileSync(join(workspace, "venue-challenges.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as { to: string; text: string });
+  const mine = lines.filter((l) => l.to === to).at(-1);
+  return /\n\s{4}(\d{6})\n/.exec(mine?.text ?? "")?.[1] ?? "";
+}
+
 beforeAll(async () => {
   workspace = mkdtempSync(join(tmpdir(), "fv-app-"));
   const [rp, vp, ap] = await Promise.all([freePort(), freePort(), freePort()]);
@@ -77,14 +92,26 @@ beforeAll(async () => {
     VENUE_PORT: String(vp), VENUE_DATA_DIR: join(workspace, "venue"), VENUE_REGISTRY_URL: REGISTRY,
     VENUE_OPS_TOKEN: OPS, VENUE_REGISTRY_MAX_AGE_MS: "600000",
     VENUE_UW_PARAMS: JSON.stringify({ offerGuarantees: false }),
+    // Proof of control, as a venue with no SIM_MODE runs it: the venue challenges the contact point on the public
+    // record itself, and separately pins this console's key for hand-verifications.
+    VENUE_CONTROL_METHODS: "REGISTRY_CONTACT_CHALLENGE,OPERATOR_ATTESTED",
+    VENUE_CONTROL_VERIFIERS: JSON.stringify([{ verifierId: VERIFIER_ID, publicKey: VERIFIER.publicJwk, methods: ["OPERATOR_ATTESTED"] }]),
+    VENUE_CONTROL_COOLDOWN_MS: "0",
+    VENUE_NOTIFY: "file",
+    VENUE_NOTIFY_FILE: join(workspace, "venue-challenges.jsonl"),
   }, "venue");
   await waitForHealth(`${VENUE}/health`, 25_000);
+
+  // The operator provisions the console's verifier key before starting it; the venue already pins its public half.
+  mkdirSync(join(workspace, "app"), { recursive: true });
+  writeFileSync(join(workspace, "app", "control-verifier.jwk.json"), JSON.stringify(exportPrivateJwk(VERIFIER)));
 
   start("src/app/server.ts", {
     APP_PORT: String(ap), APP_URL: APP, APP_DATA_DIR: join(workspace, "app"),
     APP_MASTER_KEY: randomBytes(32).toString("base64"),
     APP_VENUE_URL: VENUE, APP_VENUE_OPS_TOKEN: OPS, APP_REGISTRY_URL: REGISTRY,
     APP_BOOTSTRAP_EMAIL: BOOT.email, APP_BOOTSTRAP_PASSWORD: BOOT.password,
+    APP_VERIFIER_ID: VERIFIER_ID,
   }, "app");
   await waitForHealth(`${APP}/healthz`, 25_000);
 }, 90_000);
@@ -125,11 +152,12 @@ async function onboard(opts: { email: string; company: string; role: "broker" | 
   const orgId = (() => { const db2 = appDb(); const r = db2.prepare("SELECT org_id FROM entities WHERE usdot = ?").get(opts.usdot) as { org_id: string }; db2.close(); return r.org_id; })();
   if (opts.proof === "email") {
     await client.post("/onboarding/challenge", { csrf: Client.csrf(ob.body) });
-    const db3 = appDb();
-    const challenge = (db3.prepare("SELECT challenge FROM proofs WHERE org_id = ? AND status = 'PENDING' ORDER BY created_at DESC").get(orgId) as { challenge: string }).challenge;
-    db3.close();
+    // The code went from the VENUE to the contact point on the public record. The console never saw it; neither
+    // did this test, until it read the venue's own outbound channel — which is exactly the carrier's mailbox.
+    const code = lastCodeSentTo(contactFor(opts.usdot));
+    expect(code, "the venue did not send a code").toMatch(/^\d{6}$/);
     ob = await client.get("/onboarding");
-    const v = await client.post("/onboarding/verify", { csrf: Client.csrf(ob.body), code: challenge });
+    const v = await client.post("/onboarding/verify", { csrf: Client.csrf(ob.body), code });
     expect(v.location).toBe("/onboarding");
   } else {
     // the operator path: a staff member records what they did by hand, in that client's context
@@ -153,7 +181,11 @@ async function onboard(opts: { email: string; company: string; role: "broker" | 
   ob = await client.get("/onboarding");
   expect(ob.body).toContain("Start my agent");
   const started = await client.post("/onboarding/agent", { csrf: Client.csrf(ob.body) });
-  expect(started.location, `agent did not come up for ${opts.company}`).toBe("/desk");
+  if (started.location !== "/desk") {
+    const after = await client.get("/onboarding");
+    const flash = /<div class="flash[^"]*">([\s\S]*?)<\/div>/.exec(after.body)?.[1] ?? "(no flash)";
+    throw new Error(`agent did not come up for ${opts.company}: ${flash}`);
+  }
   return { client, orgId };
 }
 

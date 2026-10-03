@@ -24,7 +24,7 @@ export interface MembershipRow { orgId: string; userId: string; role: MemberRole
 export interface SessionRow { id: string; userId: string; createdAt: string; expiresAt: string; csrf: string }
 export interface InviteRow { code: string; email: string; orgId: string | null; orgName: string | null; orgRole: OrgRole | null; memberRole: MemberRole; createdBy: string; createdAt: string; expiresAt: string; acceptedAt: string | null; acceptedBy: string | null }
 export interface EntityRow { orgId: string; usdot: string; mc: string | null; legalName: string; entityType: string; registryAsOf: string | null; snapshot: string | null }
-export interface ProofRow { id: string; orgId: string; method: string; status: "PENDING" | "VERIFIED" | "FAILED"; challenge: string | null; sentTo: string | null; createdAt: string; verifiedAt: string | null; operatorUserId: string | null; evidence: string | null }
+export interface ProofRow { id: string; orgId: string; method: string; status: "PENDING" | "VERIFIED" | "FAILED"; challenge: string | null; sentTo: string | null; createdAt: string; verifiedAt: string | null; operatorUserId: string | null; evidence: string | null; subjectKid: string | null; proof: string | null }
 export interface PrincipalKeyRow { orgId: string; kid: string; publicJwk: string; store: string; wrapped: string | null; createdAt: string; retiredAt: string | null }
 export interface AgentRow { id: string; orgId: string; agentId: string; role: OrgRole; port: number; dataDir: string; status: "PROVISIONED" | "STARTING" | "LIVE" | "STOPPED" | "FAILED"; controlToken: string; credentialId: string | null; pid: number | null; startedAt: string | null; lastHealthAt: string | null; lastError: string | null; privateContext: string }
 export interface MandateRow { id: string; orgId: string; agentId: string; mandateId: string; limits: string; signedAt: string; expiresAt: string; registeredAt: string | null; supersededAt: string | null }
@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS entities (
 CREATE UNIQUE INDEX IF NOT EXISTS entities_usdot ON entities (usdot);
 CREATE TABLE IF NOT EXISTS proofs (
   id TEXT PRIMARY KEY, org_id TEXT NOT NULL, method TEXT NOT NULL, status TEXT NOT NULL, challenge TEXT,
-  sent_to TEXT, created_at TEXT NOT NULL, verified_at TEXT, operator_user_id TEXT, evidence TEXT);
+  sent_to TEXT, created_at TEXT NOT NULL, verified_at TEXT, operator_user_id TEXT, evidence TEXT,
+  subject_kid TEXT, proof TEXT);
 CREATE INDEX IF NOT EXISTS proofs_org ON proofs (org_id);
 CREATE TABLE IF NOT EXISTS principal_keys (
   org_id TEXT NOT NULL, kid TEXT NOT NULL, public_jwk TEXT NOT NULL, store TEXT NOT NULL, wrapped TEXT,
@@ -101,6 +102,8 @@ export class AppDb {
   entity(orgId: string) { return this.one<EntityRow>("SELECT * FROM entities WHERE org_id = ?", orgId); }
   entityByUsdot(usdot: string) { return this.one<EntityRow>("SELECT * FROM entities WHERE usdot = ?", usdot); }
   proofs(orgId: string) { return this.many<ProofRow>("SELECT * FROM proofs WHERE org_id = ? ORDER BY created_at DESC", orgId); }
+  /** The proof that will be presented when this org's agent registers its key. */
+  provenControl(orgId: string) { return this.one<ProofRow>("SELECT * FROM proofs WHERE org_id = ? AND status = 'VERIFIED' AND proof IS NOT NULL ORDER BY verified_at DESC", orgId); }
   principalKey(orgId: string) { return this.one<PrincipalKeyRow>("SELECT * FROM principal_keys WHERE org_id = ? AND retired_at IS NULL", orgId); }
   agentsOf(orgId: string) { return this.many<AgentRow>("SELECT * FROM agents WHERE org_id = ? ORDER BY agent_id", orgId); }
   allAgents() { return this.many<AgentRow>("SELECT * FROM agents ORDER BY agent_id"); }
