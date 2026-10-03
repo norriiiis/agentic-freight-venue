@@ -1,4 +1,7 @@
 *.log
+*.zip
+.DS_Store
 .data/
 .sim/
+design/interchange-console/
 node_modules/
