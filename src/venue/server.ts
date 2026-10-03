@@ -21,6 +21,11 @@
  *   VENUE_RATE_LIMIT_RPS requests per second per caller (default 50; 0 = unlimited)
  *   VENUE_TLS_CERT / VENUE_TLS_KEY  PEM paths; set both to serve HTTPS
  *   VENUE_HOST           bind address (default 127.0.0.1)
+ *   VETTING_PROVIDER        carrierok | stub (default stub). carrierok needs CARRIEROK_API_KEY
+ *                           (sk_test_… is their sandbox); VETTING_MAX_CONTACT_SHARED (default 0) is how many other
+ *                           registrants may share a contact point before the venue refuses to challenge it;
+ *                           VETTING_ALLOW_ON_UNREACHABLE=1 onboards when the provider is down (a decision);
+ *                           VETTING_BLOCK_RISK (default "Very High"); VENUE_WATCHLIST_MS polls their watchlist.
  *   VENUE_CONTROL_METHODS   comma-separated proofs of control this venue accepts (default REGISTRY_CONTACT_CHALLENGE;
  *                           SIM_MODE adds SIM_STUB_TOKEN, which is never accepted otherwise)
  *   VENUE_CONTROL_VERIFIERS JSON [{ verifierId, publicKey, methods? }] — whose signed word about control counts
@@ -39,6 +44,7 @@ import type { WitnessKey } from "../protocol/witness";
 import type { OkpJwk } from "../protocol/crypto";
 import { clockFromEnv } from "../protocol/clock";
 import type { ControlMethod } from "../protocol/control";
+import { CarrierOkMonitor } from "../identity/vetting-carrierok";
 
 const config = {
   venueId: process.env.VENUE_ID ?? "venue-local",
@@ -59,6 +65,12 @@ const config = {
   clock: clockFromEnv(),
   // Proof of control: the gate nothing downstream can repair. The stub token the mock registry serves is a
   // SIMULATION affordance and is accepted only when this process is run in SIM_MODE.
+  maxContactSharedWith: process.env.VETTING_MAX_CONTACT_SHARED ? Number(process.env.VETTING_MAX_CONTACT_SHARED) : 0,
+  // The vetting provider's watchlist, where one is configured: authority and insurance changes between a
+  // commitment and its pickup, which is the window the pre-pickup sweep alone leaves open for hours.
+  watchlist: process.env.VETTING_PROVIDER === "carrierok" && process.env.CARRIEROK_API_KEY
+    ? new CarrierOkMonitor({ apiKey: process.env.CARRIEROK_API_KEY, baseUrl: process.env.CARRIEROK_BASE_URL })
+    : undefined,
   control: {
     accept: (process.env.VENUE_CONTROL_METHODS?.split(",").map((s) => s.trim()).filter(Boolean) as ControlMethod[] | undefined)
       ?? (process.env.SIM_MODE === "1" ? ["REGISTRY_CONTACT_CHALLENGE", "VETTING_PROVIDER_ASSERTION", "OPERATOR_ATTESTED", "SIM_STUB_TOKEN"] as ControlMethod[] : undefined),
@@ -89,6 +101,7 @@ const jobs = new Scheduler((l) => console.error(l))
   .add({ name: "heartbeat", everyMs: Math.max(1_000, sweepMs), run: async () => { venue.state.persist(); return { lastAliveAt: venue.state.lastAliveAt }; } })
   .add({ name: "nonce-sweep", everyMs: Number(process.env.VENUE_NONCE_SWEEP_MS ?? 60_000), run: async () => ({ swept: venue.state.sweepNonces(2 * config.messageMaxAgeMs) }) })
   .add({ name: "pre-pickup-and-renewal", everyMs: Number(process.env.VENUE_PREPICKUP_MS ?? 15 * 60_000), run: async (now) => ({ voided: (await venue.prePickupChecks(now)).map((c) => c.commitmentId) }) })
+  .add({ name: "vetting-watchlist", everyMs: Number(process.env.VENUE_WATCHLIST_MS ?? 10 * 60_000), run: async (now) => venue.watchlistSweep(now) })
   .add({ name: "claim-windows", everyMs: Number(process.env.VENUE_CLAIM_WINDOW_SWEEP_MS ?? 60 * 60_000), run: async (now) => ({ released: venue.underwriting.expireClaimWindows(now).map((g) => g.guaranteeId) }) });
 
 const ok = (body: unknown) => ({ status: 200, body });

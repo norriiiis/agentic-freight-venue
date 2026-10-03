@@ -18,7 +18,8 @@
     "app": "tsx src/app/server.ts",
     "venue": "tsx src/venue/server.ts",
     "registry": "tsx src/registry/server.ts",
-    "pilot": "tsx src/app/pilot.ts"
+    "pilot": "tsx src/app/pilot.ts",
+    "vetting:check": "tsx src/identity/vetting-cli.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

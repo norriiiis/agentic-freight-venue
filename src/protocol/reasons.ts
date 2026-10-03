@@ -48,6 +48,7 @@ export const REASONS = {
   CONTROL_PROOF_REPLAYED: "This proof of control has already been used. Each one is good once, so a proof that leaks cannot be spent twice",
   CONTROL_VERIFIER_UNTRUSTED: "The proof is signed by a verifier this venue does not pin, by a key other than the one pinned for it, or the signature does not verify. Somebody's signature is not a proof",
   CONTROL_CHALLENGE_FAILED: "The challenge to the contact point on the public record was not answered, was answered wrongly too many times, or is being presented for a different entity than it was sent about",
+  CONTROL_CONTACT_NOT_EXCLUSIVE: "The contact point on the public record is shared with other FMCSA registrants — a filing agent's mailbox, or one operator behind several registrations. A code sent there would prove control of something several companies read, which is not control of this one, so the venue will not send it and call the result a proof",
   CONTROL_NO_CONTACT_ON_RECORD: "The public record carries no contact point for this entity, so there is nowhere to send a challenge. Control must be proven another way, by a verifier this venue pins",
   ONBOARDING_ENTITY_NOT_FOUND: "Claimed USDOT/MC not found in registry",
   ONBOARDING_KEY_ALREADY_BOUND: "A live credential already binds this entity to a different key",

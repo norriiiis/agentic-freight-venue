@@ -32,7 +32,7 @@ import { rpcCall, RpcRefusal } from "../protocol/rpc";
 import type { Credential, MandateEnvelope, RotationAuthorization, RotationClaims } from "../protocol/types";
 import { RegistryMirror, RegistryUnavailable, type RegistrySource } from "../identity/registry-mirror";
 import { coverageAssuredThrough, filerContradictedBy, filerKeyOfRecord, filingsShownBy, hasBrokerAuthority, insuranceStatus, insurerContradictedBy, insurerOfRecord, insurerStanding, keyEventsShownBy, renewalWindow, satisfiesRenewal, regulatorLogOfRecord, verifyInsurerAttestation, type FilerAttestation, type InsurerAttestation, type RegistryAttestation, type RegulatorKey, type RegulatorLogAttestation } from "../protocol/registry";
-import { StubVettingProvider } from "../identity/vetting";
+import { StubVettingProvider, vettingFromEnv, type VettingProvider } from "../identity/vetting";
 import { CredentialIssuer } from "../identity/issuer";
 import { liveCheck, signatureTrustedAt, verifyCredential, verifyPresentation, type LiveCheckResult } from "../identity/verifier";
 import { envelopeToLimits, evaluateMandate } from "../mandate/engine";
@@ -64,6 +64,12 @@ export interface VenueConfig {
   control?: Partial<ControlPolicy> & { ttlMs?: number; maxAttempts?: number; cooldownMs?: number };
   /** How this venue reaches a contact point on the public record to challenge it. */
   notifier?: Notifier;
+  /** Who vets carriers. Defaults to VETTING_PROVIDER in the environment. */
+  vetting?: VettingProvider;
+  /** Other registrants that may share a contact point before a challenge to it stops meaning anything. */
+  maxContactSharedWith?: number;
+  /** A vetting provider's watchlist, where one is configured: authority and insurance changes, pushed not polled. */
+  watchlist?: { watch(ids: string[]): Promise<{ ok: boolean; added?: number; error?: string }>; changes(o: { since?: Date; insurance?: boolean; authority?: boolean }): Promise<{ ok: boolean; changed: { profileId: string; fields: Record<string, unknown>[] }[]; error?: string }> };
   /** How long the venue waits for the awaited party's reply before canceling the negotiation. */
   replyTimeoutMs: number;
   /** Deliveries abandoned to the dead-letter queue after this many attempts (agents can still pull via tasks/get). */
@@ -90,6 +96,7 @@ export class VenueService {
   readonly keys: VenueKeyRing;
   readonly clock: ClockPolicy;
   readonly controlPolicy: ControlPolicy;
+  readonly vetting: VettingProvider;
   readonly control: ControlStore;
   private readonly notifier: Notifier;
   readonly registry: RegistryMirror;
@@ -110,7 +117,8 @@ export class VenueService {
     this.controlPolicy = { ...DEFAULT_CONTROL_POLICY, ...config.control, verifiers: config.control?.verifiers ?? DEFAULT_CONTROL_POLICY.verifiers, accept: config.control?.accept ?? DEFAULT_CONTROL_POLICY.accept };
     this.control = new ControlStore(config.dataDir, { ttlMs: config.control?.ttlMs, maxAttempts: config.control?.maxAttempts, cooldownMs: config.control?.cooldownMs });
     this.notifier = config.notifier ?? notifierFromEnv("VENUE_", process.env, join(config.dataDir, "control-challenges.jsonl"));
-    this.issuer = new CredentialIssuer(config.venueId, () => this.keys.signer(), this.registry, new StubVettingProvider(this.registry), config.dataDir, undefined, this.clock.rotationGraceMs, config.registryMaxAgeMs, this.clock.operatorRequestMaxAgeMs, this.controlPolicy, this.control);
+    this.vetting = config.vetting ?? vettingFromEnv(this.registry);
+    this.issuer = new CredentialIssuer(config.venueId, () => this.keys.signer(), this.registry, this.vetting, config.dataDir, undefined, this.clock.rotationGraceMs, config.registryMaxAgeMs, this.clock.operatorRequestMaxAgeMs, this.controlPolicy, this.control);
     this.ledger = new Ledger(join(config.dataDir, "ledger.jsonl"), () => this.keys.signer(), this.keys.currentCert(), this.keys.currentRootEvent());
     this.underwriting = new UnderwritingEngine(config.dataDir, { ...DEFAULT_PARAMS, ...config.underwriting });
     this.audit = new AuditLog(join(config.dataDir, "audit.jsonl"));
@@ -637,6 +645,18 @@ export class VenueService {
     if (!rec) throw new Refusal("ONBOARDING_ENTITY_NOT_FOUND", "venue.identity", { usdot });
     const to = (rec.email ?? "").trim();
     if (!to) throw new Refusal("CONTROL_NO_CONTACT_ON_RECORD", "venue.identity", { usdot, note: "the public record carries no email for this entity; control must be proven by a verifier this venue pins" });
+
+    // Is that mailbox this entity's alone? A challenge is only worth what the contact point is worth, and a
+    // filing agent's inbox read by a dozen carriers is worth nothing as a proof of control of any one of them.
+    // The vetting provider's network graph is what can answer this; where there is no provider, it cannot be
+    // answered and the venue says so in the audit rather than pretending it checked.
+    const vet = await this.vetting.assess(usdot).catch(() => undefined);
+    const shared = vet?.contact?.emailSharedWith;
+    const maxShared = this.config.maxContactSharedWith ?? 0;
+    if (shared !== undefined && shared > maxShared) {
+      this.audit.write({ component: "venue.identity", event: "control-challenge", outcome: "REFUSED", reasonCode: "CONTROL_CONTACT_NOT_EXCLUSIVE", subject: usdot, evidence: { sentTo: maskContact(to), sharedWith: shared, allowed: maxShared, provider: vet?.provider, snapshotDate: vet?.snapshotDate } });
+      throw new Refusal("CONTROL_CONTACT_NOT_EXCLUSIVE", "venue.identity", { usdot, contact: maskContact(to), sharedWithOtherRegistrants: shared, allowed: maxShared, provider: vet?.provider, note: "prove control through a verifier this venue pins instead" });
+    }
     const wait = this.control.cooldownRemainingMs(usdot, now);
     if (wait > 0) throw new Refusal("CONTROL_CHALLENGE_FAILED", "venue.identity", { usdot, retryInMs: wait, why: "a challenge for this entity was sent recently; this venue will not be used to post codes to a carrier repeatedly" });
     const subjectKid = kidOf(params.publicKey);
@@ -646,9 +666,42 @@ export class VenueService {
       subject: `Confirm control of USDOT ${usdot}`,
       text: `Somebody is registering an automated freight agent for ${rec.legalName} (USDOT ${usdot}) on ${this.config.venueId}.\n\nIf that is you, the confirmation code is:\n\n    ${code}\n\nIt is good until ${expiresAt} and can be used once.\n\nIf it is not you, do not pass this code on, and tell us: somebody is trying to transact as your company.\n\nThe key it would be bound to is ${subjectKid}.\n`,
     });
-    this.audit.write({ component: "venue.identity", event: "control-challenge", outcome: sent.ok ? "ALLOWED" : "REFUSED", subject: usdot, evidence: { challengeId, sentTo: maskContact(to), channel: this.notifier.kind, subjectKid, expiresAt, detail: sent.detail } });
+    this.audit.write({ component: "venue.identity", event: "control-challenge", outcome: sent.ok ? "ALLOWED" : "REFUSED", subject: usdot, evidence: { challengeId, sentTo: maskContact(to), channel: this.notifier.kind, subjectKid, expiresAt, detail: sent.detail, contact: vet?.contact ? { sharedWith: vet.contact.emailSharedWith, lastChanged: vet.contact.emailLastChanged, changeCount: vet.contact.emailChangeCount, provider: vet.provider } : { provider: "none", note: "no vetting provider: whether this mailbox is shared is unknown" }, vettingFlags: vet?.flags } });
     if (!sent.ok) throw new Refusal("CONTROL_CHALLENGE_FAILED", "venue.identity", { usdot, why: `the code could not be delivered: ${sent.detail ?? "unknown"}` });
     return { challengeId, sentTo: maskContact(to), expiresAt, subjectKid };
+  }
+
+  /**
+   * Ask the vetting provider what moved since last time, and re-verify anything it names.
+   *
+   * The venue already re-reads the registry before every step, so this does not decide anything the next tender
+   * would not decide anyway. What it buys is TIME: a carrier whose authority was revoked an hour after it was
+   * committed to a load is caught now rather than at the pre-pickup sweep, which is the difference between the
+   * broker re-covering the load and the broker finding out at the dock.
+   */
+  async watchlistSweep(now = new Date()): Promise<{ checked: number; changed: string[]; voided: string[]; error?: string }> {
+    const w = this.config.watchlist;
+    if (!w) return { checked: 0, changed: [], voided: [] };
+    const live = [...this.state.commitments.values()].filter((c) => c.status === "ACTIVE");
+    const ids = [...new Set(live.flatMap((c) => [c.brokerUsdot, c.carrierUsdot]))];
+    // The provider keys its watchlist on {dot}-{docket}; without a docket we can still ask by dot alone.
+    const added = await w.watch(ids);
+    const since = this.state.watchlistSince;
+    const res = await w.changes({ since: since ? new Date(since) : new Date(now.getTime() - 86_400_000), insurance: true, authority: true });
+    if (!res.ok) {
+      this.audit.write({ component: "venue.identity", event: "watchlist-sweep", outcome: "REFUSED", evidence: { error: res.error, watching: ids.length } });
+      return { checked: ids.length, changed: [], voided: [], error: res.error };
+    }
+    const changed = res.changed.map((c) => c.profileId);
+    if (changed.length) {
+      this.audit.write({ component: "venue.identity", event: "watchlist-change", outcome: "INFO", evidence: { changed: res.changed.map((c) => ({ profileId: c.profileId, fields: c.fields.map((f) => Object.keys(f).filter((k) => k.endsWith("_current"))).flat() })), watching: ids.length, addedThisRun: added.added } });
+    }
+    // Anything the provider flagged is re-verified against the registries' own signed word, which is still the
+    // only thing this venue acts on: a vetting provider can bring news, it cannot decide standing.
+    const voided = changed.length ? (await this.prePickupChecks(now)).map((c) => c.commitmentId) : [];
+    this.state.watchlistSince = now.toISOString();
+    this.state.persist();
+    return { checked: ids.length, changed, voided };
   }
 
   /** Redeem a code. Answers only whether it matched and how many tries are left; it never echoes the code. */

@@ -161,6 +161,8 @@ interface Snapshot {
   deadLetter: PendingNotice[];
   /** Last moment this venue was known to be alive; recovery measures downtime from it. */
   lastAliveAt?: string;
+  /** When the vetting watchlist was last read. */
+  watchlistSince?: string;
   /** Independent witnesses whose receipts this venue accepts (configured out of band; the venue cannot mint them). */
   witnesses: WitnessKey[];
   /** Receipts by ledger head hash. */
@@ -178,6 +180,8 @@ export class VenueState {
   outbox: PendingNotice[] = [];
   deadLetter: PendingNotice[] = [];
   lastAliveAt?: string;
+  /** When the vetting watchlist was last read, so a sweep asks only for what moved since. */
+  watchlistSince?: string;
   witnesses: WitnessKey[] = [];
   witnessReceipts: Record<string, WitnessReceipt[]> = {};
   /** Registered sources (registry feeds, insurers, …). An insurer's `insurerName` is the name it files under — what makes its word "of record". */
@@ -217,8 +221,8 @@ export class VenueState {
     this.commitments = new Map(rows<CommitmentRecord>("commitments", this.written.commitments).map((r) => [r.k, r.v]));
     this.outbox = rows<PendingNotice>("outbox", this.written.outbox).map((r) => r.v);
     this.deadLetter = rows<PendingNotice>("dead_letter", this.written.dead_letter).map((r) => r.v);
-    const kv = Object.fromEntries(rows<unknown>("kv", this.written.kv).map((r) => [r.k, r.v])) as Partial<Pick<Snapshot, "lastAliveAt" | "witnesses" | "witnessReceipts" | "noticeSources">>;
-    this.lastAliveAt = kv.lastAliveAt; this.witnesses = kv.witnesses ?? []; this.witnessReceipts = kv.witnessReceipts ?? {}; this.noticeSources = kv.noticeSources ?? [];
+    const kv = Object.fromEntries(rows<unknown>("kv", this.written.kv).map((r) => [r.k, r.v])) as Partial<Pick<Snapshot, "lastAliveAt" | "watchlistSince" | "witnesses" | "witnessReceipts" | "noticeSources">>;
+    this.lastAliveAt = kv.lastAliveAt; this.watchlistSince = kv.watchlistSince; this.witnesses = kv.witnesses ?? []; this.witnessReceipts = kv.witnessReceipts ?? {}; this.noticeSources = kv.noticeSources ?? [];
   }
   /** One transaction: only what changed is written, and all of it or none. Doubles as a heartbeat. */
   persist() {
@@ -229,7 +233,7 @@ export class VenueState {
       { table: "commitments", rows: [...this.commitments].map(([k, v]) => ({ k, v })), written: this.written.commitments },
       { table: "outbox", rows: this.outbox.map((n, i) => ({ k: n.id, v: n, seq: i })), written: this.written.outbox },
       { table: "dead_letter", rows: this.deadLetter.map((n, i) => ({ k: n.id, v: n, seq: i })), written: this.written.dead_letter },
-      { table: "kv", rows: [{ k: "lastAliveAt", v: this.lastAliveAt }, { k: "witnesses", v: this.witnesses }, { k: "witnessReceipts", v: this.witnessReceipts }, { k: "noticeSources", v: this.noticeSources }], written: this.written.kv },
+      { table: "kv", rows: [{ k: "lastAliveAt", v: this.lastAliveAt }, { k: "watchlistSince", v: this.watchlistSince }, { k: "witnesses", v: this.witnesses }, { k: "witnessReceipts", v: this.witnessReceipts }, { k: "noticeSources", v: this.noticeSources }], written: this.written.kv },
     ]);
   }
   /** Forget nonces older than the message acceptance window: a replay outside the window is refused as stale anyway. */
