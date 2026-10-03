@@ -44,6 +44,8 @@ export const REASONS = {
   ONBOARDING_ENTITY_NOT_FOUND: "Claimed USDOT/MC not found in registry",
   ONBOARDING_KEY_ALREADY_BOUND: "A live credential already binds this entity to a different key",
 
+  GUARANTEE_NOT_OFFERED: "This venue is not offering a guarantee on this transaction. Identity, the mandate and the record stand on their own; there is nothing to claim against, and the artifact says so rather than implying cover that does not exist",
+
   // mandate
   MANDATE_RATE_ABOVE_CEILING: "Rate exceeds the principal's mandated ceiling",
   MANDATE_RATE_BELOW_FLOOR: "Rate is below the principal's mandated floor",

@@ -97,6 +97,10 @@ export class UnderwritingEngine {
   quote(inputs: RiskInputs, beneficiaryUsdot: string, day: string): UnderwritingDecision {
     const assessment = assessRisk(inputs, this.params);
     const exp = this.exposure(inputs.usdot, beneficiaryUsdot);
+    if (this.params.offerGuarantees === false) {
+      // Risk is still assessed and published; what is withheld is the promise to pay, and the record says which.
+      return { decision: "DECLINED", assessment, reasonCode: "GUARANTEE_NOT_OFFERED", evidence: { probabilityOfLoss: assessment.probabilityOfLoss, factors: assessment.factors, note: "this venue does not currently offer a guarantee" }, exposureAfter: exp };
+    }
     if (assessment.probabilityOfLoss > this.params.maxProbabilityOfLoss) {
       return { decision: "DECLINED", assessment, reasonCode: "UNDERWRITING_DECLINED_RISK", evidence: { probabilityOfLoss: assessment.probabilityOfLoss, threshold: this.params.maxProbabilityOfLoss, factors: assessment.factors }, exposureAfter: exp };
     }

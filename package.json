@@ -14,7 +14,11 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "check:boundaries": "tsx test/boundaries.ts",
-    "mandate": "tsx src/mandate/cli.ts"
+    "mandate": "tsx src/mandate/cli.ts",
+    "app": "tsx src/app/server.ts",
+    "venue": "tsx src/venue/server.ts",
+    "registry": "tsx src/registry/server.ts",
+    "pilot": "tsx src/app/pilot.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

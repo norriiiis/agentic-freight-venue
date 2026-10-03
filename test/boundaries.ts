@@ -32,6 +32,9 @@ export const RULES: BoundaryRule[] = [
   { scope: "protocol", allowed: ["protocol"] },
   // EDI is a rendering of protocol terms for outside systems; it knows nothing of the venue.
   { scope: "edi", allowed: ["protocol", "ledger", "edi"] },
+  // The hosted application is the PRINCIPALS' side: it holds their keys and runs their agents, and reaches the
+  // venue and the registry over HTTP like any other client. It must never import venue or registry internals.
+  { scope: "app", allowed: ["protocol", "mandate", "agentkit", "ledger", "edi", "app"] },
 ];
 
 function walk(dir: string): string[] {

@@ -147,12 +147,12 @@ export async function rpcCall<R = unknown>(url: string, method: string, params: 
   return (await res.json()) as JsonRpcResponse<R>;
 }
 
-export async function httpGet<R = unknown>(url: string): Promise<R> {
-  const res = await fetch(url);
+export async function httpGet<R = unknown>(url: string, headers: Record<string, string> = {}): Promise<R> {
+  const res = await fetch(url, { headers });
   return (await res.json()) as R;
 }
-export async function httpPost<R = unknown>(url: string, body: unknown): Promise<R> {
-  const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+export async function httpPost<R = unknown>(url: string, body: unknown, headers: Record<string, string> = {}): Promise<R> {
+  const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
   return (await res.json()) as R;
 }
 

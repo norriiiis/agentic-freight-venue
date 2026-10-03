@@ -96,6 +96,28 @@ export function signJws(payload: unknown, kp: KeyPair, headerExtra: Partial<JwsH
   return detached ? `${h}..${sig}` : `${h}.${p}.${sig}`;
 }
 
+/**
+ * A signer that holds its key somewhere this process cannot read: a KMS, an
+ * HSM, a hardware token. The one asymmetry that matters is that it is async,
+ * which is why the synchronous `signJws` above cannot use it — and why the
+ * only keys signed this way are the ones NOT on the hot message path (a
+ * principal's mandate key, signed a handful of times a month).
+ */
+export interface RemoteSigner {
+  kid: string;
+  publicJwk: OkpJwk;
+  sign(data: Buffer): Promise<Buffer>;
+}
+
+/** `signJws`, for a key held elsewhere. Byte-for-byte the same output; `verifyJws` cannot tell the difference. */
+export async function signJwsWith(payload: unknown, signer: RemoteSigner, headerExtra: Partial<JwsHeader> = {}, detached = false): Promise<string> {
+  const header: JwsHeader = { alg: "EdDSA", kid: signer.kid, ...headerExtra, ...(detached ? { detached: true } : {}) };
+  const h = b64url(canonicalize(header));
+  const p = b64url(canonicalize(payload));
+  const sig = b64url(await signer.sign(Buffer.from(`${h}.${p}`, "utf8")));
+  return detached ? `${h}..${sig}` : `${h}.${p}.${sig}`;
+}
+
 export interface JwsVerifyResult {
   ok: boolean;
   header?: JwsHeader;

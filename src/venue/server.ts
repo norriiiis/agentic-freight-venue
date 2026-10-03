@@ -102,6 +102,23 @@ const routes: Record<string, HttpRoute> = {
   /** A human adjudicator's decision on a claim, with the reason on the record. */
   "POST /ops/claims/decide": async (_r, b) => { const { claimId, covered, reasonCode, why, payoutUsd } = b as { claimId: string; covered: boolean; reasonCode?: string; why: string; payoutUsd?: number }; const c = venue.underwriting.decideClaim(claimId, { covered, reasonCode, why, payoutUsd }); if (c) venue.audit.write({ component: "underwriting", event: "claim-decided", outcome: covered ? "ALLOWED" : "REFUSED", evidence: { claimId, covered, reasonCode, why, status: c.status, payoutUsd: c.decision?.payoutUsd } }); return c ? ok(c) : { status: 404, body: { error: "unknown claim" } }; },
   "POST /ops/reserve/capital": async (_r, b) => { const { usd } = b as { usd: number }; venue.underwriting.addCapital(usd); const paid = venue.underwriting.settleDeferred(); venue.audit.write({ component: "underwriting", event: "capital-added", outcome: "INFO", evidence: { usd, deferredPaid: paid.map((c) => c.claimId), reserve: venue.underwriting.reserveView() } }); return ok({ reserve: venue.underwriting.reserveView(), deferredPaid: paid.map((c) => c.claimId) }); },
+  // Read-only operator views the hosted console needs. Same data as the SIM-only /admin reads, behind the ops token.
+  "GET /ops/agents": async () => ok([...venue.state.agents.values()].map((a) => ({ agentId: a.agentId, credentialId: a.credentialId, url: a.url, registeredAt: a.registeredAt, envelope: a.envelope?.limits }))),
+  "GET /ops/commitments": async () => ok([...venue.state.commitments.values()]),
+  "GET /ops/tasks": async () => ok([...venue.state.tasks.values()]),
+  "GET /ops/messages": async (req) => {
+    const t = new URL(req.url ?? "/", "http://localhost").searchParams.get("taskId");
+    const log = venue.state.messageLog();
+    return ok(t ? log.filter((m) => (m as { taskId?: string }).taskId === t) : log);
+  },
+  "GET /ops/audit": async (req) => {
+    const from = Number(new URL(req.url ?? "/", "http://localhost").searchParams.get("from") ?? 0);
+    return ok(venue.audit.readAll().filter((e) => e.seq >= (Number.isFinite(from) ? from : 0)));
+  },
+  "GET /ops/ledger": async (req) => {
+    const from = Number(new URL(req.url ?? "/", "http://localhost").searchParams.get("from") ?? 0);
+    return ok(venue.ledgerViewFor(undefined).filter((e) => e.seq >= (Number.isFinite(from) ? from : 0)));
+  },
   "GET /ops/health": async () => ok({ ok: true, venueId: config.venueId, outbox: venue.state.outbox.length, deadLetter: venue.state.deadLetter.length, tasks: venue.state.tasks.size, commitments: venue.state.commitments.size, nonces: venue.state.nonces.size, jobs: jobs.list() }),
   /** The venue's part of a verification bundle for one commitment (artifact, ledger, lists, renewals). The world's word is not the venue's to supply. */
   "GET /bundle/*": async (req) => {

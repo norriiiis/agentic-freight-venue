@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interchange — console design</title>
+<meta name="description" content="Eight screens for an agent-to-agent freight transaction venue: the principal's desk, a refusal in full, the mandate, verification, claims, venue operations and dispatch on a phone.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%231A1917'/%3E%3Cpath d='M4 11.5V4.5M8 11.5V4.5M12 11.5V4.5' stroke='%23F7F5F0' stroke-width='1.6'/%3E%3C/svg%3E">
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#F7F5F0;color:#171614;font-family:'Space Grotesk',ui-sans-serif,system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:#17594A}
+.m{font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+header{background:#1A1917;color:#F7F5F0;padding:56px 32px 52px}
+.wrap{max-width:1040px;margin:0 auto}
+header .brand{font-size:13px;font-weight:600;letter-spacing:.18em}
+header h1{font-family:Newsreader,ui-serif,Georgia,serif;font-weight:400;font-size:46px;line-height:1.15;margin:20px 0 0;max-width:19ch;text-wrap:pretty}
+header p{font-size:15px;line-height:1.6;color:#C9C3B8;margin:18px 0 0;max-width:62ch}
+main{padding:44px 32px 72px}
+h2.sec{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#6B6459;margin:0 0 16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.card{display:block;background:#FFF;border:1px solid #E3DFD5;border-radius:4px;padding:18px 20px;text-decoration:none;color:inherit}
+.card:hover{border-color:#171614}
+.card-top{display:flex;align-items:center;justify-content:space-between}
+.persona{font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#17594A}
+.dims{font-family:'IBM Plex Mono',monospace;font-size:10px;color:#8B857A}
+.card h2{font-size:17px;font-weight:600;margin:11px 0 0;line-height:1.3}
+.card p{font-size:13px;line-height:1.55;color:#3D382F;margin:8px 0 0}
+.note{margin-top:40px;padding:20px 22px;background:#FFF;border:1px solid #E3DFD5;border-radius:4px;max-width:78ch}
+.note h3{font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#6B6459;margin:0 0 10px}
+.note p{font-size:13px;line-height:1.65;color:#3D382F;margin:0 0 10px}
+.note p:last-child{margin-bottom:0}
+footer{border-top:1px solid #E3DFD5;padding:24px 32px 56px;font-size:12px;color:#6B6459}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="brand">INTERCHANGE</div>
+    <h1>A broker's agent commits to freight without asking anyone.</h1>
+    <p>These eight screens are the human surface over that: what the agent did while nobody was watching, what it refused and why, the limits it cannot widen, and a record any counterparty can check without trusting the venue that wrote it.</p>
+  </div>
+</header>
+<main>
+  <div class="wrap">
+    <h2 class="sec">Screens</h2>
+    <div class="grid">
+      <a class="card" href="desk.html">
+        <div class="card-top">
+          <span class="persona">Broker principal</span>
+          <span class="dims">1440&times;1040</span>
+        </div>
+        <h2>Desk</h2>
+        <p>What the agent did, what it is doing, and what it refused — against the limits you set.</p>
+      </a>
+      <a class="card" href="negotiation.html">
+        <div class="card-top">
+          <span class="persona">Broker principal</span>
+          <span class="dims">1440&times;1040</span>
+        </div>
+        <h2>One load, message by message</h2>
+        <p>The wire log with the venue&#x27;s verification stamped on every hop, and the private economics that never crossed it.</p>
+      </a>
+      <a class="card" href="refusal.html">
+        <div class="card-top">
+          <span class="persona">Broker principal</span>
+          <span class="dims">1440&times;1040</span>
+        </div>
+        <h2>A refusal, in full</h2>
+        <p>The reason code, the component that refused, the evidence, and whether the guarantee would have paid.</p>
+      </a>
+      <a class="card" href="mandate.html">
+        <div class="card-top">
+          <span class="persona">Broker principal</span>
+          <span class="dims">1440&times;1040</span>
+        </div>
+        <h2>The mandate</h2>
+        <p>Limits as plain sentences, the envelope the venue sees, and a signature blocked until the limits make sense.</p>
+      </a>
+      <a class="card" href="verify.html">
+        <div class="card-top">
+          <span class="persona">Any counterparty</span>
+          <span class="dims">1440&times;1040</span>
+        </div>
+        <h2>Verify without the venue</h2>
+        <p>One bundle, one verdict, 43 checks — against keys and policy the verifier chose.</p>
+      </a>
+      <a class="card" href="claim.html">
+        <div class="card-top">
+          <span class="persona">Broker principal</span>
+          <span class="dims">1440&times;1040</span>
+        </div>
+        <h2>A claim, decided by the rules</h2>
+        <p>Six rules in order, each a line of the basis, ending in a covered claim the reserve cannot yet pay.</p>
+      </a>
+      <a class="card" href="ops.html">
+        <div class="card-top">
+          <span class="persona">Venue operator</span>
+          <span class="dims">1440&times;1040</span>
+        </div>
+        <h2>Venue operations</h2>
+        <p>Jobs, registry mirrors, alerts derived from the audit chain, the reserve and the keys.</p>
+      </a>
+      <a class="card" href="phone.html">
+        <div class="card-top">
+          <span class="persona">Carrier dispatch</span>
+          <span class="dims">390&times;844</span>
+        </div>
+        <h2>Dispatch, on a phone</h2>
+        <p>A voided commitment, the lifecycle events a driver signs, and the insurance on file.</p>
+      </a>
+    </div>
+    <div class="note">
+      <h3>About this prototype</h3>
+      <p>Static design comps, not a running system — nothing here is wired to the venue. Every rate, reason code, hash, check name and identifier is taken from the implementation: its fixtures, a scenario run, and a real 43-check verification of a commitment bundle.</p>
+      <p>Screens are drawn at 1440&times;1040 (the phone at 390&times;844) and scale down to fit narrower windows.</p>
+    </div>
+  </div>
+</main>
+<footer><div class="wrap">Interchange console — design prototype</div></footer>
+</body>
+</html>

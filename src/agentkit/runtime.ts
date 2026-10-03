@@ -796,7 +796,43 @@ export class AgentRuntime<Ctx extends { canary: string }> {
         "GET /control/private-canary": async () => ok({ canary: this.ctx.canary }),
       } satisfies Record<string, HttpRoute>);
     }
-    await startServer(this.config.port, { rpcPath: "/a2a", rpc: (m, p) => this.handleRpc(m, p), routes });
+    // The PRODUCTION control surface. /control/* stays simulator-only; an operator that runs agents on a
+    // principal's behalf drives them here, behind a per-agent bearer token, and every call is in the agent's
+    // own audit log. Nothing here can widen the mandate: these are the same guarded paths the agent uses itself.
+    const opsToken = this.config.controlToken ?? process.env.AGENT_OPS_TOKEN;
+    if (opsToken) {
+      Object.assign(routes, {
+        "GET /ops/identity": async () => ok({ agentId: this.config.agentId, role: this.config.role, kid: this.kp.kid, credentialId: this.credential?.credentialId, entity: this.config.entity, mandateId: this.mandate.mandateId, mandateExpiresAt: this.mandate.expiresAt }),
+        "GET /ops/tasks": async () => ok([...this.tasks.values()]),
+        "GET /ops/commitments": async () => {
+          const dir = join(this.config.dataDir, "commitments");
+          return ok(existsSync(dir) ? readdirSync(dir).map((f) => JSON.parse(readFileSync(join(dir, f), "utf8")) as Record<string, unknown>) : []);
+        },
+        "GET /ops/audit": async () => ok(this.audit.readAll()),
+        "POST /ops/onboard": async () => ok(await this.onboard()),
+        "POST /ops/tender": async (_r: unknown, b: unknown) => {
+          const { load, to } = b as { load: LoadSpec; to: { agentId: string } };
+          return ok(await this.tender(load, to));
+        },
+        "POST /ops/event": async (_r: unknown, b: unknown) => ok(await this.reportEvent(b as Parameters<AgentRuntime<Ctx>["reportEvent"]>[0])),
+        "POST /ops/present-insurance": async (_r: unknown, b: unknown) => ok(await this.presentInsurance(b as InsurerAttestation)),
+        "POST /ops/reconcile": async () => ok(await this.reconcile()),
+        /**
+         * The principal's own economics — what its customer pays on this load, its margins, its costs. Private to
+         * this process and never on the wire; the mandate, not this, is what bounds the agent. Merged in and
+         * persisted so a restart keeps it.
+         */
+        "POST /ops/context": async (_r: unknown, b: unknown) => {
+          const patch = b as Record<string, unknown>;
+          for (const k of Object.keys(patch)) if (k === "canary") delete patch[k];
+          Object.assign(this.ctx as Record<string, unknown>, patch);
+          writeFileAtomic(join(this.config.dataDir, "private.json"), JSON.stringify(this.ctx, null, 2));
+          this.audit.write({ component: this.comp.runtime, event: "context-updated", outcome: "INFO", evidence: { fields: Object.keys(patch) } });
+          return ok({ ok: true, fields: Object.keys(patch) });
+        },
+      } satisfies Record<string, HttpRoute>);
+    }
+    await startServer(this.config.port, { rpcPath: "/a2a", rpc: (m, p) => this.handleRpc(m, p), routes, opsToken });
     setInterval(() => {
       if (!this.credential) return;
       this.reconcile().catch(() => {});

@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A claim, decided by the rules — Interchange console</title>
+<meta name="description" content="Six rules in order, each a line of the basis, ending in a covered claim the reserve cannot yet pay.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%231A1917'/%3E%3Cpath d='M4 11.5V4.5M8 11.5V4.5M12 11.5V4.5' stroke='%23F7F5F0' stroke-width='1.6'/%3E%3C/svg%3E">
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#F7F5F0;color:#171614;font-family:'Space Grotesk',ui-sans-serif,system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:#17594A}a:hover{color:#0E3E33}
+.m{font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-ligatures:none}
+.s{font-family:Newsreader,ui-serif,Georgia,serif}
+button{font:inherit;color:inherit;cursor:pointer}
+body{background:#EAE7DE}
+.protobar{position:sticky;top:0;z-index:20;background:#1A1917;color:#F7F5F0;display:flex;align-items:center;gap:18px;padding:0 18px;height:46px;overflow-x:auto;white-space:nowrap}
+.protobar .brand{font-size:12px;font-weight:600;letter-spacing:.14em;flex-shrink:0}
+.protobar .tag{font-size:11px;color:#8B857A;flex-shrink:0}
+.protobar nav{display:flex;gap:2px;margin-left:auto;flex-shrink:0}
+.protobar nav a{font-size:12px;color:#A8A296;text-decoration:none;padding:6px 10px;border-radius:3px}
+.protobar nav a:hover{color:#F7F5F0;background:#2A2724}
+.protobar nav a.here{color:#F7F5F0;background:#2E2B27}
+.stage{position:relative;margin:26px auto 40px;width:1440px;height:1040px}
+.screen{position:absolute;top:0;left:0;transform-origin:top left;box-shadow:0 1px 2px rgba(23,22,20,.10),0 14px 40px rgba(23,22,20,.10)}
+@media print{.protobar{display:none}.stage{margin:0}.screen{box-shadow:none}}
+</style>
+</head>
+<body>
+  <div class="protobar">
+    <span class="brand">INTERCHANGE</span>
+    <span class="tag">design prototype · Broker principal</span>
+    <nav aria-label="Screens">
+      <a href="index.html">All screens</a>
+      <a href="desk.html">Desk</a>
+      <a href="negotiation.html">Negotiation</a>
+      <a href="refusal.html">Refusal</a>
+      <a href="mandate.html">Mandate</a>
+      <a href="verify.html">Verify</a>
+      <a href="claim.html" aria-current="page" class="here">Claim</a>
+      <a href="ops.html">Ops</a>
+      <a href="phone.html">Phone</a>
+    </nav>
+  </div>
+  <main class="stage">
+    <div class="screen">
+<div style="width: 1440px; height: 1040px; display: flex; background: #F7F5F0;">
+
+  <div style="width: 216px; flex-shrink: 0; background: #1A1917; color: #F7F5F0; display: flex; flex-direction: column; padding: 22px 0 18px;">
+    <div style="padding: 0 20px 20px;">
+      <div style="font-size: 14px; font-weight: 600; letter-spacing: 0.16em;">INTERCHANGE</div>
+      <div style="font-size: 10px; color: #8B857A; letter-spacing: 0.06em; margin-top: 4px;">freight transaction venue</div>
+    </div>
+    <div style="margin: 0 12px 18px; padding: 12px; background: #262421; border-radius: 4px;">
+      <div style="font-size: 12px; font-weight: 500; line-height: 1.3;">NORTHLINE<br>LOGISTICS LLC</div>
+      <div class="m" style="font-size: 10px; color: #A8A296; margin-top: 6px;">USDOT 3312874 · MC-1088412</div>
+    </div>
+    <nav style="display: flex; flex-direction: column; gap: 1px; padding: 0 12px;">
+      <a href="desk.html" style="display: flex; align-items: center; padding: 9px 10px 9px 23px; border-radius: 3px; color: #A8A296; text-decoration: none; font-size: 13px;">Desk</a>
+      <a href="negotiation.html" style="display: flex; align-items: center; padding: 9px 10px 9px 23px; border-radius: 3px; color: #A8A296; text-decoration: none; font-size: 13px;">Commitments</a>
+      <a href="refusal.html" style="display: flex; align-items: center; justify-content: space-between; padding: 9px 10px 9px 23px; border-radius: 3px; color: #A8A296; text-decoration: none; font-size: 13px;">Refusals<span class="m" style="font-size: 11px; color: #E09A82;">2</span></a>
+      <a href="claim.html" style="display: flex; align-items: center; gap: 8px; padding: 9px 10px; background: #2E2B27; border-radius: 3px; color: #F7F5F0; text-decoration: none; font-size: 13px; font-weight: 500;"><span style="width: 5px; height: 5px; border-radius: 50%; background: #D8A657;"></span>Claims</a>
+      <a href="mandate.html" style="display: flex; align-items: center; padding: 9px 10px 9px 23px; border-radius: 3px; color: #A8A296; text-decoration: none; font-size: 13px;">Mandate</a>
+      <a href="verify.html" style="display: flex; align-items: center; padding: 9px 10px 9px 23px; border-radius: 3px; color: #A8A296; text-decoration: none; font-size: 13px;">Verify a record</a>
+    </nav>
+    <div style="flex-grow: 1;"></div>
+    <div style="margin: 0 12px; padding: 12px; border-top: 1px solid #332F2B;">
+      <div style="font-size: 11px; color: #8B857A; line-height: 1.5;">Each rule that decided this<br>claim is on the ledger, in the<br>order it was applied.</div>
+    </div>
+  </div>
+
+  <div style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0;">
+
+    <div style="height: 58px; flex-shrink: 0; border-bottom: 1px solid #E3DFD5; display: flex; align-items: center; padding: 0 28px; gap: 14px; background: #FFFFFF;">
+      <a href="desk.html" style="font-size: 13px; color: #6B6459; text-decoration: none;">Claims</a>
+      <span style="color: #CFC9BB;">/</span>
+      <h1 class="m" style="margin: 0; font-size: 15px; font-weight: 600;">clm_4f2ad81c</h1>
+      <span class="m" style="font-size: 10px; font-weight: 600; letter-spacing: 0.06em; color: #FFFFFF; background: #8A5A18; padding: 4px 8px; border-radius: 2px;">DEFERRED</span>
+      <div style="flex-grow: 1;"></div>
+      <span class="m" style="font-size: 11px; color: #6B6459;">filed 24 Sep 11:06Z · ledger seq 1,301</span>
+    </div>
+
+    <div style="flex-grow: 1; padding: 24px 28px; overflow: hidden;">
+
+      <div style="display: grid; grid-template-columns: minmax(0, 1fr) 452px; gap: 20px;">
+
+        <div style="display: flex; flex-direction: column; gap: 18px; min-width: 0;">
+
+          <!-- outcome -->
+          <div style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 22px 24px;">
+            <div style="display: flex; align-items: baseline; gap: 14px;">
+              <h2 class="s" style="margin: 0; font-size: 32px; font-weight: 400;">Covered &mdash; <span style="color: #8A5A18;">$2,215</span></h2>
+              <span class="m" style="font-size: 12px; color: #8A5A18;">NOT YET PAID</span>
+            </div>
+            <p style="margin: 10px 0 0; font-size: 13px; line-height: 1.6; color: #3D382F; max-width: 660px;">The rules cover this claim in full, capped at the guaranteed amount. The reserve holds <span class="m">$135.21</span> today, so it cannot pay it. That is recorded as it is: deferred, with the shortfall visible. It is not a denial, and the venue will not pay it out of a number with no money behind it. It settles the moment capital arrives.</p>
+            <div style="display: flex; gap: 0; margin-top: 18px; border-top: 1px solid #E3DFD5; padding-top: 15px;">
+              <div style="padding-right: 26px; border-right: 1px solid #E3DFD5;">
+                <div style="font-size: 11px; color: #6B6459;">Claimed</div>
+                <div class="m" style="font-size: 14px; margin-top: 4px;">$5,000.00</div>
+              </div>
+              <div style="padding: 0 26px; border-right: 1px solid #E3DFD5;">
+                <div style="font-size: 11px; color: #6B6459;">Covered amount</div>
+                <div class="m" style="font-size: 14px; margin-top: 4px;">$2,215.00</div>
+              </div>
+              <div style="padding: 0 26px; border-right: 1px solid #E3DFD5;">
+                <div style="font-size: 11px; color: #6B6459;">Peril</div>
+                <div class="m" style="font-size: 14px; margin-top: 4px;">IDENTITY_FRAUD</div>
+              </div>
+              <div style="padding: 0 26px; border-right: 1px solid #E3DFD5;">
+                <div style="font-size: 11px; color: #6B6459;">Decided by</div>
+                <div class="m" style="font-size: 14px; margin-top: 4px;">rules</div>
+              </div>
+              <div style="padding-left: 26px;">
+                <div style="font-size: 11px; color: #6B6459;">On</div>
+                <div class="m" style="font-size: 14px; margin-top: 4px;">L-2026-262-0417</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- the rules -->
+          <section style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 18px 20px;">
+            <h3 style="margin: 0 0 3px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #3D382F;">How it was decided</h3>
+            <p style="margin: 0 0 14px; font-size: 12px; color: #6B6459;">The guarantee's own terms, applied in order. Every line below is on the ledger.</p>
+            <ol style="margin: 0; padding: 0; list-style: none;">
+              <li style="display: grid; grid-template-columns: 20px 1fr; gap: 12px; padding: 9px 0; border-top: 1px solid #EFEBE2; align-items: start;">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#17594A" stroke-width="2.4" style="margin-top: 2px;" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>
+                <div><div style="font-size: 13px;">The claimant is the beneficiary</div><div class="m" style="font-size: 11px; color: #6B6459; margin-top: 2px;">3312874 is named as beneficiary on gtee_e81fe03a</div></div>
+              </li>
+              <li style="display: grid; grid-template-columns: 20px 1fr; gap: 12px; padding: 9px 0; border-top: 1px solid #EFEBE2; align-items: start;">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#17594A" stroke-width="2.4" style="margin-top: 2px;" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>
+                <div><div style="font-size: 13px;">The guarantee is claimable</div><div class="m" style="font-size: 11px; color: #6B6459; margin-top: 2px;">completed 25 Sep; not released</div></div>
+              </li>
+              <li style="display: grid; grid-template-columns: 20px 1fr; gap: 12px; padding: 9px 0; border-top: 1px solid #EFEBE2; align-items: start;">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#17594A" stroke-width="2.4" style="margin-top: 2px;" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>
+                <div><div style="font-size: 13px;">The peril is in scope</div><div class="m" style="font-size: 11px; color: #6B6459; margin-top: 2px;">IDENTITY_FRAUD is one of the three this guarantee names</div></div>
+              </li>
+              <li style="display: grid; grid-template-columns: 20px 1fr; gap: 12px; padding: 9px 0; border-top: 1px solid #EFEBE2; align-items: start;">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#17594A" stroke-width="2.4" style="margin-top: 2px;" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>
+                <div><div style="font-size: 13px;">Within the 90-day claim window</div><div class="m" style="font-size: 11px; color: #6B6459; margin-top: 2px;">window closes 23 Dec 2026 17:00Z</div></div>
+              </li>
+              <li style="display: grid; grid-template-columns: 20px 1fr; gap: 12px; padding: 9px 0; border-top: 1px solid #EFEBE2; align-items: start;">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#17594A" stroke-width="2.4" style="margin-top: 2px;" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>
+                <div><div style="font-size: 13px;">No pickup was recorded after a void</div><div class="m" style="font-size: 11px; color: #6B6459; margin-top: 2px;">the commitment was never voided; PRINCIPAL_OVERRODE_REFUSAL does not apply</div></div>
+              </li>
+              <li style="display: grid; grid-template-columns: 20px 1fr; gap: 12px; padding: 9px 0; border-top: 1px solid #EFEBE2; border-bottom: 1px solid #EFEBE2; align-items: start;">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#17594A" stroke-width="2.4" style="margin-top: 2px;" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"></path></svg>
+                <div><div style="font-size: 13px;">Payout capped at the covered amount</div><div class="m" style="font-size: 11px; color: #6B6459; margin-top: 2px;">min(5000, 2215) = 2215</div></div>
+              </li>
+            </ol>
+          </section>
+
+          <!-- contrast -->
+          <section style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 18px 20px;">
+            <h3 style="margin: 0 0 12px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #3D382F;">Two other claims on this load</h3>
+            <div style="display: flex; flex-direction: column;">
+              <div style="display: grid; grid-template-columns: 108px 1fr; gap: 14px; padding: 11px 0; border-top: 1px solid #EFEBE2;">
+                <span class="m" style="font-size: 10px; font-weight: 600; letter-spacing: 0.05em; color: #9E3B24; background: #F7E9E4; padding: 3px 7px; border-radius: 2px; height: 20px; text-align: center;">DENIED</span>
+                <div>
+                  <div style="font-size: 13px;">Prairie Wind claimed identity fraud on the same commitment</div>
+                  <div class="m" style="font-size: 11px; color: #6B6459; margin-top: 3px;">CLAIM_NOT_BENEFICIARY &mdash; claimant 2751903 is not the beneficiary 3312874</div>
+                </div>
+              </div>
+              <div style="display: grid; grid-template-columns: 108px 1fr; gap: 14px; padding: 11px 0; border-top: 1px solid #EFEBE2; border-bottom: 1px solid #EFEBE2;">
+                <span class="m" style="font-size: 10px; font-weight: 600; letter-spacing: 0.05em; color: #9E3B24; background: #F7E9E4; padding: 3px 7px; border-radius: 2px; height: 20px; text-align: center;">DENIED</span>
+                <div>
+                  <div style="font-size: 13px;">You claimed $2,215 for a six-hour late delivery</div>
+                  <div class="m" style="font-size: 11px; color: #6B6459; margin-top: 3px;">CLAIM_PERIL_NOT_IN_SCOPE &mdash; peril NON_PERFORMANCE is not in scope: IDENTITY_FRAUD, DOUBLE_BROKERING_VIA_VENUE, CREDENTIAL_MISBINDING</div>
+                </div>
+              </div>
+            </div>
+            <p style="margin: 12px 0 0; font-size: 12px; line-height: 1.5; color: #6B6459;">A denial names the term that denied it. This guarantee was never insurance against a carrier running late, and it does not pretend otherwise at claim time.</p>
+          </section>
+
+        </div>
+
+        <!-- right -->
+        <div style="display: flex; flex-direction: column; gap: 18px;">
+
+          <section style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 18px 20px;">
+            <h3 style="margin: 0 0 4px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #3D382F;">The reserve behind it</h3>
+            <p style="margin: 0 0 16px; font-size: 12px; color: #6B6459;">Premiums in, payouts out, over declared capital.</p>
+
+            <div style="font-size: 11px; color: #6B6459;">Available against this claim</div>
+            <div style="display: flex; align-items: baseline; gap: 8px; margin-top: 5px;">
+              <span class="m" style="font-size: 24px; font-weight: 500; color: #8A5A18;">$135.21</span>
+              <span class="m" style="font-size: 12px; color: #6B6459;">of $2,215.00 needed</span>
+            </div>
+            <div style="height: 8px; background: #E3DFD5; border-radius: 4px; margin-top: 10px; overflow: hidden;"><div style="width: 6.1%; height: 8px; background: #8A5A18; border-radius: 4px;"></div></div>
+            <div style="display: flex; justify-content: space-between; margin-top: 6px;">
+              <span class="m" style="font-size: 11px; color: #8A5A18;">6.1% funded</span>
+              <span class="m" style="font-size: 11px; color: #6B6459;">short by $2,079.79</span>
+            </div>
+
+            <dl style="margin: 16px 0 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; row-gap: 7px; column-gap: 10px; padding-top: 14px; border-top: 1px solid #EFEBE2;">
+              <dt style="font-size: 12px; color: #3D382F;">Declared capital</dt><dd class="m" style="margin: 0; font-size: 12px; text-align: right;">$100.00</dd>
+              <dt style="font-size: 12px; color: #3D382F;">Premiums earned</dt><dd class="m" style="margin: 0; font-size: 12px; text-align: right;">+ $35.21</dd>
+              <dt style="font-size: 12px; color: #3D382F;">Payouts made</dt><dd class="m" style="margin: 0; font-size: 12px; text-align: right;">&minus; $0.00</dd>
+              <dt style="font-size: 12px; color: #3D382F; font-weight: 500; border-top: 1px solid #EFEBE2; padding-top: 7px;">Available</dt><dd class="m" style="margin: 0; font-size: 12px; text-align: right; font-weight: 500; border-top: 1px solid #EFEBE2; padding-top: 7px;">$135.21</dd>
+              <dt style="font-size: 12px; color: #6B6459;">Exposure outstanding</dt><dd class="m" style="margin: 0; font-size: 12px; text-align: right; color: #6B6459;">$2,215.00</dd>
+            </dl>
+
+            <p style="margin: 14px 0 0; font-size: 11px; line-height: 1.55; color: #6B6459;">Capital adequacy is an actuarial question. This page makes the number visible; it does not answer it.</p>
+          </section>
+
+          <section style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 18px 20px;">
+            <h3 style="margin: 0 0 12px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #3D382F;">Your evidence</h3>
+            <dl style="margin: 0; display: grid; grid-template-columns: 92px minmax(0, 1fr); row-gap: 8px; column-gap: 12px;">
+              <dt style="font-size: 11px; color: #6B6459;">Paid to</dt><dd class="m" style="margin: 0; font-size: 11px;">acct ****1189, Sunrise Bank</dd>
+              <dt style="font-size: 11px; color: #6B6459;">Wire trace</dt><dd class="m" style="margin: 0; font-size: 11px;">ab21f0c4d9e7…</dd>
+              <dt style="font-size: 11px; color: #6B6459;">Amount</dt><dd class="m" style="margin: 0; font-size: 11px;">$5,000.00 on 26 Sep</dd>
+              <dt style="font-size: 11px; color: #6B6459;">Your note</dt><dd style="margin: 0; font-size: 11px; line-height: 1.5; color: #3D382F;">Remittance details were changed by someone presenting as Prairie Wind's dispatcher.</dd>
+            </dl>
+            <p style="margin: 13px 0 0; font-size: 11px; line-height: 1.55; color: #6B6459;">Whether that payment really went to an impostor is evidence from outside this venue. The rules decided what the venue can know; an adjudicator decides the rest, with a reason on the ledger.</p>
+          </section>
+
+          <section style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 18px 20px;">
+            <h3 style="margin: 0 0 11px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #3D382F;">Status</h3>
+            <div style="display: flex; flex-direction: column; gap: 10px;">
+              <div style="display: flex; gap: 10px; align-items: baseline;"><span class="m" style="font-size: 11px; color: #6B6459; width: 74px;">24 Sep 11:06</span><span style="font-size: 12px;">Filed by you</span></div>
+              <div style="display: flex; gap: 10px; align-items: baseline;"><span class="m" style="font-size: 11px; color: #6B6459; width: 74px;">24 Sep 11:06</span><span style="font-size: 12px;">Covered by the rules · $2,215</span></div>
+              <div style="display: flex; gap: 10px; align-items: baseline;"><span class="m" style="font-size: 11px; color: #8A5A18; width: 74px;">24 Sep 11:06</span><span style="font-size: 12px; color: #8A5A18;">Deferred &mdash; reserve short by $2,079.79</span></div>
+              <div style="display: flex; gap: 10px; align-items: baseline;"><span class="m" style="font-size: 11px; color: #6B6459; width: 74px;">&mdash;</span><span style="font-size: 12px; color: #6B6459;">Awaiting capital. You will be told the moment it settles.</span></div>
+            </div>
+          </section>
+
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    </div>
+  </main>
+<script>
+(function () {
+  var W = 1440, H = 1040;
+  var stage = document.querySelector('.stage'), screen = document.querySelector('.screen');
+  function fit() {
+    var k = Math.min(1, (window.innerWidth - 32) / W);
+    screen.style.transform = 'scale(' + k + ')';
+    stage.style.width = (W * k) + 'px';
+    stage.style.height = (H * k) + 'px';
+  }
+  fit();
+  window.addEventListener('resize', fit);
+})();
+</script>
+</body>
+</html>

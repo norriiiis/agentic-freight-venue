@@ -35,6 +35,11 @@ export interface AgentConfig {
    * about its principal, is already cancelled, or is dated in the future.
    */
   insurer?: { insurerId: string; publicKey: OkpJwk };
+  /**
+   * Bearer token for this agent's production `/ops/*` surface. Set by whoever runs the agent on the principal's
+   * behalf; unset means there is no such surface and the agent answers only to the venue and its own strategy.
+   */
+  controlToken?: string;
   /** How far ahead of this agent's clock a document may be dated before it is refused (default protocol/clock.ts skewMs). */
   clockSkewMs?: number;
   /**

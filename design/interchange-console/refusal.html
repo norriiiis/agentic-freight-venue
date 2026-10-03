@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A refusal, in full — Interchange console</title>
+<meta name="description" content="The reason code, the component that refused, the evidence, and whether the guarantee would have paid.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%231A1917'/%3E%3Cpath d='M4 11.5V4.5M8 11.5V4.5M12 11.5V4.5' stroke='%23F7F5F0' stroke-width='1.6'/%3E%3C/svg%3E">
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#F7F5F0;color:#171614;font-family:'Space Grotesk',ui-sans-serif,system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:#17594A}a:hover{color:#0E3E33}
+.m{font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-ligatures:none}
+.s{font-family:Newsreader,ui-serif,Georgia,serif}
+button{font:inherit;color:inherit;cursor:pointer}
+body{background:#EAE7DE}
+.protobar{position:sticky;top:0;z-index:20;background:#1A1917;color:#F7F5F0;display:flex;align-items:center;gap:18px;padding:0 18px;height:46px;overflow-x:auto;white-space:nowrap}
+.protobar .brand{font-size:12px;font-weight:600;letter-spacing:.14em;flex-shrink:0}
+.protobar .tag{font-size:11px;color:#8B857A;flex-shrink:0}
+.protobar nav{display:flex;gap:2px;margin-left:auto;flex-shrink:0}
+.protobar nav a{font-size:12px;color:#A8A296;text-decoration:none;padding:6px 10px;border-radius:3px}
+.protobar nav a:hover{color:#F7F5F0;background:#2A2724}
+.protobar nav a.here{color:#F7F5F0;background:#2E2B27}
+.stage{position:relative;margin:26px auto 40px;width:1440px;height:1040px}
+.screen{position:absolute;top:0;left:0;transform-origin:top left;box-shadow:0 1px 2px rgba(23,22,20,.10),0 14px 40px rgba(23,22,20,.10)}
+@media print{.protobar{display:none}.stage{margin:0}.screen{box-shadow:none}}
+</style>
+</head>
+<body>
+  <div class="protobar">
+    <span class="brand">INTERCHANGE</span>
+    <span class="tag">design prototype · Broker principal</span>
+    <nav aria-label="Screens">
+      <a href="index.html">All screens</a>
+      <a href="desk.html">Desk</a>
+      <a href="negotiation.html">Negotiation</a>
+      <a href="refusal.html" aria-current="page" class="here">Refusal</a>
+      <a href="mandate.html">Mandate</a>
+      <a href="verify.html">Verify</a>
+      <a href="claim.html">Claim</a>
+      <a href="ops.html">Ops</a>
+      <a href="phone.html">Phone</a>
+    </nav>
+  </div>
+  <main class="stage">
+    <div class="screen">
+<div style="width: 1440px; height: 1040px; display: flex; background: #F7F5F0;">
+
+  <div style="width: 216px; flex-shrink: 0; background: #1A1917; color: #F7F5F0; display: flex; flex-direction: column; padding: 22px 0 18px;">
+    <div style="padding: 0 20px 20px;">
+      <div style="font-size: 14px; font-weight: 600; letter-spacing: 0.16em;">INTERCHANGE</div>
+      <div style="font-size: 10px; color: #8B857A; letter-spacing: 0.06em; margin-top: 4px;">freight transaction venue</div>
+    </div>
+    <div style="margin: 0 12px 18px; padding: 12px; background: #262421; border-radius: 4px;">
+      <div style="font-size: 12px; font-weight: 500; line-height: 1.3;">NORTHLINE<br>LOGISTICS LLC</div>
+      <div class="m" style="font-size: 10px; color: #A8A296; margin-top: 6px;">USDOT 3312874 · MC-1088412</div>
+    </div>
+    <nav style="display: flex; flex-direction: column; gap: 1px; padding: 0 12px;">
+      <a href="desk.html" style="display: flex; align-items: center; padding: 9px 10px 9px 23px; border-radius: 3px; color: #A8A296; text-decoration: none; font-size: 13px;">Desk</a>
+      <a href="negotiation.html" style="display: flex; align-items: center; padding: 9px 10px 9px 23px; border-radius: 3px; color: #A8A296; text-decoration: none; font-size: 13px;">Commitments</a>
+      <a href="refusal.html" style="display: flex; align-items: center; gap: 8px; padding: 9px 10px; background: #2E2B27; border-radius: 3px; color: #F7F5F0; text-decoration: none; font-size: 13px; font-weight: 500;"><span style="width: 5px; height: 5px; border-radius: 50%; background: #E09A82;"></span>Refusals</a>
+      <a href="claim.html" style="display: flex; align-items: center; justify-content: space-between; padding: 9px 10px 9px 23px; border-radius: 3px; color: #A8A296; text-decoration: none; font-size: 13px;">Claims<span class="m" style="font-size: 11px;">1</span></a>
+      <a href="mandate.html" style="display: flex; align-items: center; padding: 9px 10px 9px 23px; border-radius: 3px; color: #A8A296; text-decoration: none; font-size: 13px;">Mandate</a>
+      <a href="verify.html" style="display: flex; align-items: center; padding: 9px 10px 9px 23px; border-radius: 3px; color: #A8A296; text-decoration: none; font-size: 13px;">Verify a record</a>
+    </nav>
+    <div style="flex-grow: 1;"></div>
+    <div style="margin: 0 12px; padding: 12px; border-top: 1px solid #332F2B;">
+      <div style="font-size: 11px; color: #8B857A; line-height: 1.5;">A refusal names the rule, the<br>component and the evidence.<br>You can check all three.</div>
+    </div>
+  </div>
+
+  <div style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0;">
+
+    <div style="height: 58px; flex-shrink: 0; border-bottom: 1px solid #E3DFD5; display: flex; align-items: center; padding: 0 28px; gap: 14px; background: #FFFFFF;">
+      <a href="desk.html" style="font-size: 13px; color: #6B6459; text-decoration: none;">Refusals</a>
+      <span style="color: #CFC9BB;">/</span>
+      <h1 class="m" style="margin: 0; font-size: 15px; font-weight: 600;">L-2026-291-0355</h1>
+      <div style="flex-grow: 1;"></div>
+      <button type="button" style="border: 1px solid #CFC9BB; background: #FFFFFF; font-size: 13px; padding: 8px 13px; border-radius: 3px;">Export as PDF</button>
+      <button type="button" style="border: 1px solid #CFC9BB; background: #FFFFFF; font-size: 13px; padding: 8px 13px; border-radius: 3px;">Copy JSON</button>
+    </div>
+
+    <div style="flex-grow: 1; padding: 26px 28px; overflow: hidden;">
+
+      <!-- verdict -->
+      <div style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 22px 26px;">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9E3B24" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v6"></path><path d="M12 16.5v.5"></path></svg>
+          <span class="m" style="font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: #9E3B24;">REFUSED BEFORE ANY COMMITMENT</span>
+        </div>
+        <h2 class="s" style="margin: 12px 0 0; font-size: 34px; font-weight: 400; line-height: 1.25; max-width: 980px; text-wrap: pretty;">Cedar Fork Freight's insurance was cancelled four days before your agent tendered to them.</h2>
+        <div style="display: flex; gap: 0; margin-top: 20px; border-top: 1px solid #E3DFD5; padding-top: 16px;">
+          <div style="padding-right: 28px; border-right: 1px solid #E3DFD5;">
+            <div style="font-size: 11px; color: #6B6459;">Reason code</div>
+            <div class="m" style="font-size: 13px; font-weight: 500; color: #9E3B24; margin-top: 4px;">INSURANCE_LAPSED</div>
+          </div>
+          <div style="padding: 0 28px; border-right: 1px solid #E3DFD5;">
+            <div style="font-size: 11px; color: #6B6459;">Refused by</div>
+            <div class="m" style="font-size: 13px; margin-top: 4px;">venue.identity</div>
+          </div>
+          <div style="padding: 0 28px; border-right: 1px solid #E3DFD5;">
+            <div style="font-size: 11px; color: #6B6459;">At</div>
+            <div class="m" style="font-size: 13px; margin-top: 4px;">tender intake · 08:12:04.311Z</div>
+          </div>
+          <div style="padding: 0 28px; border-right: 1px solid #E3DFD5;">
+            <div style="font-size: 11px; color: #6B6459;">Audit</div>
+            <div class="m" style="font-size: 13px; margin-top: 4px;">venue/audit.jsonl #61</div>
+          </div>
+          <div style="padding-left: 28px;">
+            <div style="font-size: 11px; color: #6B6459;">Your exposure</div>
+            <div class="m" style="font-size: 13px; margin-top: 4px; color: #17594A;">none · nothing was signed</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: grid; grid-template-columns: minmax(0, 1fr) 434px; gap: 20px; margin-top: 20px;">
+
+        <!-- evidence -->
+        <div style="display: flex; flex-direction: column; gap: 18px; min-width: 0;">
+
+          <section style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 18px 20px;">
+            <h3 style="margin: 0 0 4px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #3D382F;">What the registries said, when asked</h3>
+            <p style="margin: 0 0 14px; font-size: 12px; color: #6B6459;">Asked fresh at 08:12:04Z. Not remembered — the venue refuses on stale word rather than relying on it.</p>
+
+            <div style="display: flex; flex-direction: column; gap: 0;">
+              <div style="display: grid; grid-template-columns: 150px 1fr 96px; gap: 12px; padding: 10px 0; border-top: 1px solid #EFEBE2; align-items: center;">
+                <div class="m" style="font-size: 12px;">fmcsa-li-mock</div>
+                <div class="m" style="font-size: 11px; color: #3D382F;">BMC-91X · Great Plains Mutual · TRK-0092817-24 · cancellation filed 19 Aug, effective 18 Sep</div>
+                <div class="m" style="font-size: 11px; color: #6B6459; text-align: right;">312ms old</div>
+              </div>
+              <div style="display: grid; grid-template-columns: 150px 1fr 96px; gap: 12px; padding: 10px 0; border-top: 1px solid #EFEBE2; align-items: center;">
+                <div class="m" style="font-size: 12px;">midwest-vetting</div>
+                <div class="m" style="font-size: 11px; color: #3D382F;">BMC-91X · Great Plains Mutual · TRK-0092817-24 · cancellation filed 19 Aug, effective 18 Sep</div>
+                <div class="m" style="font-size: 11px; color: #6B6459; text-align: right;">870ms old</div>
+              </div>
+              <div style="display: grid; grid-template-columns: 150px 1fr 96px; gap: 12px; padding: 10px 0; border-top: 1px solid #EFEBE2; border-bottom: 1px solid #EFEBE2; align-items: center;">
+                <div class="m" style="font-size: 12px;">coastline-check</div>
+                <div class="m" style="font-size: 11px; color: #3D382F;">BMC-91X · Great Plains Mutual · TRK-0092817-24 · cancellation filed 19 Aug, effective 18 Sep</div>
+                <div class="m" style="font-size: 11px; color: #6B6459; text-align: right;">1.2s old</div>
+              </div>
+            </div>
+            <p style="margin: 12px 0 0; font-size: 12px; line-height: 1.55; color: #3D382F;">Three of three mirrors answered inside the 5-minute policy and <strong style="font-weight: 600;">all three agree</strong>. Standing requires unanimity among the mirrors that answer — one dissenting mirror would have produced <span class="m" style="font-size: 11px;">REGISTRY_DISAGREEMENT</span> instead, and the venue would still have refused.</p>
+          </section>
+
+          <section style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 18px 20px;">
+            <h3 style="margin: 0 0 14px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #3D382F;">How it happened</h3>
+            <div style="position: relative; height: 66px;">
+              <div style="position: absolute; left: 0; right: 0; top: 23px; height: 2px; background: #E3DFD5;"></div>
+              <div style="position: absolute; left: 0; right: 0; top: 23px; height: 2px; width: 62%; background: #9E3B24; border-radius: 1px;"></div>
+              <div style="position: absolute; left: 0; top: 0; width: 200px;">
+                <div class="m" style="font-size: 11px; font-weight: 500;">19 Aug</div>
+                <div style="width: 9px; height: 9px; border-radius: 50%; background: #171614; margin: 7px 0 6px;"></div>
+                <div style="font-size: 11px; color: #6B6459; line-height: 1.4;">Insurer files the cancellation</div>
+              </div>
+              <div style="position: absolute; left: 38%; top: 0; width: 200px;">
+                <div class="m" style="font-size: 11px; font-weight: 500;">18 Sep</div>
+                <div style="width: 9px; height: 9px; border-radius: 50%; background: #9E3B24; margin: 7px 0 6px;"></div>
+                <div style="font-size: 11px; color: #6B6459; line-height: 1.4;">Coverage ends. 30 days' statutory notice.</div>
+              </div>
+              <div style="position: absolute; left: 62%; top: 0; width: 220px;">
+                <div class="m" style="font-size: 11px; font-weight: 500;">22 Sep 08:12</div>
+                <div style="width: 9px; height: 9px; border-radius: 50%; background: #171614; border: 2px solid #F7F5F0; margin: 7px 0 6px;"></div>
+                <div style="font-size: 11px; color: #6B6459; line-height: 1.4;">Your agent tenders. The venue asks. Refused.</div>
+              </div>
+            </div>
+            <p style="margin: 16px 0 0; font-size: 12px; line-height: 1.55; color: #3D382F;">Nobody notified the venue. Cedar Fork's own credential was still valid, its authority still active, and its agent behaved correctly throughout. A credential is not standing, so the venue asked the registries at this tender rather than trusting what it had been told at onboarding.</p>
+          </section>
+
+          <section style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 18px 20px;">
+            <h3 style="margin: 0 0 10px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #3D382F;">And the carrier's own insurer?</h3>
+            <p style="margin: 0; font-size: 12px; line-height: 1.55; color: #3D382F;">Great Plains Mutual's signed certificate, presented by Cedar Fork on 12 Aug, assured coverage through 11 Sep. Nothing newer is on file. The origin of the fact and the three mirrors of it do not disagree — which is the ordinary case, and the reason a mirror that <em>did</em> disagree would be provably lying.</p>
+          </section>
+
+        </div>
+
+        <!-- right -->
+        <div style="display: flex; flex-direction: column; gap: 18px;">
+
+          <section style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 18px 20px;">
+            <h3 style="margin: 0 0 10px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #3D382F;">Would the guarantee have paid?</h3>
+            <div style="display: flex; align-items: baseline; gap: 10px;">
+              <span class="s" style="font-size: 30px; color: #9E3B24;">No</span>
+              <span style="font-size: 12px; color: #6B6459;">and it would not have needed to</span>
+            </div>
+            <p style="margin: 10px 0 0; font-size: 12px; line-height: 1.55; color: #3D382F;">Nothing was committed, so there is no covered transaction. Had the load moved anyway, an uninsured accident is outside the scope in any case — cargo loss and non-performance are the carrier's policy, not this guarantee. And a load dispatched after this refusal would be excluded under <span class="m" style="font-size: 11px;">PRINCIPAL_OVERRODE_REFUSAL</span>.</p>
+          </section>
+
+          <section style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 18px 20px;">
+            <h3 style="margin: 0 0 4px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #3D382F;">Who said what</h3>
+            <p style="margin: 0 0 14px; font-size: 12px; color: #6B6459;">Every link is a signature by a party that did not choose the others.</p>
+            <ol style="margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column;">
+              <li style="display: grid; grid-template-columns: 18px 1fr; gap: 10px; padding-bottom: 13px;">
+                <div style="display: flex; flex-direction: column; align-items: center;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #171614; margin-top: 4px;"></span><span style="flex-grow: 1; width: 1px; background: #E3DFD5; margin-top: 4px;"></span></div>
+                <div>
+                  <div style="font-size: 12px; font-weight: 500;">Texas Dept. of Insurance</div>
+                  <div style="font-size: 11px; color: #6B6459; line-height: 1.5; margin-top: 2px;">licensed Great Plains Mutual (NAIC 24074) to file under key 4c1a…, in a key-event log you pinned once</div>
+                </div>
+              </li>
+              <li style="display: grid; grid-template-columns: 18px 1fr; gap: 10px; padding-bottom: 13px;">
+                <div style="display: flex; flex-direction: column; align-items: center;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #171614; margin-top: 4px;"></span><span style="flex-grow: 1; width: 1px; background: #E3DFD5; margin-top: 4px;"></span></div>
+                <div>
+                  <div style="font-size: 12px; font-weight: 500;">The registries' filer directory</div>
+                  <div style="font-size: 11px; color: #6B6459; line-height: 1.5; margin-top: 2px;">list that key as the filer's, valid from 2 Jul 2025, not revoked</div>
+                </div>
+              </li>
+              <li style="display: grid; grid-template-columns: 18px 1fr; gap: 10px; padding-bottom: 13px;">
+                <div style="display: flex; flex-direction: column; align-items: center;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #171614; margin-top: 4px;"></span><span style="flex-grow: 1; width: 1px; background: #E3DFD5; margin-top: 4px;"></span></div>
+                <div>
+                  <div style="font-size: 12px; font-weight: 500;">Great Plains Mutual</div>
+                  <div style="font-size: 11px; color: #6B6459; line-height: 1.5; margin-top: 2px;">filed the cancellation on 19 Aug, effective 18 Sep</div>
+                </div>
+              </li>
+              <li style="display: grid; grid-template-columns: 18px 1fr; gap: 10px; padding-bottom: 13px;">
+                <div style="display: flex; flex-direction: column; align-items: center;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #9E3B24; margin-top: 4px;"></span><span style="flex-grow: 1; width: 1px; background: #E3DFD5; margin-top: 4px;"></span></div>
+                <div>
+                  <div style="font-size: 12px; font-weight: 500;">Three registry mirrors</div>
+                  <div style="font-size: 11px; color: #6B6459; line-height: 1.5; margin-top: 2px;">each signed that record under its own key and clock, within the last 1.2 seconds</div>
+                </div>
+              </li>
+              <li style="display: grid; grid-template-columns: 18px 1fr; gap: 10px;">
+                <div style="display: flex; flex-direction: column; align-items: center;"><span style="width: 8px; height: 8px; border-radius: 50%; background: #171614; margin-top: 4px;"></span></div>
+                <div>
+                  <div style="font-size: 12px; font-weight: 500;">This venue</div>
+                  <div style="font-size: 11px; color: #6B6459; line-height: 1.5; margin-top: 2px;">refused, and signed the refusal. It added no fact of its own.</div>
+                </div>
+              </li>
+            </ol>
+            <button type="button" style="margin-top: 14px; width: 100%; border: 1px solid #CFC9BB; background: #FFFFFF; font-size: 12px; font-weight: 500; padding: 9px 12px; border-radius: 3px;">Check every signature yourself</button>
+          </section>
+
+          <section style="background: #FFFFFF; border: 1px solid #E3DFD5; border-radius: 4px; padding: 18px 20px;">
+            <h3 style="margin: 0 0 12px; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #3D382F;">What now</h3>
+            <div style="display: flex; flex-direction: column; gap: 9px;">
+              <button type="button" style="border: 1px solid #171614; background: #171614; color: #F7F5F0; font-size: 13px; font-weight: 500; padding: 11px 14px; border-radius: 3px; text-align: left;">Re-tender to the next carrier &mdash; 4 match this lane</button>
+              <button type="button" style="border: 1px solid #CFC9BB; background: #FFFFFF; font-size: 13px; padding: 11px 14px; border-radius: 3px; text-align: left;">Ask Cedar Fork to present a renewed COI</button>
+              <button type="button" style="border: 1px solid #CFC9BB; background: #FFFFFF; font-size: 13px; padding: 11px 14px; border-radius: 3px; text-align: left;">Watch this carrier &mdash; notify me if it re-files</button>
+            </div>
+          </section>
+
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+    </div>
+  </main>
+<script>
+(function () {
+  var W = 1440, H = 1040;
+  var stage = document.querySelector('.stage'), screen = document.querySelector('.screen');
+  function fit() {
+    var k = Math.min(1, (window.innerWidth - 32) / W);
+    screen.style.transform = 'scale(' + k + ')';
+    stage.style.width = (W * k) + 'px';
+    stage.style.height = (H * k) + 'px';
+  }
+  fit();
+  window.addEventListener('resize', fit);
+})();
+</script>
+</body>
+</html>

@@ -6,7 +6,25 @@ The two agents are separate OS processes with separate data directories and sepa
 
 **A convincing refusal is the product.** Twenty-nine adversarial scenarios each fail with a machine-readable reason, the component that refused, the evidence it relied on, and whether the guarantee would have paid. After the commitment, the load's lifecycle, claims against the guarantee, and a counted reserve are on the same ledger, and the whole thing renders as the X12 the rest of the industry speaks.
 
-## Run it
+## Onboard a client and run a load
+
+The venue is a protocol; what a client signs into is `src/app/` — a hosted console that holds the principal's key, runs their agent, and reaches the venue over HTTP like any other party.
+
+```bash
+npm install
+npm run registry &                    # the registry mirror (own key, own clock)
+VENUE_OPS_TOKEN=secret VENUE_UW_PARAMS='{"offerGuarantees":false}' npm run venue &
+APP_MASTER_KEY=$(openssl rand -base64 32) APP_VENUE_OPS_TOKEN=secret \
+  APP_BOOTSTRAP_EMAIL=you@example.com APP_BOOTSTRAP_PASSWORD=a-long-password npm run app
+```
+
+Sign in at `http://127.0.0.1:4200`, invite a client from **Operations**, and they walk five steps: claim their USDOT against the registry's signed word, prove they control it (a code to the contact point on the public record, or an operator who did the check by hand and typed what they did), create a signing key their agent never holds, sign their limits, and start their agent. A broker can then post a load and watch two agents negotiate it.
+
+`test/app.test.ts` is that journey, asserted end to end: two clients onboarded through the real HTTP application, a load tendered, a commitment on the ledger. For a pilot on one host, `deploy/docker-compose.yml` and [`deploy/RUNBOOK.md`](deploy/RUNBOOK.md).
+
+**What this deployment does not claim.** The venue and the registry mirror it reads are operated by the same company, so a registry attestation is that company's signature over data it mirrored from FMCSA — not an independent party's word. The console says so on every page. No guarantee is offered: risk is still assessed and published, and the artifact records `GUARANTEE_NOT_OFFERED` rather than implying cover that does not exist. Principal keys are held by the application, so the honest version of "the agent cannot widen its own mandate" is "the agent cannot, and its operator could" — `APP_KEY_STORE=external` is the configuration where that is not true, and the client signs for itself.
+
+## Run the simulator
 
 ```bash
 npm install
@@ -131,6 +149,7 @@ Each scenario prints the wire log, the refusal with evidence, the audit entries 
 | `src/ledger/` | Hash-chained, venue-signed, fsync'd append-only log — one entry is the commit point and carries the guarantee; `KEY_ROTATION`, `ROOT_ROTATION`, `RESEAL`, `REATTESTATION` and `CREDENTIAL_STATUS` entries make the chain the single source of truth for keys and status, verifiable from any pinned root; self-contained commitment artifact with additive attestations; independent verifier (library + CLI) that can demand a witnessed, fresh-enough status list, with the verdict precedence declared as a table (`VERDICT_ORDER`) rather than by the order of the code; `bundle.ts` gathers everything a verifier needs into one document — the venue's part from the venue, the world's word from the registries and witnesses the verifier names — against the verifier's own pins. |
 | `src/edi/` | Commitment → rate confirmation and X12 850/855/856 segment outline (`mapping.ts`); a full X12 204/990/214 serializer with envelopes, control numbers, a partner profile and parse-back (`x12.ts`) — the bridge out of the venue to a shipper's TMS. |
 | `src/witness/` | An independent ledger witness: the witnessing core (`protocol/witness-core.ts`, shared with agents) as its own process with its own key and clock; cosigns each new head only if it extends the last one it cosigned; remembers every hash it verified; gossips at positions both peers have verified and turns a disagreement into a self-contained equivocation proof; watches inclusion promises and lodges unanswered notices as pending; halts on any proof of venue misbehaviour. What turns the venue's "as of" into a third party's, a split view into evidence, and silence into an unanswered claim. |
+| `src/app/` | The hosted application: accounts and invitations, the five-step onboarding, custody of each principal's signing key (`keys.ts`: envelope-encrypted locally, or HashiCorp Vault transit — AWS/Azure/GCP KMS cannot sign Ed25519), a supervisor that runs one agent process per client and drives it through its token-gated `/ops/*` surface, and the server-rendered console. Imports nothing from `venue/` or `registry/`: it is the principals' side, and reaches both over HTTP. |
 | `src/sim/` | Process harness (spawn, kill, restart, re-provision an agent with a new key, start registry processes as independent mirrors and file cancellations with the upstream they mirror, freeze (honestly or lying) or darken any of them, act as an insurer signing coverage attestations, start witnesses with peers and make them collude, act as a status-notice source; acts as each principal's key-management system, each principal's choice of witnesses, and the venue operator's root-key custody including the pre-committed next root), fixtures, thirty scenarios, transcript renderer, CLI. |
 | `test/` | Identity, registry-attestation and mandate refusal tests, ledger/protocol tests, verdict order, transport hardening and observability, key providers, the FMCSA adapter against QCMobile/L&I shapes, claims and the reserve, X12 round-trips, the mandate tool, the model guard against a fake endpoint, the clock policy, the no-shared-state proof, scenario acceptance. |
 

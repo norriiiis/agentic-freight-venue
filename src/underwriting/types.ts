@@ -45,6 +45,13 @@ export interface ExposureView {
 }
 
 export interface UnderwritingParams {
+  /**
+   * Whether this venue offers a guarantee at all. False is a legitimate product: identity, mandates and the
+   * record carry their own value, and an indemnity is a licensed activity with capital behind it. With it off,
+   * every quote is UNGUARANTEED with GUARANTEE_NOT_OFFERED on the record, risk is still assessed and shown,
+   * and a mandate that requires a guarantee cannot be satisfied — which is why the console refuses to sign one.
+   */
+  offerGuarantees?: boolean;
   /** Decline above this probability of loss. */
   maxProbabilityOfLoss: number;
   /** Multiplier over expected loss to cover expenses + capital. */

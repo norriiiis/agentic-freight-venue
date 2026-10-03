@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { importPublicKey, signJws, verifyJws, type KeyPair } from "../protocol/crypto";
+import { importPublicKey, signJws, signJwsWith, verifyJws, type KeyPair, type RemoteSigner } from "../protocol/crypto";
 import type { MandateEnvelope } from "../protocol/types";
 import type { Mandate, MandateLimits } from "./types";
 
@@ -15,6 +15,20 @@ export function issueMandate(principal: KeyPair, principalName: string, agentId:
     limits,
   };
   return { ...unsigned, principalSignature: signJws(unsigned, principal, { typ: "mandate+jws" }, true) };
+}
+
+/** The same mandate, signed by a key this process does not hold (hosted custody). */
+export async function issueMandateWith(signer: RemoteSigner, principalName: string, agentId: string, limits: MandateLimits, validityDays = 30, now = new Date()): Promise<Mandate> {
+  const unsigned: Omit<Mandate, "principalSignature"> = {
+    schema: "freight-venue/mandate/v1",
+    mandateId: `mandate_${randomUUID()}`,
+    agentId,
+    principal: { name: principalName, kid: signer.kid, publicKey: signer.publicJwk },
+    issuedAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + validityDays * 86_400_000).toISOString(),
+    limits,
+  };
+  return { ...unsigned, principalSignature: await signJwsWith(unsigned, signer, { typ: "mandate+jws" }, true) };
 }
 
 export function verifyMandate(m: Mandate, now = new Date()): { ok: boolean; error?: string } {
@@ -53,6 +67,32 @@ export function issueEnvelope(principal: KeyPair, m: Mandate, disclose: Partial<
     },
   };
   return { ...unsigned, principalSignature: signJws(unsigned, principal, { typ: "mandate-envelope+jws" }, true) };
+}
+
+/** The envelope, signed by a hosted key. Derived from the mandate exactly as `issueEnvelope` does. */
+export async function issueEnvelopeWith(signer: RemoteSigner, m: Mandate, disclose: Partial<MandateEnvelope["limits"]> = {}): Promise<MandateEnvelope> {
+  const unsigned: Omit<MandateEnvelope, "principalSignature"> = {
+    schema: "freight-venue/mandate-envelope/v1",
+    agentId: m.agentId,
+    principalKid: signer.kid,
+    issuedAt: m.issuedAt,
+    expiresAt: m.expiresAt,
+    principalPublicKey: signer.publicJwk,
+    limits: {
+      maxRatePerLoadUsd: m.limits.maxRatePerLoadUsd,
+      minRatePerLoadUsd: m.limits.minRatePerLoadUsd,
+      maxDailyExposureUsd: m.limits.maxDailyExposureUsd,
+      maxPerCounterpartyExposureUsd: m.limits.maxPerCounterpartyExposureUsd,
+      allowedEquipment: m.limits.allowedEquipment,
+      allowedLaneRegions: m.limits.allowedLaneRegions,
+      requiredCounterpartyInsuranceUsd: m.limits.requiredCounterpartyInsuranceUsd,
+      requireGuarantee: m.limits.requireGuarantee,
+      requireInsurerAttestation: m.limits.requireInsurerAttestation,
+      requireInsurerUndertaking: m.limits.requireInsurerUndertaking,
+      ...disclose,
+    },
+  };
+  return { ...unsigned, principalSignature: await signJwsWith(unsigned, signer, { typ: "mandate-envelope+jws" }, true) };
 }
 
 export function verifyEnvelope(e: MandateEnvelope, now = new Date()): { ok: boolean; error?: string } {

@@ -1,0 +1,91 @@
+# A closed pilot on one host. Three long-running processes, three volumes,
+# one network. Nothing here is serverless: the venue holds a ledger and the
+# app supervises agent processes, so both need to stay up and keep their disk.
+#
+# Before the first `up`, write a .env beside this file:
+#   VENUE_OPS_TOKEN=$(openssl rand -hex 32)
+#   APP_MASTER_KEY=$(openssl rand -base64 32)
+#   APP_BOOTSTRAP_EMAIL=you@yourcompany.com
+#   APP_BOOTSTRAP_PASSWORD=<a long one>
+#   APP_URL=https://console.yourcompany.com
+services:
+  registry:
+    build: ..
+    command: ["npm", "run", "registry"]
+    environment:
+      REGISTRY_ID: ${REGISTRY_ID:-fmcsa-li-mock}
+      REGISTRY_PORT: "4400"
+      REGISTRY_DATA_DIR: /data/registry
+      # Point this at FMCSA when you have a webkey. Without an L&I export the
+      # record's insurance is a summary, and insurer-of-record checks refuse it.
+      REGISTRY_UPSTREAM: ${REGISTRY_UPSTREAM:-file}
+      FMCSA_WEBKEY: ${FMCSA_WEBKEY:-}
+    volumes: ["registry-data:/data"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4400/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  venue:
+    build: ..
+    command: ["npm", "run", "venue"]
+    depends_on:
+      registry: {condition: service_healthy}
+    environment:
+      VENUE_ID: ${VENUE_ID:-interchange}
+      VENUE_PORT: "4100"
+      VENUE_HOST: 0.0.0.0
+      VENUE_DATA_DIR: /data/venue
+      VENUE_REGISTRY_URL: http://registry:4400
+      VENUE_REGISTRY_ID: ${REGISTRY_ID:-fmcsa-li-mock}
+      VENUE_OPS_TOKEN: ${VENUE_OPS_TOKEN:?set VENUE_OPS_TOKEN in .env}
+      VENUE_RATE_LIMIT_RPS: "50"
+      # No guarantee is offered: risk is assessed and published, the promise to pay is not made.
+      VENUE_UW_PARAMS: '{"offerGuarantees":false}'
+      VENUE_ALERT_WEBHOOK: ${VENUE_ALERT_WEBHOOK:-}
+    volumes: ["venue-data:/data"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4100/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: ..
+    command: ["npm", "run", "app"]
+    depends_on:
+      venue: {condition: service_healthy}
+    environment:
+      APP_PORT: "4200"
+      APP_HOST: 0.0.0.0
+      APP_URL: ${APP_URL:-http://127.0.0.1:4200}
+      APP_DATA_DIR: /data/app
+      APP_SECURE_COOKIES: ${APP_SECURE_COOKIES:-1}
+      APP_MASTER_KEY: ${APP_MASTER_KEY:?set APP_MASTER_KEY in .env}
+      APP_KEY_STORE: ${APP_KEY_STORE:-local}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      APP_VENUE_URL: http://venue:4100
+      APP_VENUE_OPS_TOKEN: ${VENUE_OPS_TOKEN}
+      APP_REGISTRY_URL: http://registry:4400
+      APP_REGISTRY_ID: ${REGISTRY_ID:-fmcsa-li-mock}
+      APP_MAIL: ${APP_MAIL:-console}
+      APP_MAIL_PROVIDER: ${APP_MAIL_PROVIDER:-resend}
+      APP_MAIL_TOKEN: ${APP_MAIL_TOKEN:-}
+      APP_MAIL_FROM: ${APP_MAIL_FROM:-}
+      APP_BOOTSTRAP_EMAIL: ${APP_BOOTSTRAP_EMAIL:-}
+      APP_BOOTSTRAP_PASSWORD: ${APP_BOOTSTRAP_PASSWORD:-}
+      AGENT_LLM_URL: ${AGENT_LLM_URL:-}
+      AGENT_LLM_MODEL: ${AGENT_LLM_MODEL:-}
+      AGENT_LLM_KEY: ${AGENT_LLM_KEY:-}
+    ports: ["127.0.0.1:4200:4200"]
+    volumes: ["app-data:/data"]
+    restart: unless-stopped
+
+volumes:
+  registry-data:
+  venue-data:
+  app-data:

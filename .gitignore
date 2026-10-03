@@ -1,4 +1,4 @@
-node_modules/
-.sim/
-.data/
 *.log
+.data/
+.sim/
+node_modules/
